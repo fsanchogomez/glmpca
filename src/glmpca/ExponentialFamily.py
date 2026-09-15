@@ -107,7 +107,7 @@ class ExponentialFamily:
         return 0.0
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.ones(size=X.shape)
+        return torch.ones_like(X)
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
         return X
@@ -245,7 +245,7 @@ class Poisson(ExponentialFamily):
         return torch.exp(theta)
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
-        return 1 / scipy.special.gamma(X + 1)
+        return torch.exp(-torch.lgamma(X + 1))
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
         return torch.where(X > 0, torch.log(X), -self.family_params["m"])
@@ -335,7 +335,7 @@ class Beta(ExponentialFamily):
 
     def initialize_family_parameters(self, X: torch.Tensor) -> None:
         p = X.shape[1]
-        values = X.numpy()
+        values = X.cpu().numpy()
 
         def compute_beta_param(x: np.ndarray) -> tuple[float, ...]:
             y = x[x > self.family_params["eps"]]
@@ -353,6 +353,7 @@ class Beta(ExponentialFamily):
             )
         )
         self.family_params["nu"] = torch.sum(self.family_params["nu"][:, :2], dim=1)
+        self.family_params["nu"] = self.family_params["nu"].to(X.device)
         assert self.family_params["nu"].shape[0] == p
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
@@ -361,8 +362,8 @@ class Beta(ExponentialFamily):
         X = X.clip(self.family_params["eps"], 1 - self.family_params["eps"])
 
         # Initialize dichotomy parameters.
-        min_val = torch.zeros(X.shape)
-        max_val = torch.ones(X.shape)
+        min_val = torch.zeros_like(X)
+        max_val = torch.ones_like(X)
         theta = (min_val + max_val) / 2
 
         llik = self._derivative_neg_log_likelihood(X, theta)
@@ -427,8 +428,8 @@ class SigmoidBeta(Beta):
         X = X.clip(self.family_params["eps"], 1 - self.family_params["eps"])
 
         # Initialize dichotomy parameters.
-        min_val = torch.zeros(X.shape)
-        max_val = torch.ones(X.shape)
+        min_val = torch.zeros_like(X)
+        max_val = torch.ones_like(X)
         logit_theta = (min_val + max_val) / 2
 
         llik = self._derivative_neg_log_likelihood(X, logit_theta)
@@ -490,7 +491,7 @@ class Gamma(ExponentialFamily):
     def natural_parametrization(self, theta: torch.Tensor) -> torch.Tensor:
         nat_params = torch.stack([
             theta,
-            -torch.ones(theta.shape) * self.family_params["nu"],
+            -torch.ones_like(theta) * self.family_params["nu"],
         ])
         if nat_params.shape[1] == 1:
             nat_params = nat_params.flatten()
@@ -518,8 +519,8 @@ class Gamma(ExponentialFamily):
         """Dichotomy to compute inverse of digamma function."""
 
         # Initialize dichotomy parameters.
-        min_val = torch.zeros(X.shape)
-        max_val = torch.ones(X.shape) * self.family_params["max_val"]
+        min_val = torch.zeros_like(X)
+        max_val = torch.ones_like(X) * self.family_params["max_val"]
         theta = (min_val + max_val) / 2
 
         llik = self._digamma_implicit_function(X, theta)
@@ -540,7 +541,7 @@ class Gamma(ExponentialFamily):
 
     def initialize_family_parameters(self, X: torch.Tensor) -> None:
         p = X.shape[1]
-        values = X.numpy()
+        values = X.cpu().numpy()
 
         self.family_params["nu"] = torch.Tensor(
             _fit_columns(
@@ -551,6 +552,7 @@ class Gamma(ExponentialFamily):
             )
         )
         self.family_params["nu"] = 1.0 / self.family_params["nu"][:, -1]
+        self.family_params["nu"] = self.family_params["nu"].to(X.device)
         assert self.family_params["nu"].shape[0] == p
 
 
@@ -597,7 +599,7 @@ class LogNormal(ExponentialFamily):
     def natural_parametrization(self, theta: torch.Tensor) -> torch.Tensor:
         nat_params = torch.stack([
             theta / torch.square(self.family_params["nu"]),
-            -torch.ones(theta.shape) / (2 * torch.square(self.family_params["nu"])),
+            -torch.ones_like(theta) / (2 * torch.square(self.family_params["nu"])),
         ])
         if nat_params.shape[1] == 1:
             nat_params = nat_params.flatten()

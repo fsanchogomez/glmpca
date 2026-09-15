@@ -166,3 +166,49 @@ def test_riemannian_adagrad_on_euclidean_matches_torch_adagrad() -> None:
             optimizer.step()
 
     torch.testing.assert_close(ours.detach(), theirs.detach(), rtol=0, atol=1e-6)
+
+
+def test_the_mps_device_is_rejected() -> None:
+    model = GLMPCA(N_PC, family="poisson", device="mps")
+    with pytest.raises(ValueError, match="mps"):
+        model.fit(sample(GLMFamily.poisson))
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="CUDA is available")
+def test_cuda_is_rejected_when_it_is_not_available() -> None:
+    model = GLMPCA(N_PC, family="poisson", device="cuda")
+    with pytest.raises(ValueError, match="CUDA is not available"):
+        model.fit(sample(GLMFamily.poisson))
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_fitted_attributes_are_on_the_cpu(family: GLMFamily) -> None:
+    model = GLMPCA(N_PC, family=family, max_iter=2, batch_size=16)
+    model.fit(sample(family))
+
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_intercept_ is not None
+    assert model.saturated_loadings_.device.type == "cpu"
+    assert model.saturated_intercept_.device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_a_cuda_fit_matches_the_cpu_fit(family: GLMFamily) -> None:
+    X = sample(family)
+    models = {}
+    for device in ("cpu", "cuda"):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        models[device] = GLMPCA(
+            N_PC, family=family, max_iter=2, batch_size=16, device=device
+        )
+        models[device].fit(X)
+
+    cpu_loadings = models["cpu"].saturated_loadings_
+    cuda_loadings = models["cuda"].saturated_loadings_
+    assert cpu_loadings is not None
+    assert cuda_loadings is not None
+    cosines = torch.linalg.svdvals(cpu_loadings.detach().T @ cuda_loadings.detach())
+    torch.testing.assert_close(cosines, torch.ones(N_PC), rtol=0, atol=1e-4)
+    assert models["cuda"].transform(X.cuda()).device.type == "cuda"
