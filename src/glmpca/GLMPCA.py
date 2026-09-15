@@ -220,6 +220,9 @@ class GLMPCA:
 
         """
         device = _resolve_device(self.device)
+        if self.init not in ("spectral", "random"):
+            msg = f"init={self.init!r} is not valid. Use 'spectral' or 'random'."
+            raise ValueError(msg)
 
         if isinstance(X, ad.AnnData):
             counts = X.X

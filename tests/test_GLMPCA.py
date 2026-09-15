@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anndata as ad
 import numpy as np
 import pytest
 import torch
 from geoopt import ManifoldParameter
-from glmpca.ExponentialFamily import GLMFamily, Poisson
+from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson
 from glmpca.GLMPCA import GLMPCA, _RiemannianAdagrad
 from scipy import sparse
 
@@ -74,6 +74,17 @@ def test_an_exponential_family_instance_is_used_as_given() -> None:
 def test_an_unknown_family_name_is_rejected() -> None:
     with pytest.raises(ValueError, match="nope"):
         GLMPCA(N_PC, family="nope")
+
+
+@pytest.mark.parametrize("init", ["spectrl", ""])
+def test_an_unknown_init_is_rejected_before_the_family_is_fitted(init: str) -> None:
+    family = Beta()
+    model = GLMPCA(N_PC, family=family, init=cast("Any", init))
+
+    with pytest.raises(ValueError, match="init="):
+        model.fit(sample(GLMFamily.beta))
+
+    assert "nu" not in family.family_params
 
 
 def test_transform_before_fit_fails_with_advice() -> None:
