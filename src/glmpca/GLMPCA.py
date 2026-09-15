@@ -221,7 +221,7 @@ class GLMPCA:
         Returns
         -------
         bool
-            Returns True if the fitting procedure was been successful.
+            Returns True if the fitting procedure was successful.
 
         """
         device = _resolve_device(self.device)
@@ -343,7 +343,7 @@ class GLMPCA:
         Returns
         -------
         tuple[torch.Tensor, torch.Tensor]
-            Projected saturated parameters.
+            Projected saturated parameters (loadings, intercept).
 
         """
         if self.learning_rate_ < LEARNING_RATE_LIMIT:
