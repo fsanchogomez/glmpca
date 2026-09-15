@@ -457,4 +457,6 @@ class GLMPCA:
         projected_parameters = projected_parameters.matmul(loadings).matmul(loadings.T)
         projected_parameters = projected_parameters + intercept_term
 
-        return self.exponential_family.log_likelihood(batch_data, projected_parameters)
+        return self.exponential_family.neg_log_likelihood(
+            batch_data, projected_parameters
+        )

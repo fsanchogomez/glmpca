@@ -129,7 +129,7 @@ class ExponentialFamily:
 
         return expt - torch.log(f)
 
-    def log_likelihood(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    def neg_log_likelihood(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """Computes negative log-likelihood between dataset X and parameters theta"""
         expt = self.exponential_term(X, theta) - self.log_partition(theta)
         return -torch.sum(expt)
@@ -209,7 +209,7 @@ class Bernoulli(ExponentialFamily):
             -self.family_params["max_val"], self.family_params["max_val"]
         )
 
-    def log_likelihood(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    def neg_log_likelihood(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """Computes negative log-likelihood between dataset X and parameters theta"""
         expt = self.exponential_term(X, theta) - self.log_partition(theta)
         return -torch.sum(expt)
@@ -317,7 +317,7 @@ class Beta(ExponentialFamily):
             dim=0,
         )
 
-    def _derivative_log_likelihood(
+    def _derivative_neg_log_likelihood(
         self, X: torch.Tensor, theta: torch.Tensor
     ) -> torch.Tensor:
         X = X.clip(self.family_params["eps"], 1 - self.family_params["eps"])
@@ -359,12 +359,12 @@ class Beta(ExponentialFamily):
         max_val = torch.ones(X.shape)
         theta = (min_val + max_val) / 2
 
-        llik = self._derivative_log_likelihood(X, theta)
+        llik = self._derivative_neg_log_likelihood(X, theta)
         for idx in tqdm(range(self.family_params["maxiter"])):
             min_val[llik > 0] = theta[llik > 0]
             max_val[llik < 0] = theta[llik < 0]
             theta = (min_val + max_val) / 2
-            llik = self._derivative_log_likelihood(X, theta)
+            llik = self._derivative_neg_log_likelihood(X, theta)
 
             if torch.max(torch.abs(llik)) < self.family_params["eps"]:
                 print(f"CONVERGENCE AFTER {idx} ITERATIONS")
@@ -405,7 +405,7 @@ class SigmoidBeta(Beta):
             nat_params = nat_params.flatten()
         return nat_params
 
-    def _derivative_log_likelihood(
+    def _derivative_neg_log_likelihood(
         self, X: torch.Tensor, theta: torch.Tensor
     ) -> torch.Tensor:
         X = X.clip(self.family_params["eps"], 1 - self.family_params["eps"])
@@ -425,12 +425,12 @@ class SigmoidBeta(Beta):
         max_val = torch.ones(X.shape)
         logit_theta = (min_val + max_val) / 2
 
-        llik = self._derivative_log_likelihood(X, logit_theta)
+        llik = self._derivative_neg_log_likelihood(X, logit_theta)
         for idx in tqdm(range(self.family_params["maxiter"])):
             min_val[llik > 0] = logit_theta[llik > 0]
             max_val[llik < 0] = logit_theta[llik < 0]
             logit_theta = (min_val + max_val) / 2
-            llik = self._derivative_log_likelihood(X, logit_theta)
+            llik = self._derivative_neg_log_likelihood(X, logit_theta)
 
             if torch.max(torch.abs(llik)) < self.family_params["eps"]:
                 print(f"CONVERGENCE AFTER {idx} ITERATIONS")
