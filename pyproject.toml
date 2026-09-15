@@ -1,0 +1,102 @@
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "glmpca"
+version = "0.1.0"
+description = "Generalized Principal Component Analysis in Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE.txt"}
+authors = [
+    {name = "Fernando Sancho Gómez"},
+]
+maintainers = [
+    {name = "Fernando Sancho Gómez", email = "f.sanchogomez@uu.nl"},
+]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: Pypi",
+]
+
+dependencies = [
+    "anndata",
+    "numpy",
+    "scipy",
+    "torch",
+    "geoopt",
+    "tqdm",
+    ]
+
+[project.optional-dependencies]
+test = [
+"pytest"
+]
+
+[tool.coverage.run]
+source = ["src"]
+parallel = true
+omit = ["*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+xfail_strict = true
+addopts = [
+    "--import-mode=importlib",  # allow using test files with same name
+]
+
+[tool.isort]
+include_trailing_comma = true
+multi_line_output = 3
+profile = "black"
+skip_glob = ["docs/*"]
+
+[tool.ruff]
+src = ["."]
+include = [
+    "src/glmpca/**/*.py",
+    "tests/**/*.py",
+    "pyproject.toml",
+]
+
+format.preview = true
+format.docstring-code-format = true
+lint.select = [
+    "ANN",  # Annotations
+    "B",    # Likely bugs and design issues
+    "BLE",  # Blind except
+    "C4",   # Comprehensions
+    "E",    # Error detected by Pycodestyle
+    "EM",   # Traceback-friendly error messages
+    "F",    # Errors detected by Pyflakes
+    "I",    # isort
+    "ICN",  # Follow import conventions
+    "ISC",  # Implicit string concatenation
+    "PERF", # Performance
+    "PIE",  # Syntax simplifications
+    "PL",   # Pylint
+    "PT",   # Pytest conventions
+    "PTH",  # Pathlib instead of os.path
+    "PYI",  # Typing
+    "RUF",  # Unused noqa
+    "SIM",  # Code simplifications
+    "TC",   # manage type checking blocks
+    "TID",  # Banned imports
+    "UP",   # pyupgrade
+    "W",    # Warning detected by Pycodestyle
+]
+
+lint.ignore = [
+    "FBT", # Boolean positional arguments
+    "PLR2004", # Magic numbers
+    "PLR0913", # Too many arguments
+    "PLR0912", # Too many branches
+    "PLR0915", # Too many statements
+    "PLR0917", # Too many positional arguments
+]
