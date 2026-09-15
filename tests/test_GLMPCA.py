@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
 import anndata as ad
@@ -77,6 +78,26 @@ def test_an_unknown_family_name_is_rejected() -> None:
 def test_transform_before_fit_fails_with_advice() -> None:
     with pytest.raises(RuntimeError, match=r"Call fit\(\)"):
         GLMPCA(N_PC, family="poisson").transform(sample(GLMFamily.poisson))
+
+
+def test_a_batch_size_larger_than_the_row_count_is_reduced_with_a_warning() -> None:
+    X = sample(GLMFamily.poisson)[:10]
+    model = GLMPCA(N_PC, family="poisson", max_iter=3, batch_size=256)
+
+    with pytest.warns(UserWarning, match=r"batch_size=256 .* \(10\)"):
+        assert model.fit(X)
+
+    assert model.batch_size == 256
+    assert [len(scores) for scores in model.loadings_learning_scores_] == [3]
+
+
+def test_a_batch_size_equal_to_the_row_count_is_used_without_a_warning() -> None:
+    X = sample(GLMFamily.poisson)[:16]
+    model = GLMPCA(N_PC, family="poisson", max_iter=3, batch_size=16)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        assert model.fit(X)
 
 
 def fitted_loadings(X: torch.Tensor | ad.AnnData) -> torch.Tensor:

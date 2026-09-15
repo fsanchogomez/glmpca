@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import anndata as ad
@@ -101,7 +102,9 @@ class GLMPCA:
         with a smaller value. Defaults to 0.2.
 
     batch_size : int
-        Size of the batch in the SGD optimisation step. Defaults to 256.
+        Size of the batch in the SGD optimisation step. If the matrix to fit has
+        fewer rows, the number of rows is used instead and a warning is issued.
+        Defaults to 256.
 
     step_size: int
         Step size in optimiser scheduler. Defaults to 20.
@@ -205,6 +208,15 @@ class GLMPCA:
             msg = f"X format unrecognised: {type(X)} != np.ndarray or torch.Tensor"
             raise ValueError(msg)
 
+        batch_size = self.batch_size
+        if X_fit.shape[0] < batch_size:
+            msg = (
+                f"batch_size={batch_size} is larger than the number of observations "
+                f"to fit ({X_fit.shape[0]}). Using batch_size={X_fit.shape[0]}."
+            )
+            warnings.warn(msg, UserWarning, stacklevel=2)
+            batch_size = X_fit.shape[0]
+
         # Fit exponential family params (e.g., dispersion for negative binomial)
         self.exponential_family.initialize_family_parameters(X_fit)
 
@@ -218,7 +230,7 @@ class GLMPCA:
 
         # Use saturated parameters to find loadings by projected gradient descent
         runs = [
-            self._saturated_loading_iter(saturated_parameters, X_fit)
+            self._saturated_loading_iter(saturated_parameters, X_fit, batch_size)
             for _ in range(self.n_init)
         ]
 
@@ -264,7 +276,7 @@ class GLMPCA:
         return projected_parameters
 
     def _saturated_loading_iter(
-        self, saturated_parameters: torch.Tensor, X: torch.Tensor
+        self, saturated_parameters: torch.Tensor, X: torch.Tensor, batch_size: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Computes the loadings solution of the GLM-PCA optimisation problem.
 
@@ -274,6 +286,8 @@ class GLMPCA:
             Saturated parameters of the dataset X ($g^{-1}\left(X\right)$)
         X : torch.Tensor
             Dataset with cells in rows and features in columns.
+        batch_size : int
+            Size of the batch in the SGD optimisation step.
 
         Returns
         -------
@@ -301,7 +315,7 @@ class GLMPCA:
         # Load dataset
         train_data = TensorDataset(X, saturated_parameters.data.clone())
         train_loader = DataLoader(
-            dataset=train_data, batch_size=self.batch_size, shuffle=True, drop_last=True
+            dataset=train_data, batch_size=batch_size, shuffle=True, drop_last=True
         )
 
         # Run epoch in a for loop
@@ -361,6 +375,7 @@ class GLMPCA:
                 return self._saturated_loading_iter(
                     saturated_parameters=saturated_parameters,
                     X=X,
+                    batch_size=batch_size,
                 )
 
         return (_loadings, _intercept)
