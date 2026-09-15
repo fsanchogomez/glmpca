@@ -342,7 +342,7 @@ class GLMPCA:
 
         Returns
         -------
-        torch.Tensor
+        tuple[torch.Tensor, torch.Tensor]
             Projected saturated parameters.
 
         """
@@ -436,7 +436,7 @@ class GLMPCA:
 
         Parameters
         ----------
-        saturated_parameters : torch.Tensor
+        parameters : torch.Tensor
             Saturated parameters of the dataset X ($g^{-1}\left(X\right)$)
         X : torch.Tensor
             Dataset with cells in rows and features in columns.
