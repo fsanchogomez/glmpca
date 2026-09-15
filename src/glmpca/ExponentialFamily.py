@@ -540,6 +540,15 @@ class Gamma(ExponentialFamily):
         return theta
 
     def initialize_family_parameters(self, X: torch.Tensor) -> None:
+        not_positive = int((X <= 0).sum())
+        if not_positive:
+            msg = (
+                "The Gamma family is defined only for values greater than 0, but "
+                f"{not_positive} of {X.numel()} values are 0 or negative. For data "
+                "with zeros, use another family, for example 'poisson' for counts."
+            )
+            raise ValueError(msg)
+
         p = X.shape[1]
         values = X.cpu().numpy()
 

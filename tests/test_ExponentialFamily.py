@@ -130,3 +130,12 @@ def test_parallel_family_parameter_fit_matches_sequential(
     torch.testing.assert_close(
         parallel.family_params["nu"], sequential.family_params["nu"], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0], ids=["zero", "negative"])
+def test_gamma_fit_rejects_values_that_are_not_positive(value: float) -> None:
+    X = torch.rand(20, 5) + 0.5
+    X[3, 2] = value
+
+    with pytest.raises(ValueError, match="1 of 100 values are 0 or negative"):
+        Gamma().initialize_family_parameters(X)
