@@ -207,7 +207,7 @@ def fitted_loadings(X: torch.Tensor | ad.AnnData) -> torch.Tensor:
     ],
     ids=lambda matrix_type: matrix_type.__name__,
 )
-def test_anndata_input_is_fitted_with_cells_as_features(
+def test_anndata_input_is_fitted_with_cells_in_rows(
     matrix_type: Callable[[np.ndarray], Any],
 ) -> None:
     counts = (
@@ -217,10 +217,10 @@ def test_anndata_input_is_fitted_with_cells_as_features(
         .astype(np.float32)
     )
     adata = ad.AnnData(matrix_type(counts))
+    loadings = fitted_loadings(adata)
 
-    torch.testing.assert_close(
-        fitted_loadings(adata), fitted_loadings(torch.Tensor(counts.T))
-    )
+    assert loadings.shape == (N_FEATURES, N_PC)
+    torch.testing.assert_close(loadings, fitted_loadings(torch.Tensor(counts)))
 
 
 @pytest.mark.parametrize(
@@ -242,7 +242,7 @@ def test_backed_anndata_input_is_fitted_like_in_memory_input(
     adata = ad.read_h5ad(path, backed="r")
     try:
         torch.testing.assert_close(
-            fitted_loadings(adata), fitted_loadings(torch.Tensor(counts.T))
+            fitted_loadings(adata), fitted_loadings(torch.Tensor(counts))
         )
     finally:
         adata.file.close()

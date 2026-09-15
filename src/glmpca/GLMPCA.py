@@ -235,7 +235,7 @@ class GLMPCA:
                 counts = counts.to_memory()
             if isinstance(counts, csr_matrix | csc_matrix | csr_array | csc_array):
                 counts = counts.toarray()
-            X_fit = torch.Tensor(np.asarray(counts).T)
+            X_fit = torch.Tensor(np.asarray(counts))
         elif isinstance(X, np.ndarray):
             X_fit = torch.Tensor(X)
         elif isinstance(X, torch.Tensor):
