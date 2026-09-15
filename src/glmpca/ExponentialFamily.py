@@ -218,7 +218,7 @@ class Bernoulli(ExponentialFamily):
         return theta
 
     def log_partition(self, theta: torch.Tensor) -> torch.Tensor:
-        return torch.log(1.0 + torch.exp(theta))
+        return torch.nn.functional.softplus(theta)
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
         return torch.ones_like(X)

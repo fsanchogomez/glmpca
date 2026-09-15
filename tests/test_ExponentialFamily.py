@@ -48,6 +48,18 @@ def test_bernoulli_success_probability_is_the_sigmoid_of_theta() -> None:
     torch.testing.assert_close(success, torch.sigmoid(theta), rtol=0, atol=1e-6)
 
 
+def test_bernoulli_log_partition_and_gradient_stay_finite_for_large_theta() -> None:
+    theta = torch.tensor([-1000.0, 0.0, 89.0, 1000.0], requires_grad=True)
+    log_partition = Bernoulli().log_partition(theta)
+    log_partition.sum().backward()
+
+    torch.testing.assert_close(
+        log_partition.detach(), torch.tensor([0.0, math.log(2.0), 89.0, 1000.0])
+    )
+    assert theta.grad is not None
+    torch.testing.assert_close(theta.grad, torch.sigmoid(theta.detach()))
+
+
 def test_poisson_log_pmf_matches_scipy() -> None:
     X = torch.linspace(0, 100, 101)
     for theta in torch.linspace(-50, 5, 10):
