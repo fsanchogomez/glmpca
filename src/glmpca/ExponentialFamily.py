@@ -40,6 +40,17 @@ def _fit_columns(
         return list(tqdm(executor.map(fit, columns), total=n_columns))
 
 
+def _require_positive(X: torch.Tensor, family_name: str) -> None:
+    not_positive = int((X <= 0).sum())
+    if not_positive:
+        msg = (
+            f"The {family_name} family is defined only for values greater than 0, "
+            f"but {not_positive} of {X.numel()} values are 0 or negative. For data "
+            "with zeros, use another family, for example 'poisson' for counts."
+        )
+        raise ValueError(msg)
+
+
 class GLMFamily(str, Enum):
     gaussian = "gaussian"
     poisson = "poisson"
@@ -540,14 +551,7 @@ class Gamma(ExponentialFamily):
         return theta
 
     def initialize_family_parameters(self, X: torch.Tensor) -> None:
-        not_positive = int((X <= 0).sum())
-        if not_positive:
-            msg = (
-                "The Gamma family is defined only for values greater than 0, but "
-                f"{not_positive} of {X.numel()} values are 0 or negative. For data "
-                "with zeros, use another family, for example 'poisson' for counts."
-            )
-            raise ValueError(msg)
+        _require_positive(X, "Gamma")
 
         p = X.shape[1]
         values = X.cpu().numpy()
@@ -632,4 +636,5 @@ class LogNormal(ExponentialFamily):
         return torch.log(X.clip(self.family_params["min_val"]))
 
     def initialize_family_parameters(self, X: torch.Tensor) -> None:
+        _require_positive(X, "LogNormal")
         self.family_params["nu"] = torch.sqrt(torch.var(torch.log(X), dim=0))

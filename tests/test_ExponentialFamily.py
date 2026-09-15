@@ -18,6 +18,7 @@ from glmpca.ExponentialFamily import (
     Beta,
     Gamma,
     Gaussian,
+    LogNormal,
     Poisson,
     SigmoidBeta,
 )
@@ -133,9 +134,15 @@ def test_parallel_family_parameter_fit_matches_sequential(
 
 
 @pytest.mark.parametrize("value", [0.0, -1.0], ids=["zero", "negative"])
-def test_gamma_fit_rejects_values_that_are_not_positive(value: float) -> None:
+@pytest.mark.parametrize("family", [Gamma, LogNormal], ids=["gamma", "lognormal"])
+def test_positive_families_reject_values_that_are_not_positive(
+    family: type[Gamma | LogNormal], value: float
+) -> None:
     X = torch.rand(20, 5) + 0.5
     X[3, 2] = value
 
-    with pytest.raises(ValueError, match="1 of 100 values are 0 or negative"):
-        Gamma().initialize_family_parameters(X)
+    with pytest.raises(
+        ValueError,
+        match=rf"The {family.__name__} family .* 1 of 100 values are 0 or negative",
+    ):
+        family().initialize_family_parameters(X)
