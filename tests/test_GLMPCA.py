@@ -92,6 +92,29 @@ def test_transform_before_fit_fails_with_advice() -> None:
         GLMPCA(N_PC, family="poisson").transform(sample(GLMFamily.poisson))
 
 
+def test_each_init_run_starts_from_the_initial_learning_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = GLMPCA(N_PC, family="poisson", n_init=3, learning_rate=0.2, batch_size=16)
+    start_rates: list[float] = []
+
+    def run_that_restarts_once(
+        saturated_parameters: torch.Tensor,
+        X: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        start_rates.append(model.learning_rate_)
+        model.learning_rate_ *= model.gamma
+        return torch.eye(N_FEATURES, N_PC), torch.zeros(N_FEATURES)
+
+    monkeypatch.setattr(model, "_saturated_loading_iter", run_that_restarts_once)
+    model.fit(sample(GLMFamily.poisson))
+
+    assert start_rates == [0.2, 0.2, 0.2]
+    assert model.learning_rate_ == 0.1
+
+
 def test_a_batch_size_larger_than_the_row_count_is_reduced_with_a_warning() -> None:
     X = sample(GLMFamily.poisson)[:10]
     model = GLMPCA(N_PC, family="poisson", max_iter=3, batch_size=256)

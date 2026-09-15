@@ -256,17 +256,18 @@ class GLMPCA:
         saturated_parameters = self.exponential_family.invert_g(X_fit.to(device)).cpu()
 
         # Initialize the learning procedure
-        self.learning_rate_ = self.initial_learning_rate_
         self.loadings_learning_scores_ = []
         self.loadings_learning_rates_ = []
 
         # Use saturated parameters to find loadings by projected gradient descent
-        runs = [
-            self._saturated_loading_iter(
-                saturated_parameters, X_fit, batch_size, device
+        runs = []
+        for _ in range(self.n_init):
+            self.learning_rate_ = self.initial_learning_rate_
+            runs.append(
+                self._saturated_loading_iter(
+                    saturated_parameters, X_fit, batch_size, device
+                )
             )
-            for _ in range(self.n_init)
-        ]
 
         runs = [(loadings.cpu(), intercept.cpu()) for loadings, intercept in runs]
         self.exponential_family.load_family_params_to_gpu(torch.device("cpu"))
