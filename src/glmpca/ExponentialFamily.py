@@ -170,7 +170,11 @@ class Gaussian(ExponentialFamily):
         self, family_params: dict[str, Any] | None = None, **kwargs: object
     ) -> None:
         self.family_name = "gaussian"
-        self.family_params = family_params if family_params else {}
+        default_family_params: dict[str, Any] = {}
+        self.family_params = family_params if family_params else default_family_params
+        self.family_params.update(kwargs)
+        for key, value in default_family_params.items():
+            self.family_params.setdefault(key, value)
 
     def sufficient_statistics(self, X: torch.Tensor) -> torch.Tensor:
         return X
@@ -201,7 +205,11 @@ class Bernoulli(ExponentialFamily):
         self, family_params: dict[str, Any] | None = None, **kwargs: object
     ) -> None:
         self.family_name = "bernoulli"
-        self.family_params = family_params if family_params else {"max_val": 30}
+        default_family_params: dict[str, Any] = {"max_val": 30}
+        self.family_params = family_params if family_params else default_family_params
+        self.family_params.update(kwargs)
+        for key, value in default_family_params.items():
+            self.family_params.setdefault(key, value)
 
     def sufficient_statistics(self, X: torch.Tensor) -> torch.Tensor:
         return X
@@ -399,7 +407,7 @@ class SigmoidBeta(Beta):
 
     This distribution is similar to the previous Beta (which it
     inherits from) but the natural parameter is re-parametrized using
-    a Sigmoid. This is shown expeerimentally to stabilize the
+    a Sigmoid. This is shown experimentally to stabilize the
     optimisation by removing the ]0,1[ constraint.
 
     family_params of interest:

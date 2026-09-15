@@ -94,6 +94,14 @@ def test_every_family_fits_with_n_jobs(family: GLMFamily) -> None:
     assert model.fit(sample(family))
 
 
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_every_family_fits_with_partial_family_params(family: GLMFamily) -> None:
+    model = GLMPCA(
+        N_PC, family=family, family_params={"n_jobs": 2}, max_iter=1, batch_size=16
+    )
+    assert model.fit(sample(family))
+
+
 def test_without_n_jobs_the_family_setting_is_kept() -> None:
     model = GLMPCA(N_PC, family="beta", family_params={"n_jobs": 2})
     assert model.exponential_family.family_params["n_jobs"] == 2

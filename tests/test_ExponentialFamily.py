@@ -18,6 +18,7 @@ from glmpca.ExponentialFamily import (
     Beta,
     Gamma,
     Gaussian,
+    GLMFamily,
     LogNormal,
     Poisson,
     SigmoidBeta,
@@ -146,3 +147,16 @@ def test_positive_families_reject_values_that_are_not_positive(
         match=rf"The {family.__name__} family .* 1 of 100 values are 0 or negative",
     ):
         family().initialize_family_parameters(X)
+
+
+@pytest.mark.parametrize("family", list(GLMFamily), ids=lambda family: family.value)
+def test_every_family_fills_in_defaults_and_keyword_arguments(
+    family: GLMFamily,
+) -> None:
+    distribution = family.distribution()
+    defaults = distribution().family_params
+    family_params = distribution({"n_jobs": 2}, max_val=7).family_params
+
+    assert set(defaults) <= set(family_params)
+    assert family_params["n_jobs"] == 2
+    assert family_params["max_val"] == 7
