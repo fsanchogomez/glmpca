@@ -219,7 +219,9 @@ class Poisson(ExponentialFamily):
     r"""Poisson distribution
 
     family_params of interest:
-        - "min_val" (int) corresponding to the min value (replaces 0).
+        - "m" (float): saturated parameter of zero counts is -m instead of -inf
+        (Landgraf and Lee, 2020). Large values let zero counts dominate the
+        projection. Defaults to 1.
 
     """
 
@@ -227,7 +229,11 @@ class Poisson(ExponentialFamily):
         self, family_params: dict[str, Any] | None = None, **kwargs: object
     ) -> None:
         self.family_name = "poisson"
-        self.family_params = family_params if family_params else {"min_val": 1e-20}
+        default_family_params: dict[str, Any] = {"m": 1.0}
+        self.family_params = family_params if family_params else default_family_params
+        self.family_params.update(kwargs)
+        for key, value in default_family_params.items():
+            self.family_params.setdefault(key, value)
 
     def sufficient_statistics(self, X: torch.Tensor) -> torch.Tensor:
         return X
@@ -242,7 +248,7 @@ class Poisson(ExponentialFamily):
         return 1 / scipy.special.gamma(X + 1)
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.log(X).clip(self.family_params["min_val"])
+        return torch.where(X > 0, torch.log(X), -self.family_params["m"])
 
     def log_distribution(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """The computation of gamma function for the base measure (h) would lead to inf,

@@ -6,6 +6,7 @@ a grid of observations.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -54,6 +55,21 @@ def test_poisson_log_pmf_matches_scipy() -> None:
             scipy.stats.poisson.logpmf(X.numpy(), np.exp(float(theta))),
             decimal=3,
         )
+
+
+@pytest.mark.parametrize("m", [1.0, 2.5])
+def test_poisson_saturated_parameters_map_zero_counts_to_minus_m(m: float) -> None:
+    X = torch.tensor([0.0, 1.0, 3.0, 0.0])
+    torch.testing.assert_close(
+        Poisson({"m": m}).invert_g(X), torch.tensor([-m, 0.0, math.log(3.0), -m])
+    )
+
+
+@pytest.mark.parametrize(
+    "family_params", [None, {"n_jobs": 2}], ids=["none", "partial"]
+)
+def test_poisson_m_defaults_to_one(family_params: dict[str, int] | None) -> None:
+    assert Poisson(family_params).invert_g(torch.zeros(2)).tolist() == [-1.0, -1.0]
 
 
 @pytest.mark.parametrize(

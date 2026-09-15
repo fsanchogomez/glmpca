@@ -66,7 +66,7 @@ def test_a_family_name_and_its_member_select_the_same_distribution(
 
 
 def test_an_exponential_family_instance_is_used_as_given() -> None:
-    family = Poisson({"min_val": 1e-10})
+    family = Poisson({"m": 2.0})
     assert GLMPCA(N_PC, family=family).exponential_family is family
 
 
