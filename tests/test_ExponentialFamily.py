@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def seed() -> None:
-    torch.manual_seed(0)
+    torch.manual_seed(42)
 
 
 def test_gaussian_pdf_matches_scipy() -> None:
@@ -97,3 +97,20 @@ def test_gamma_pdf_matches_scipy() -> None:
                 ),
                 decimal=2,
             )
+
+
+@pytest.mark.parametrize("n_jobs", [4, -1])
+@pytest.mark.parametrize(
+    "family", [Beta, SigmoidBeta, Gamma], ids=["beta", "sigmoid_beta", "gamma"]
+)
+def test_parallel_family_parameter_fit_matches_sequential(
+    family: type[Beta | Gamma], n_jobs: int
+) -> None:
+    X = torch.rand(50, 30) * 0.8 + 0.1
+    sequential, parallel = family({"n_jobs": 1}), family({"n_jobs": n_jobs})
+    sequential.initialize_family_parameters(X)
+    parallel.initialize_family_parameters(X)
+
+    torch.testing.assert_close(
+        parallel.family_params["nu"], sequential.family_params["nu"], rtol=0, atol=0
+    )

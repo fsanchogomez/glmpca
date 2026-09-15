@@ -1,25 +1,56 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import anndata as ad
 import numpy as np
 import torch
 import torch.optim
+from geoopt import EuclideanStiefel, ManifoldParameter
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-try:
-    import mctorch.nn as mnn
-    import mctorch.optim as moptim
-except ImportError:
-    msg = "Please install mctorch package via `pip install --user mctorch-lib"
-    raise ImportError(msg) from ImportError
-
 from .ExponentialFamily import ExponentialFamily, GLMFamily
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from torch.optim.optimizer import ParamsT
+
 LEARNING_RATE_LIMIT = 10 ** (-10)
+
+
+class _RiemannianAdagrad(torch.optim.Optimizer):
+    def __init__(self, params: ParamsT, lr: float = 1e-2, eps: float = 1e-10) -> None:
+        super().__init__(params, {"lr": lr, "eps": eps})
+
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for point in group["params"]:
+                if point.grad is None:
+                    continue
+                manifold = point.manifold
+                state = self.state[point]
+                if not state:
+                    state["sum"] = torch.zeros_like(point)
+                rgrad = manifold.egrad2rgrad(point, point.grad)
+                state["sum"].add_(rgrad.square())
+                std = state["sum"].sqrt().add_(group["eps"])
+                direction = manifold.proju(point, rgrad / std)
+                point.copy_(manifold.retr(point, -group["lr"] * direction))
+        return loss
 
 
 class GLMPCA:
@@ -353,14 +384,14 @@ class GLMPCA:
 
         Returns
         -------
-        optimizer: mctorch.optim
-            mctorch optimiser instance
+        optimizer: _RiemannianAdagrad
+            Riemannian Adagrad optimiser instance
 
-        loadings: mnn.Parameter
-            mcTorch parameter instance with loadings constrained to the Stiefel manifold
+        loadings: geoopt.ManifoldParameter
+            geoopt parameter with loadings constrained to the Stiefel manifold
 
-        intercept: mnn.Parameter
-            mcTorch parameter instance with intercept.
+        intercept: geoopt.ManifoldParameter
+            geoopt parameter with intercept.
 
         lr_scheduler: torch.optim.scheduler
             Scheduler instance.
@@ -378,29 +409,20 @@ class GLMPCA:
             _, _, v = torch.linalg.svd(
                 parameters[random_idx] - torch.mean(parameters[random_idx], dim=0)
             )
-            loadings = mnn.Parameter(
-                data=v[: self.n_pc, :].T,
-                manifold=mnn.Stiefel(parameters.shape[1], self.n_pc),
-                requires_grad=True,
-            )
+            loadings = ManifoldParameter(v[: self.n_pc, :].T)
+            loadings.manifold = EuclideanStiefel()
         elif self.init == "random":
-            loadings = mnn.Parameter(
-                manifold=mnn.Stiefel(parameters.shape[1], self.n_pc), requires_grad=True
+            loadings = ManifoldParameter(
+                EuclideanStiefel().random(parameters.shape[1], self.n_pc)
             )
 
         # Initialize intercept
         if self.exponential_family.family_name in ["poisson"]:
-            intercept = mnn.Parameter(
-                torch.median(parameters[random_idx], dim=0).values,
-                manifold=mnn.Euclidean(parameters.shape[1]),
-                requires_grad=True,
+            intercept = ManifoldParameter(
+                torch.median(parameters[random_idx], dim=0).values
             )
         else:
-            intercept = mnn.Parameter(
-                torch.mean(parameters[random_idx], dim=0),
-                manifold=mnn.Euclidean(parameters.shape[1]),
-                requires_grad=True,
-            )
+            intercept = ManifoldParameter(torch.mean(parameters[random_idx], dim=0))
 
         # Load ExponentialFamily params to GPU (if they exist)
         self.exponential_family.load_family_params_to_gpu(self.device)
@@ -409,7 +431,7 @@ class GLMPCA:
         # TODO: allow for other optimizer to be used.
         # TODO: learning rate for intercept.
         print(f"LEARNING RATE: {self.learning_rate_}")
-        optimizer = moptim.rAdagrad(
+        optimizer = _RiemannianAdagrad(
             params=[
                 {"params": loadings, "lr": self.learning_rate_},
                 {"params": intercept, "lr": self.learning_rate_ * 0.01},

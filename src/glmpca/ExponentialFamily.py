@@ -1,15 +1,43 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import scipy
 import torch
-from joblib import Parallel, delayed
 from tqdm import tqdm
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
 saturation_eps = 10**-10
+
+
+def _n_workers(n_jobs: int) -> int:
+    if n_jobs >= 0:
+        return n_jobs
+    available = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else os.cpu_count() or 1
+    )
+    return max(available + 1 + n_jobs, 1)
+
+
+def _fit_columns(
+    fit: Callable[[np.ndarray], tuple[float, ...]],
+    columns: Iterable[np.ndarray],
+    n_columns: int,
+    n_jobs: int,
+) -> list[tuple[float, ...]]:
+    workers = _n_workers(n_jobs)
+    if workers == 1:
+        return list(tqdm(map(fit, columns), total=n_columns))
+    with ThreadPoolExecutor(workers) as executor:
+        return list(tqdm(executor.map(fit, columns), total=n_columns))
 
 
 class GLMFamily(str, Enum):
@@ -311,9 +339,12 @@ class Beta(ExponentialFamily):
             )
 
         self.family_params["nu"] = torch.Tensor(
-            Parallel(
-                n_jobs=self.family_params["n_jobs"], batch_size=100, backend="threading"
-            )(delayed(compute_beta_param)(values[:, idx]) for idx in tqdm(range(p)))
+            _fit_columns(
+                compute_beta_param,
+                (values[:, idx] for idx in range(p)),
+                p,
+                self.family_params["n_jobs"],
+            )
         )
         self.family_params["nu"] = torch.sum(self.family_params["nu"][:, :2], dim=1)
         assert self.family_params["nu"].shape[0] == p
@@ -506,9 +537,11 @@ class Gamma(ExponentialFamily):
         values = X.numpy()
 
         self.family_params["nu"] = torch.Tensor(
-            Parallel(n_jobs=self.family_params["n_jobs"])(
-                delayed(scipy.stats.gamma.fit)(values[:, idx], floc=0)
-                for idx in tqdm(range(p))
+            _fit_columns(
+                lambda column: scipy.stats.gamma.fit(column, floc=0),
+                (values[:, idx] for idx in range(p)),
+                p,
+                self.family_params["n_jobs"],
             )
         )
         self.family_params["nu"] = 1.0 / self.family_params["nu"][:, -1]

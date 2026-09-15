@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import anndata as ad
 import numpy as np
 import pytest
 import torch
+from geoopt import ManifoldParameter
 from glmpca.ExponentialFamily import GLMFamily, Poisson
-from glmpca.GLMPCA import GLMPCA
+from glmpca.GLMPCA import GLMPCA, _RiemannianAdagrad
 from scipy import sparse
 
 if TYPE_CHECKING:
@@ -112,3 +113,35 @@ def test_anndata_input_is_fitted_with_cells_as_features(
     torch.testing.assert_close(
         fitted_loadings(adata), fitted_loadings(torch.Tensor(counts.T))
     )
+
+
+@pytest.mark.parametrize("init", ["spectral", "random"])
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_fitted_loadings_are_orthonormal(
+    family: GLMFamily, init: Literal["spectral", "random"]
+) -> None:
+    model = GLMPCA(N_PC, family=family, init=init, max_iter=5, batch_size=16)
+    model.fit(sample(family))
+
+    assert model.saturated_loadings_ is not None
+    loadings = model.saturated_loadings_.detach()
+    torch.testing.assert_close(
+        loadings.T @ loadings, torch.eye(N_PC), rtol=0, atol=1e-5
+    )
+
+
+def test_riemannian_adagrad_on_euclidean_matches_torch_adagrad() -> None:
+    start, target = torch.randn(7), torch.randn(7)
+    ours = ManifoldParameter(start.clone())
+    theirs = torch.nn.Parameter(start.clone())
+    optimizers = {
+        ours: _RiemannianAdagrad([ours], lr=0.1),
+        theirs: torch.optim.Adagrad([theirs], lr=0.1, eps=1e-10),
+    }
+    for _ in range(50):
+        for point, optimizer in optimizers.items():
+            optimizer.zero_grad()
+            (point - target).square().sum().backward()
+            optimizer.step()
+
+    torch.testing.assert_close(ours.detach(), theirs.detach(), rtol=0, atol=1e-6)
