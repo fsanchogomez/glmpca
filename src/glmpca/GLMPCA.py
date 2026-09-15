@@ -142,8 +142,11 @@ class GLMPCA:
         parameters from a small random batch of the dataset, "random" performs a random
         initialization on the Stiefel manifold. Defaults to "spectral".
 
-    n_jobs: int
-        Number of jobs used in parallel operations. Defaults to 1.
+    n_jobs: int or None
+        Number of jobs for the per-feature fits of the family parameters. If given,
+        it is written to family_params["n_jobs"] and replaces any value there. Only
+        "beta", "sigmoid_beta" and "gamma" use it; the other families ignore it.
+        Defaults to None, which keeps the family setting.
 
     device: str, torch.device or None
         Device used to compute the saturated parameters and to train. None selects
@@ -164,7 +167,7 @@ class GLMPCA:
         gamma: float = 0.5,
         n_init: int = 1,
         init: Literal["spectral", "random"] = "spectral",
-        n_jobs: int = 1,
+        n_jobs: int | None = None,
         device: str | torch.device | None = None,
     ) -> None:
         self.n_pc = n_pc
@@ -204,6 +207,8 @@ class GLMPCA:
             )
         else:
             self.exponential_family = family
+        if n_jobs is not None:
+            self.exponential_family.family_params["n_jobs"] = n_jobs
 
     def fit(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
         r"""Fits a GLM-PCA to a specific dataset.

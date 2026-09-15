@@ -564,7 +564,6 @@ class LogNormal(ExponentialFamily):
     family_params of interest:
         - "min_val" (int): min data value. Defaults to 1e-5.
         - "max_val" (int): max data value. Defaults to 1e7.
-        - "n_jobs" (int): number of jobs, specifically for computing the "nu" parameter.
         - "method" (str): method use to compute the "nu" parameter per feature.
         Two possibles: "MLE" and "MM". Defaults to "MLE".
         - "eps" (float): minimum difference used for inverting the g function.
@@ -583,7 +582,6 @@ class LogNormal(ExponentialFamily):
         default_family_params: dict[str, Any] = {
             "min_val": 1e-5,
             "max_val": 1e7,
-            "n_jobs": 1,
             "eps": 1e-4,
             "maxiter": 100,
         }

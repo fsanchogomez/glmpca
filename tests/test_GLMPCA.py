@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 from geoopt import ManifoldParameter
-from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson
+from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson, _n_workers
 from glmpca.GLMPCA import GLMPCA, _RiemannianAdagrad
 from scipy import sparse
 
@@ -69,6 +69,50 @@ def test_a_family_name_and_its_member_select_the_same_distribution(
 def test_an_exponential_family_instance_is_used_as_given() -> None:
     family = Poisson({"m": 2.0})
     assert GLMPCA(N_PC, family=family).exponential_family is family
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_n_jobs_is_propagated_to_every_family(family: GLMFamily) -> None:
+    model = GLMPCA(N_PC, family=family, n_jobs=3)
+    assert model.exponential_family.family_params["n_jobs"] == 3
+
+
+def test_n_jobs_replaces_the_n_jobs_in_family_params() -> None:
+    model = GLMPCA(N_PC, family="beta", family_params={"n_jobs": 2}, n_jobs=3)
+    assert model.exponential_family.family_params["n_jobs"] == 3
+
+
+def test_n_jobs_is_propagated_to_a_family_instance() -> None:
+    family = Beta()
+    GLMPCA(N_PC, family=family, n_jobs=3)
+    assert family.family_params["n_jobs"] == 3
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_every_family_fits_with_n_jobs(family: GLMFamily) -> None:
+    model = GLMPCA(N_PC, family=family, n_jobs=2, max_iter=1, batch_size=16)
+    assert model.fit(sample(family))
+
+
+def test_without_n_jobs_the_family_setting_is_kept() -> None:
+    model = GLMPCA(N_PC, family="beta", family_params={"n_jobs": 2})
+    assert model.exponential_family.family_params["n_jobs"] == 2
+
+
+def test_the_family_fit_receives_the_n_jobs_given_to_glmpca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[int] = []
+
+    def recording_n_workers(n_jobs: int) -> int:
+        received.append(n_jobs)
+        return _n_workers(n_jobs)
+
+    monkeypatch.setattr("glmpca.ExponentialFamily._n_workers", recording_n_workers)
+    model = GLMPCA(N_PC, family="beta", n_jobs=2, max_iter=1, batch_size=16)
+    model.fit(sample(GLMFamily.beta))
+
+    assert received == [2]
 
 
 def test_an_unknown_family_name_is_rejected() -> None:
