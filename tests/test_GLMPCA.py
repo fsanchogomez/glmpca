@@ -16,6 +16,7 @@ from scipy import sparse
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 N_CELLS = 40
 N_FEATURES = 12
@@ -134,6 +135,31 @@ def test_anndata_input_is_fitted_with_cells_as_features(
     torch.testing.assert_close(
         fitted_loadings(adata), fitted_loadings(torch.Tensor(counts.T))
     )
+
+
+@pytest.mark.parametrize(
+    "matrix_type",
+    [np.asarray, sparse.csr_matrix, sparse.csc_matrix],
+    ids=lambda matrix_type: matrix_type.__name__,
+)
+def test_backed_anndata_input_is_fitted_like_in_memory_input(
+    matrix_type: Callable[[np.ndarray], Any], tmp_path: Path
+) -> None:
+    counts = (
+        np.random
+        .default_rng(0)
+        .poisson(3.0, size=(N_CELLS, N_FEATURES))
+        .astype(np.float32)
+    )
+    path = tmp_path / "counts.h5ad"
+    ad.AnnData(matrix_type(counts)).write_h5ad(path)
+    adata = ad.read_h5ad(path, backed="r")
+    try:
+        torch.testing.assert_close(
+            fitted_loadings(adata), fitted_loadings(torch.Tensor(counts.T))
+        )
+    finally:
+        adata.file.close()
 
 
 @pytest.mark.parametrize("init", ["spectral", "random"])

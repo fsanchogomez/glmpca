@@ -7,6 +7,7 @@ import anndata as ad
 import numpy as np
 import torch
 import torch.optim
+from anndata.abc import CSCDataset, CSRDataset
 from geoopt import EuclideanStiefel, ManifoldParameter
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 from torch.utils.data import DataLoader, TensorDataset
@@ -222,6 +223,8 @@ class GLMPCA:
 
         if isinstance(X, ad.AnnData):
             counts = X.X
+            if isinstance(counts, CSRDataset | CSCDataset):
+                counts = counts.to_memory()
             if isinstance(counts, csr_matrix | csc_matrix | csr_array | csc_array):
                 counts = counts.toarray()
             X_fit = torch.Tensor(np.asarray(counts).T)
