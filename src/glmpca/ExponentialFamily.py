@@ -474,11 +474,8 @@ class Gamma(ExponentialFamily):
     Original formulation presented in [Mourragui et al, 2023].
 
     family_params of interest:
-        - "min_val" (int): min data value. Defaults to 1e-5.
         - "max_val" (int): max data value. Defaults to 1e7.
         - "n_jobs" (int): number of jobs, specifically for computing the "nu" parameter.
-        - "method" (str): method use to compute the "nu" parameter per feature.
-        Two possibles: "MLE" and "MM". Defaults to "MLE".
         - "eps" (float): minimum difference used for inverting the g function.
         Defaults to 1e-4
         - "maxiter" (int): maximum number of iterations for the inversion of the
@@ -493,7 +490,6 @@ class Gamma(ExponentialFamily):
         if family_params is None or "nu" not in family_params:
             print("Gamma distribution not initialized yet")
         default_family_params: dict[str, Any] = {
-            "min_val": 1e-5,
             "max_val": 1e7,
             "n_jobs": 1,
             "eps": 1e-4,
@@ -584,13 +580,6 @@ class LogNormal(ExponentialFamily):
 
     family_params of interest:
         - "min_val" (int): min data value. Defaults to 1e-5.
-        - "max_val" (int): max data value. Defaults to 1e7.
-        - "method" (str): method use to compute the "nu" parameter per feature.
-        Two possibles: "MLE" and "MM". Defaults to "MLE".
-        - "eps" (float): minimum difference used for inverting the g function.
-        Defaults to 1e-4
-        - "maxiter" (int): maximum number of iterations for the inversion of the
-        g function. Defaults to 100.
 
     """
 
@@ -602,9 +591,6 @@ class LogNormal(ExponentialFamily):
             print("Log Normal distribution not initialized yet")
         default_family_params: dict[str, Any] = {
             "min_val": 1e-5,
-            "max_val": 1e7,
-            "eps": 1e-4,
-            "maxiter": 100,
         }
         self.family_params = family_params if family_params else default_family_params
         self.family_params.update(kwargs)
