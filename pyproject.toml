@@ -29,7 +29,14 @@ dependencies = [
     "torch",
     "geoopt",
     "tqdm",
-    ]
+    "typer",
+    "umap-learn",
+    "igraph",
+    "matplotlib",
+]
+
+[project.scripts]
+glmpca = "glmpca.cli.glmpca:cli"
 
 [project.optional-dependencies]
 test = [
