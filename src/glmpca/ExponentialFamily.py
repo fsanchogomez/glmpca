@@ -205,7 +205,7 @@ class Bernoulli(ExponentialFamily):
         return torch.ones_like(X)
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.log(X / (X - 1)).clip(
+        return torch.log(X / (1 - X)).clip(
             -self.family_params["max_val"], self.family_params["max_val"]
         )
 
