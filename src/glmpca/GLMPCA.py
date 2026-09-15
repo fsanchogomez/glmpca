@@ -454,7 +454,8 @@ class GLMPCA:
         )
         if self.init == "spectral":
             _, _, v = torch.linalg.svd(
-                parameters[random_idx] - torch.mean(parameters[random_idx], dim=0)
+                parameters[random_idx] - torch.mean(parameters[random_idx], dim=0),
+                full_matrices=False,
             )
             loadings = ManifoldParameter(v[: self.n_pc, :].T.to(device))
             loadings.manifold = EuclideanStiefel()
