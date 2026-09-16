@@ -9,9 +9,9 @@ import anndata as ad
 import numpy as np
 import pytest
 import torch
-from geoopt import ManifoldParameter
 from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson, _n_workers
-from glmpca.GLMPCA import GLMPCA, _RiemannianAdagrad
+from glmpca.GLMPCA import GLMPCA
+from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
 from scipy import sparse
 
 if TYPE_CHECKING:
@@ -276,7 +276,7 @@ def test_riemannian_adagrad_on_euclidean_matches_torch_adagrad() -> None:
     ours = ManifoldParameter(start.clone())
     theirs = torch.nn.Parameter(start.clone())
     optimizers = {
-        ours: _RiemannianAdagrad([ours], lr=0.1),
+        ours: RiemannianAdagrad([ours], lr=0.1),
         theirs: torch.optim.Adagrad([theirs], lr=0.1, eps=1e-10),
     }
     for _ in range(50):

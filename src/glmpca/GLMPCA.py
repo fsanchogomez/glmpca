@@ -2,24 +2,19 @@ from __future__ import annotations
 
 import copy
 import warnings
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import Any, Literal
 
 import anndata as ad
 import numpy as np
 import torch
 import torch.optim
 from anndata.abc import CSCDataset, CSRDataset
-from geoopt import EuclideanStiefel, ManifoldParameter
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from .ExponentialFamily import ExponentialFamily, GLMFamily
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from torch.optim.optimizer import ParamsT
+from .manifolds import EuclideanStiefel, ManifoldParameter, RiemannianAdagrad
 
 LEARNING_RATE_LIMIT = 10 ** (-10)
 
@@ -59,38 +54,6 @@ def _to_tensor(
         f"anndata.AnnData"
     )
     raise ValueError(msg)
-
-
-class _RiemannianAdagrad(torch.optim.Optimizer):
-    def __init__(self, params: ParamsT, lr: float = 1e-2, eps: float = 1e-10) -> None:
-        super().__init__(params, {"lr": lr, "eps": eps})
-
-    @overload
-    def step(self, closure: None = None) -> None: ...
-
-    @overload
-    def step(self, closure: Callable[[], float]) -> float: ...
-
-    @torch.no_grad()
-    def step(self, closure: Callable[[], float] | None = None) -> float | None:
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for group in self.param_groups:
-            for point in group["params"]:
-                if point.grad is None:
-                    continue
-                manifold = point.manifold
-                state = self.state[point]
-                if not state:
-                    state["sum"] = torch.zeros_like(point)
-                rgrad = manifold.egrad2rgrad(point, point.grad)
-                state["sum"].add_(rgrad.square())
-                std = state["sum"].sqrt().add_(group["eps"])
-                direction = manifold.proju(point, rgrad / std)
-                point.copy_(manifold.retr(point, -group["lr"] * direction))
-        return loss
 
 
 class GLMPCA:
@@ -470,11 +433,11 @@ class GLMPCA:
         optimizer: _RiemannianAdagrad
             Riemannian Adagrad optimiser instance
 
-        loadings: geoopt.ManifoldParameter
-            geoopt parameter with loadings constrained to the Stiefel manifold
+        loadings: ManifoldParameter
+            Parameter with loadings constrained to the Stiefel manifold
 
-        intercept: geoopt.ManifoldParameter
-            geoopt parameter with intercept.
+        intercept: ManifoldParameter
+            Parameter with the intercept.
 
         lr_scheduler: torch.optim.scheduler
             Scheduler instance.
@@ -495,7 +458,10 @@ class GLMPCA:
             loadings.manifold = EuclideanStiefel()
         elif self.init == "random":
             loadings = ManifoldParameter(
-                EuclideanStiefel().random(parameters.shape[1], self.n_pc, device=device)
+                EuclideanStiefel().random(
+                    parameters.shape[1], self.n_pc, device=device
+                ),
+                manifold=EuclideanStiefel(),
             )
 
         # Initialize intercept
@@ -512,7 +478,7 @@ class GLMPCA:
         # TODO: allow for other optimizer to be used.
         # TODO: learning rate for intercept.
         print(f"LEARNING RATE: {self.learning_rate_}")
-        optimizer = _RiemannianAdagrad(
+        optimizer = RiemannianAdagrad(
             params=[
                 {"params": loadings, "lr": self.learning_rate_},
                 {"params": intercept, "lr": self.learning_rate_ * 0.01},

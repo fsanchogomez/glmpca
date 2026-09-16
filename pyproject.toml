@@ -27,7 +27,6 @@ dependencies = [
     "numpy",
     "scipy",
     "torch",
-    "geoopt",
     "tqdm",
     "typer",
     "umap-learn",
