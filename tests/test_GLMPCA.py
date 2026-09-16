@@ -36,6 +36,10 @@ def sample(family: GLMFamily) -> torch.Tensor:
         return torch.randn(shape)
     if family is GLMFamily.poisson:
         return torch.poisson(torch.full(shape, 3.0))
+    if family is GLMFamily.negative_binomial:
+        return torch.distributions.NegativeBinomial(
+            5.0, probs=torch.tensor(0.4)
+        ).sample(shape)
     if family is GLMFamily.bernoulli:
         return torch.bernoulli(torch.full(shape, 0.4))
     if family in {GLMFamily.beta, GLMFamily.sigmoid_beta}:
@@ -69,11 +73,14 @@ def test_a_family_name_and_its_member_select_the_same_distribution(
 def test_an_exponential_family_instance_is_copied_with_its_parameters() -> None:
     family = Poisson({"m": 2.0})
 
-    used = GLMPCA(N_PC, family=family).exponential_family
+    used = GLMPCA(N_PC, family=family, chunk_size=64).exponential_family
 
     assert used is not family
     assert type(used) is Poisson
-    assert used.family_params == family.family_params
+    assert used.family_params["m"] == 2.0
+    # GLMPCA gives its own chunk_size to the copy, and leaves the caller's instance.
+    assert used.family_params["chunk_size"] == 64
+    assert "chunk_size" not in family.family_params
 
 
 @pytest.mark.parametrize("family", list(GLMFamily))
@@ -512,3 +519,18 @@ def test_a_chunk_size_below_one_is_rejected(chunk_size: int) -> None:
 
     with pytest.raises(ValueError, match="chunk_size"):
         model.fit(sample(GLMFamily.poisson))
+
+
+def test_a_negative_binomial_fit_accepts_the_mle_dispersion() -> None:
+    X = sample(GLMFamily.negative_binomial)
+    model = GLMPCA(
+        N_PC,
+        family="negative_binomial",
+        family_params={"method": "mle"},
+        max_iter=2,
+        batch_size=8,
+    )
+
+    assert model.fit(X)
+    assert model.exponential_family.family_params["nu"].shape == (N_FEATURES,)
+    assert model.exponential_family.family_params["chunk_size"] == model.chunk_size

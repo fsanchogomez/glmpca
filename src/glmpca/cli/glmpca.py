@@ -240,7 +240,8 @@ def main(
                 "[bold yellow]beta[/bold yellow], "
                 "[bold yellow]gamma[/bold yellow], "
                 "[bold yellow]lognormal[/bold yellow], "
-                "[bold yellow]sigmoid_beta[/bold yellow]."
+                "[bold yellow]sigmoid_beta[/bold yellow], "
+                "[bold yellow]negative_binomial[/bold yellow]."
             ),
         ),
     ] = GLMFamily.poisson,

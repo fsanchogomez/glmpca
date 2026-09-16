@@ -204,6 +204,7 @@ class GLMPCA:
             self.exponential_family.family_params = dict(family.family_params)
         if n_jobs is not None:
             self.exponential_family.family_params["n_jobs"] = n_jobs
+        self.exponential_family.family_params["chunk_size"] = chunk_size
 
     def fit(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
         r"""Fits a GLM-PCA to a specific dataset.
