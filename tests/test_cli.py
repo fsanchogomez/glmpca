@@ -168,6 +168,8 @@ def test_glmpca_passes_every_option_to_the_model(
             "random",
             "--device",
             "cpu",
+            "--chunkSize",
+            "16",
             "-p",
             "1",
         ],
@@ -185,6 +187,7 @@ def test_glmpca_passes_every_option_to_the_model(
     assert model.n_init == 2
     assert model.init == "random"
     assert model.device == "cpu"
+    assert model.chunk_size == 16
     assert model.exponential_family.family_params["n_jobs"] == 1
 
 
@@ -253,7 +256,9 @@ def test_glmpca_plots_the_umap_with_leiden_clusters(
     assert list(table.columns) == ["Cell_ID", "UMAP1", "UMAP2", "cluster"]
     assert table["Cell_ID"].tolist() == adata.obs_names.tolist()
     np.testing.assert_allclose(
-        table[["UMAP1", "UMAP2"]].to_numpy(), adata.obsm["X_umap"], rtol=1e-6
+        table[["UMAP1", "UMAP2"]].to_numpy(),
+        np.asarray(adata.obsm["X_umap"], dtype=np.float64),
+        rtol=1e-6,
     )
     assert table["cluster"].tolist() == adata.obs["leiden"].astype(str).tolist()
 

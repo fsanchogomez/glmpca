@@ -19,7 +19,7 @@ from matplotlib.figure import Figure
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 
 from glmpca.ExponentialFamily import GLMFamily, _n_workers
-from glmpca.GLMPCA import GLMPCA
+from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, GLMPCA
 
 DESCRIPTION = (
     "Reduce the dimensionality of a cell-by-feature matrix with GLM-PCA.\n\n"
@@ -317,6 +317,19 @@ def main(
             ),
         ),
     ] = Init.spectral,
+    chunk_size: Annotated[
+        int,
+        typer.Option(
+            "--chunkSize",
+            rich_help_panel=_OPTIMISATION,
+            help=(
+                "Number of cells handled at a time when the saturated parameters are "
+                "computed and when a run is scored. It bounds the memory of those two "
+                "steps and does not change the result. Lower it for a large dataset on "
+                "a small machine."
+            ),
+        ),
+    ] = DEFAULT_CHUNK_ROWS,
     # Clustering options
     n_neighbors: Annotated[
         int,
@@ -469,6 +482,7 @@ def main(
             gamma=gamma,
             n_init=n_init,
             init=init,
+            chunk_size=chunk_size,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
             cluster_resolution=cluster_resolution,
@@ -503,6 +517,7 @@ def main(
         init="spectral" if init is Init.spectral else "random",
         n_jobs=number_of_processors,
         device=device,
+        chunk_size=chunk_size,
     )
     try:
         model.fit(X)

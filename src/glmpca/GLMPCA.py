@@ -17,6 +17,7 @@ from .ExponentialFamily import ExponentialFamily, GLMFamily
 from .manifolds import EuclideanStiefel, ManifoldParameter, RiemannianAdagrad
 
 LEARNING_RATE_LIMIT = 10 ** (-10)
+DEFAULT_CHUNK_ROWS = 8192
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -44,9 +45,9 @@ def _to_tensor(
             counts = counts.to_memory()
         if isinstance(counts, csr_matrix | csc_matrix | csr_array | csc_array):
             counts = counts.toarray()
-        return torch.Tensor(np.asarray(counts))
+        return torch.from_numpy(np.ascontiguousarray(counts, dtype=np.float32))
     if isinstance(X, np.ndarray):
-        return torch.Tensor(X)
+        return torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
     if isinstance(X, torch.Tensor):
         return X.clone() if copy else X
     msg = (
@@ -138,6 +139,12 @@ class GLMPCA:
         "cuda" if it is available, else "cpu". The "mps" device is not supported.
         Fitted attributes are always stored on the CPU. Defaults to None.
 
+    chunk_size: int
+        Number of rows handled at a time when fit computes the saturated parameters and
+        when it scores a run on the whole dataset. It bounds the memory of those two
+        steps and does not change the result. Lower it for a large dataset on a small
+        machine. Defaults to 8192.
+
     """
 
     def __init__(
@@ -154,6 +161,7 @@ class GLMPCA:
         init: Literal["spectral", "random"] = "spectral",
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
+        chunk_size: int = DEFAULT_CHUNK_ROWS,
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -168,6 +176,7 @@ class GLMPCA:
         self.gamma = gamma
         self.step_size = step_size
         self.init = init
+        self.chunk_size = chunk_size
 
         self.saturated_loadings_: torch.Tensor | None = None
         # saturated_intercept_: before projecting
@@ -214,8 +223,11 @@ class GLMPCA:
         if self.init not in ("spectral", "random"):
             msg = f"init={self.init!r} is not valid. Use 'spectral' or 'random'."
             raise ValueError(msg)
+        if self.chunk_size < 1:
+            msg = f"chunk_size={self.chunk_size} is not valid. Use 1 or more."
+            raise ValueError(msg)
 
-        X_fit = _to_tensor(X, copy=True)
+        X_fit = _to_tensor(X)
         if X_fit.shape[0] < 2:
             msg = (
                 f"A fit needs at least 2 rows (cells), but the input has "
@@ -238,7 +250,12 @@ class GLMPCA:
         self.exponential_family.load_family_params_to_gpu(device)
 
         # Compute saturated parameters, alongside exponential family parameters
-        saturated_parameters = self.exponential_family.invert_g(X_fit.to(device)).cpu()
+        saturated_parameters = torch.empty_like(X_fit)
+        for start in range(0, X_fit.shape[0], self.chunk_size):
+            stop = start + self.chunk_size
+            saturated_parameters[start:stop] = self.exponential_family.invert_g(
+                X_fit[start:stop].to(device)
+            ).cpu()
 
         # Initialize the learning procedure
         self.loadings_learning_scores_ = []
@@ -260,7 +277,7 @@ class GLMPCA:
         # Select best model
         with torch.no_grad():
             training_cost = torch.stack([
-                self._optim_cost(loadings, intercept, X_fit, saturated_parameters)
+                self._full_cost(loadings, intercept, X_fit, saturated_parameters)
                 for loadings, intercept in runs
             ])
         best_model_idx = int(torch.argmin(training_cost))
@@ -297,8 +314,7 @@ class GLMPCA:
         saturated_parameters = self.exponential_family.invert_g(X_transform)
 
         # Compute intercept term
-        n = X_transform.shape[0]
-        intercept_term = intercept.unsqueeze(0).repeat(n, 1)
+        intercept_term = intercept.unsqueeze(0)
 
         projected_parameters = saturated_parameters - intercept_term
         projected_parameters = projected_parameters.matmul(loadings)
@@ -352,8 +368,6 @@ class GLMPCA:
         )
 
         # Run epoch in a for loop
-        self._loadings_epochs = [_loadings.clone().detach()]
-        self._intercept_epochs = [_intercept.clone().detach()]
         for _ in tqdm(range(self.max_iter)):
             for batch_data, batch_parameters in train_loader:
                 cost_step = self._optim_cost(
@@ -371,9 +385,6 @@ class GLMPCA:
                 _optimizer.zero_grad()
                 self.loadings_learning_rates_[-1].append(_lr_scheduler.get_last_lr())
             _lr_scheduler.step()
-
-            self._loadings_epochs.append(_loadings.clone().detach())
-            self._intercept_epochs.append(_intercept.clone().detach())
 
             # If NaN or Inf is found in the parameters, start over optimisation with
             # reduced learning rate.
@@ -396,9 +407,6 @@ class GLMPCA:
                 )
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-
-                self._loadings_epochs = []
-                self._intercept_epochs = []
 
                 return self._saturated_loading_iter(
                     saturated_parameters=saturated_parameters,
@@ -489,6 +497,22 @@ class GLMPCA:
         )
 
         return optimizer, loadings, intercept, lr_scheduler
+
+    def _full_cost(
+        self,
+        loadings: torch.Tensor,
+        intercept: torch.Tensor,
+        X: torch.Tensor,
+        parameters: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Sums the cost over chunks of chunk_size rows, to never expand X."""
+        total = torch.zeros((), dtype=X.dtype)
+        for start in range(0, X.shape[0], self.chunk_size):
+            stop = start + self.chunk_size
+            total = total + self._optim_cost(
+                loadings, intercept, X[start:stop], parameters[start:stop]
+            )
+        return total
 
     def _optim_cost(
         self,

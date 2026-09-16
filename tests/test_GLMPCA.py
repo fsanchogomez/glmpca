@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson, _n_workers
-from glmpca.GLMPCA import GLMPCA
+from glmpca.GLMPCA import GLMPCA, _to_tensor
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
 from scipy import sparse
 
@@ -442,3 +442,73 @@ def test_an_input_with_two_rows_is_fitted() -> None:
     model = GLMPCA(N_PC, family="beta", max_iter=1, batch_size=2)
 
     assert model.fit(sample(GLMFamily.beta)[:2])
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_the_chunked_saturation_equals_one_call(family: GLMFamily) -> None:
+    X = sample(family)
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    chunked = GLMPCA(N_PC, family=family, max_iter=1, batch_size=8, chunk_size=7)
+    chunked.fit(X)
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    whole = GLMPCA(N_PC, family=family, max_iter=1, batch_size=8, chunk_size=10**9)
+    whole.fit(X)
+
+    assert chunked.saturated_loadings_ is not None
+    assert whole.saturated_loadings_ is not None
+    torch.testing.assert_close(chunked.saturated_loadings_, whole.saturated_loadings_)
+
+
+def test_the_chunked_cost_equals_the_cost_of_the_whole_matrix() -> None:
+    X = sample(GLMFamily.poisson)
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8, chunk_size=7)
+    model.fit(X)
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_intercept_ is not None
+    parameters = model.exponential_family.invert_g(X)
+
+    with torch.no_grad():
+        whole = model._optim_cost(
+            model.saturated_loadings_, model.saturated_intercept_, X, parameters
+        )
+        chunked = model._full_cost(
+            model.saturated_loadings_, model.saturated_intercept_, X, parameters
+        )
+
+    torch.testing.assert_close(chunked, whole, rtol=1e-5, atol=1e-4)
+
+
+def test_a_float32_array_is_not_copied() -> None:
+    counts = (
+        np.random
+        .default_rng(0)
+        .poisson(3.0, size=(N_CELLS, N_FEATURES))
+        .astype(np.float32)
+    )
+
+    X = _to_tensor(counts)
+
+    assert X.data_ptr() == counts.__array_interface__["data"][0]
+
+
+def test_fit_does_not_change_the_input() -> None:
+    X = sample(GLMFamily.poisson)
+    before = X.clone()
+
+    GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8).fit(X)
+
+    torch.testing.assert_close(X, before)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_a_chunk_size_below_one_is_rejected(chunk_size: int) -> None:
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=1, batch_size=8, chunk_size=chunk_size
+    )
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        model.fit(sample(GLMFamily.poisson))
