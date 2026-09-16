@@ -357,3 +357,26 @@ def test_transform_rejects_an_unknown_input_type() -> None:
 
     with pytest.raises(ValueError, match="X format unrecognised"):
         model.transform([[1.0, 2.0]])  # ty: ignore[invalid-argument-type]
+
+
+def test_the_fitted_attributes_do_not_require_gradients() -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8)
+    model.fit(sample(GLMFamily.poisson))
+
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_intercept_ is not None
+    assert not model.saturated_loadings_.requires_grad
+    assert not model.saturated_intercept_.requires_grad
+    assert model.saturated_loadings_.numpy().shape == (N_FEATURES, N_PC)
+    assert model.saturated_intercept_.numpy().shape == (N_FEATURES,)
+
+
+def test_the_transform_output_does_not_require_gradients() -> None:
+    X = sample(GLMFamily.poisson)
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8)
+    model.fit(X)
+
+    scores = model.transform(X)
+
+    assert not scores.requires_grad
+    assert scores.numpy().shape == (N_CELLS, N_PC)

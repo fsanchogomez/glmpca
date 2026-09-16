@@ -292,7 +292,9 @@ class GLMPCA:
                 for loadings, intercept in runs
             ])
         best_model_idx = int(torch.argmin(training_cost))
-        self.saturated_loadings_, self.saturated_intercept_ = runs[best_model_idx]
+        best_loadings, best_intercept = runs[best_model_idx]
+        self.saturated_loadings_ = best_loadings.detach()
+        self.saturated_intercept_ = best_intercept.detach()
 
         return True
 

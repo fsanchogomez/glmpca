@@ -512,11 +512,10 @@ def main(
     loadings, intercept = model.saturated_loadings_, model.saturated_intercept_
     assert loadings is not None
     assert intercept is not None
-    with torch.no_grad():
-        scores = model.transform(X).numpy()
+    scores = model.transform(X).numpy()
     adata.obsm["X_glmPCA"] = scores
-    adata.varm["glmPCA_loadings"] = loadings.detach().numpy()
-    adata.var["glmPCA_intercept"] = intercept.detach().numpy()
+    adata.varm["glmPCA_loadings"] = loadings.numpy()
+    adata.var["glmPCA_intercept"] = intercept.numpy()
     adata.uns["glmPCA"] = {
         "params": {
             "n_pc": n_prin_comps,
