@@ -253,6 +253,13 @@ class GLMPCA:
             raise ValueError(msg)
 
         X_fit = _to_tensor(X, copy=True)
+        if X_fit.shape[0] < 2:
+            msg = (
+                f"A fit needs at least 2 rows (cells), but the input has "
+                f"{X_fit.shape[0]}. Check that the data has cells in rows and "
+                f"features in columns."
+            )
+            raise ValueError(msg)
 
         batch_size = self.batch_size
         if X_fit.shape[0] < batch_size:

@@ -418,3 +418,27 @@ def test_the_family_keeps_one_parameters_dictionary_over_a_fit() -> None:
 
     assert model.exponential_family.family_params is params
     assert "nu" in params
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_an_input_with_one_row_is_rejected(family: GLMFamily) -> None:
+    model = GLMPCA(N_PC, family=family, max_iter=1, batch_size=8)
+
+    with pytest.raises(ValueError, match="at least 2 rows"):
+        model.fit(sample(family)[:1])
+
+
+def test_an_anndata_with_one_row_is_rejected() -> None:
+    counts = (
+        np.random.default_rng(0).poisson(3.0, size=(1, N_FEATURES)).astype(np.float32)
+    )
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8)
+
+    with pytest.raises(ValueError, match="at least 2 rows"):
+        model.fit(ad.AnnData(counts))
+
+
+def test_an_input_with_two_rows_is_fitted() -> None:
+    model = GLMPCA(N_PC, family="beta", max_iter=1, batch_size=2)
+
+    assert model.fit(sample(GLMFamily.beta)[:2])
