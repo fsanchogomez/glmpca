@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import warnings
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -227,7 +228,8 @@ class GLMPCA:
                 self.family_params
             )
         else:
-            self.exponential_family = family
+            self.exponential_family = copy.copy(family)
+            self.exponential_family.family_params = dict(family.family_params)
         if n_jobs is not None:
             self.exponential_family.family_params["n_jobs"] = n_jobs
 

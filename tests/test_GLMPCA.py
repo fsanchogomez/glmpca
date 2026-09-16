@@ -66,9 +66,14 @@ def test_a_family_name_and_its_member_select_the_same_distribution(
     )
 
 
-def test_an_exponential_family_instance_is_used_as_given() -> None:
+def test_an_exponential_family_instance_is_copied_with_its_parameters() -> None:
     family = Poisson({"m": 2.0})
-    assert GLMPCA(N_PC, family=family).exponential_family is family
+
+    used = GLMPCA(N_PC, family=family).exponential_family
+
+    assert used is not family
+    assert type(used) is Poisson
+    assert used.family_params == family.family_params
 
 
 @pytest.mark.parametrize("family", list(GLMFamily))
@@ -82,10 +87,13 @@ def test_n_jobs_replaces_the_n_jobs_in_family_params() -> None:
     assert model.exponential_family.family_params["n_jobs"] == 3
 
 
-def test_n_jobs_is_propagated_to_a_family_instance() -> None:
-    family = Beta()
-    GLMPCA(N_PC, family=family, n_jobs=3)
-    assert family.family_params["n_jobs"] == 3
+def test_n_jobs_reaches_the_copy_of_a_family_instance_only() -> None:
+    family = Beta({"n_jobs": 2})
+
+    model = GLMPCA(N_PC, family=family, n_jobs=3)
+
+    assert model.exponential_family.family_params["n_jobs"] == 3
+    assert family.family_params["n_jobs"] == 2
 
 
 @pytest.mark.parametrize("family", list(GLMFamily))
@@ -380,3 +388,33 @@ def test_the_transform_output_does_not_require_gradients() -> None:
 
     assert not scores.requires_grad
     assert scores.numpy().shape == (N_CELLS, N_PC)
+
+
+def test_the_family_params_dictionary_of_the_caller_is_not_changed() -> None:
+    params = {"n_jobs": 2}
+    model = GLMPCA(N_PC, family="beta", family_params=params, max_iter=1, batch_size=16)
+
+    model.fit(sample(GLMFamily.beta))
+
+    assert params == {"n_jobs": 2}
+    assert "nu" in model.exponential_family.family_params
+
+
+def test_a_family_instance_of_the_caller_is_not_changed_by_a_fit() -> None:
+    family = Beta({"n_jobs": 2})
+    model = GLMPCA(N_PC, family=family, n_jobs=3, max_iter=1, batch_size=16)
+
+    model.fit(sample(GLMFamily.beta))
+
+    assert family.family_params["n_jobs"] == 2
+    assert "nu" not in family.family_params
+
+
+def test_the_family_keeps_one_parameters_dictionary_over_a_fit() -> None:
+    model = GLMPCA(N_PC, family="beta", max_iter=1, batch_size=16)
+    params = model.exponential_family.family_params
+
+    model.fit(sample(GLMFamily.beta))
+
+    assert model.exponential_family.family_params is params
+    assert "nu" in params

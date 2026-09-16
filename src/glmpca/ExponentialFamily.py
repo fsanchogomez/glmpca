@@ -106,7 +106,7 @@ class ExponentialFamily:
         self, family_params: dict[str, Any] | None = None, **kwargs: object
     ) -> None:
         self.family_name = "base"
-        self.family_params = family_params if family_params else {}
+        self.family_params = dict(family_params) if family_params else {}
 
     def sufficient_statistics(self, X: torch.Tensor) -> torch.Tensor:
         return X
@@ -146,14 +146,10 @@ class ExponentialFamily:
         return -torch.sum(expt)
 
     def load_family_params_to_gpu(self, device: torch.device) -> None:
-        self.family_params = {
-            k: (
-                self.family_params[k].to(device)
-                if type(self.family_params[k]) is torch.Tensor
-                else self.family_params[k]
-            )
-            for k in self.family_params
-        }
+        for key in self.family_params:
+            value = self.family_params[key]
+            if type(value) is torch.Tensor:
+                self.family_params[key] = value.to(device)
 
     def initialize_family_parameters(self, X: torch.Tensor) -> None:
         """General method to initialize certain parameters (e.g. for Beta or Negative
@@ -171,7 +167,9 @@ class Gaussian(ExponentialFamily):
     ) -> None:
         self.family_name = "gaussian"
         default_family_params: dict[str, Any] = {}
-        self.family_params = family_params if family_params else default_family_params
+        self.family_params = (
+            dict(family_params) if family_params else default_family_params
+        )
         self.family_params.update(kwargs)
         for key, value in default_family_params.items():
             self.family_params.setdefault(key, value)
@@ -206,7 +204,9 @@ class Bernoulli(ExponentialFamily):
     ) -> None:
         self.family_name = "bernoulli"
         default_family_params: dict[str, Any] = {"max_val": 30}
-        self.family_params = family_params if family_params else default_family_params
+        self.family_params = (
+            dict(family_params) if family_params else default_family_params
+        )
         self.family_params.update(kwargs)
         for key, value in default_family_params.items():
             self.family_params.setdefault(key, value)
@@ -249,7 +249,9 @@ class Poisson(ExponentialFamily):
     ) -> None:
         self.family_name = "poisson"
         default_family_params: dict[str, Any] = {"m": 1.0}
-        self.family_params = family_params if family_params else default_family_params
+        self.family_params = (
+            dict(family_params) if family_params else default_family_params
+        )
         self.family_params.update(kwargs)
         for key, value in default_family_params.items():
             self.family_params.setdefault(key, value)
@@ -308,7 +310,9 @@ class Beta(ExponentialFamily):
             "maxiter": 100,
             "method": "MLE",
         }
-        self.family_params = family_params if family_params else default_family_params
+        self.family_params = (
+            dict(family_params) if family_params else default_family_params
+        )
         self.family_params.update(kwargs)
         for key, value in default_family_params.items():
             self.family_params.setdefault(key, value)
@@ -495,7 +499,9 @@ class Gamma(ExponentialFamily):
             "eps": 1e-4,
             "maxiter": 100,
         }
-        self.family_params = family_params if family_params else default_family_params
+        self.family_params = (
+            dict(family_params) if family_params else default_family_params
+        )
         self.family_params.update(kwargs)
         for key, value in default_family_params.items():
             self.family_params.setdefault(key, value)
@@ -592,7 +598,9 @@ class LogNormal(ExponentialFamily):
         default_family_params: dict[str, Any] = {
             "min_val": 1e-5,
         }
-        self.family_params = family_params if family_params else default_family_params
+        self.family_params = (
+            dict(family_params) if family_params else default_family_params
+        )
         self.family_params.update(kwargs)
         for key, value in default_family_params.items():
             self.family_params.setdefault(key, value)
