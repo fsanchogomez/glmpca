@@ -39,6 +39,27 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
     return resolved
 
 
+def _to_tensor(
+    X: torch.Tensor | np.ndarray | ad.AnnData, *, copy: bool = False
+) -> torch.Tensor:
+    if isinstance(X, ad.AnnData):
+        counts = X.X
+        if isinstance(counts, CSRDataset | CSCDataset):
+            counts = counts.to_memory()
+        if isinstance(counts, csr_matrix | csc_matrix | csr_array | csc_array):
+            counts = counts.toarray()
+        return torch.Tensor(np.asarray(counts))
+    if isinstance(X, np.ndarray):
+        return torch.Tensor(X)
+    if isinstance(X, torch.Tensor):
+        return X.clone() if copy else X
+    msg = (
+        f"X format unrecognised: {type(X)} != torch.Tensor, np.ndarray or "
+        f"anndata.AnnData"
+    )
+    raise ValueError(msg)
+
+
 class _RiemannianAdagrad(torch.optim.Optimizer):
     def __init__(self, params: ParamsT, lr: float = 1e-2, eps: float = 1e-10) -> None:
         super().__init__(params, {"lr": lr, "eps": eps})
@@ -229,20 +250,7 @@ class GLMPCA:
             msg = f"init={self.init!r} is not valid. Use 'spectral' or 'random'."
             raise ValueError(msg)
 
-        if isinstance(X, ad.AnnData):
-            counts = X.X
-            if isinstance(counts, CSRDataset | CSCDataset):
-                counts = counts.to_memory()
-            if isinstance(counts, csr_matrix | csc_matrix | csr_array | csc_array):
-                counts = counts.toarray()
-            X_fit = torch.Tensor(np.asarray(counts))
-        elif isinstance(X, np.ndarray):
-            X_fit = torch.Tensor(X)
-        elif isinstance(X, torch.Tensor):
-            X_fit = X.clone()
-        else:
-            msg = f"X format unrecognised: {type(X)} != np.ndarray or torch.Tensor"
-            raise ValueError(msg)
+        X_fit = _to_tensor(X, copy=True)
 
         batch_size = self.batch_size
         if X_fit.shape[0] < batch_size:
@@ -288,18 +296,19 @@ class GLMPCA:
 
         return True
 
-    def transform(self, X: torch.Tensor) -> torch.Tensor:
+    def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
         r"""Transforms and projects dataset X onto the principal components.
 
         Parameters
         ----------
-        X : torch.Tensor
-            Dataset with cells in rows and features in columns.
+        X : torch.Tensor, np.ndarray or AnnData
+            Dataset with cells in rows and features in columns. An np.ndarray or an
+            AnnData input is converted on the CPU, as in fit.
 
         Returns
         -------
         torch.Tensor
-            Projected saturated parameters.
+            Projected saturated parameters, on the device of the converted dataset.
 
         """
         loadings, intercept = self.saturated_loadings_, self.saturated_intercept_
@@ -307,12 +316,14 @@ class GLMPCA:
             msg = "GLMPCA is not fitted. Call fit() before transform()."
             raise RuntimeError(msg)
 
-        loadings, intercept = loadings.to(X.device), intercept.to(X.device)
-        self.exponential_family.load_family_params_to_gpu(X.device)
-        saturated_parameters = self.exponential_family.invert_g(X)
+        X_transform = _to_tensor(X)
+        device = X_transform.device
+        loadings, intercept = loadings.to(device), intercept.to(device)
+        self.exponential_family.load_family_params_to_gpu(device)
+        saturated_parameters = self.exponential_family.invert_g(X_transform)
 
         # Compute intercept term
-        n = X.shape[0]
+        n = X_transform.shape[0]
         intercept_term = intercept.unsqueeze(0).repeat(n, 1)
 
         projected_parameters = saturated_parameters - intercept_term

@@ -324,3 +324,36 @@ def test_a_cuda_fit_matches_the_cpu_fit(family: GLMFamily) -> None:
     cosines = torch.linalg.svdvals(cpu_loadings.detach().T @ cuda_loadings.detach())
     torch.testing.assert_close(cosines, torch.ones(N_PC), rtol=0, atol=1e-4)
     assert models["cuda"].transform(X.cuda()).device.type == "cuda"
+
+
+@pytest.mark.parametrize(
+    "matrix_type",
+    [np.asarray, sparse.csr_matrix, sparse.csc_matrix],
+    ids=lambda matrix_type: matrix_type.__name__,
+)
+def test_transform_accepts_anndata_and_ndarray_like_a_tensor(
+    matrix_type: Callable[[np.ndarray], Any],
+) -> None:
+    counts = (
+        np.random
+        .default_rng(0)
+        .poisson(3.0, size=(N_CELLS, N_FEATURES))
+        .astype(np.float32)
+    )
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8)
+    model.fit(torch.Tensor(counts))
+
+    expected = model.transform(torch.Tensor(counts))
+
+    torch.testing.assert_close(
+        model.transform(ad.AnnData(matrix_type(counts))), expected
+    )
+    torch.testing.assert_close(model.transform(counts), expected)
+
+
+def test_transform_rejects_an_unknown_input_type() -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8)
+    model.fit(sample(GLMFamily.poisson))
+
+    with pytest.raises(ValueError, match="X format unrecognised"):
+        model.transform([[1.0, 2.0]])  # ty: ignore[invalid-argument-type]
