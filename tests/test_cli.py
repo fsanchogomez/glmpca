@@ -159,8 +159,6 @@ def test_glmpca_passes_every_option_to_the_model(
             "0.1",
             "--batchSize",
             "16",
-            "--stepSize",
-            "5",
             "--gamma",
             "0.25",
             "--nInit",
@@ -186,7 +184,6 @@ def test_glmpca_passes_every_option_to_the_model(
     assert model.max_iter == 3
     assert model.initial_learning_rate_ == 0.1
     assert model.batch_size == 16
-    assert model.step_size == 5
     assert model.gamma == 0.25
     assert model.n_init == 2
     assert model.init == "random"

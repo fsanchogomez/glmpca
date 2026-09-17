@@ -245,7 +245,7 @@ def run_fast_poisson(
     """Fits the counts directly by Alternating Poisson Regression."""
     logging.info(
         "fast_poisson fits the counts directly, so the optimisation options "
-        "(--learningRate, --batchSize, --stepSize, --gamma, --nInit, --init) and "
+        "(--learningRate, --batchSize, --gamma, --nInit, --init) and "
         "--keepDepthPC do not apply. Its model holds a size factor for every cell."
     )
     try:
@@ -374,21 +374,14 @@ def main(
             ),
         ),
     ] = 256,
-    step_size: Annotated[
-        int,
-        typer.Option(
-            "--stepSize",
-            rich_help_panel=_OPTIMISATION,
-            help="Number of epochs between two reductions of the learning rate.",
-        ),
-    ] = 20,
     gamma: Annotated[
         float,
         typer.Option(
             "--gamma",
             rich_help_panel=_OPTIMISATION,
             help=(
-                "Factor that multiplies the learning rate every ``--stepSize`` epochs."
+                "Factor that multiplies the learning rate when the cost of an epoch "
+                "stops falling."
             ),
         ),
     ] = 0.5,
@@ -605,7 +598,6 @@ def main(
             max_iter=max_iter,
             learning_rate=learning_rate,
             batch_size=batch_size,
-            step_size=step_size,
             gamma=gamma,
             n_init=n_init,
             init=init,
@@ -642,7 +634,6 @@ def main(
                 max_iter=max_iter,
                 learning_rate=learning_rate,
                 batch_size=batch_size,
-                step_size=step_size,
                 gamma=gamma,
                 n_init=n_init,
                 init="spectral" if init is Init.spectral else "random",
@@ -664,7 +655,6 @@ def main(
             "max_iter": max_iter,
             "learning_rate": learning_rate,
             "batch_size": batch_size,
-            "step_size": step_size,
             "gamma": gamma,
             "n_init": n_init,
             "init": init.value,

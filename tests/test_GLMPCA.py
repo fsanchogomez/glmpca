@@ -10,7 +10,12 @@ import numpy as np
 import pytest
 import torch
 from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson, _n_workers
-from glmpca.GLMPCA import GLMPCA, LEARNING_RATE_LIMIT, _to_tensor
+from glmpca.GLMPCA import (
+    GLMPCA,
+    LEARNING_RATE_LIMIT,
+    PLATEAU_PATIENCE,
+    _to_tensor,
+)
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
 from scipy import sparse
 
@@ -196,18 +201,30 @@ def test_a_scheduled_learning_rate_under_the_limit_stops_the_fit() -> None:
     model = GLMPCA(
         N_PC,
         family="poisson",
-        max_iter=20,
+        max_iter=3 * PLATEAU_PATIENCE,
         batch_size=16,
         learning_rate=2 * LEARNING_RATE_LIMIT,
-        step_size=1,
         gamma=1e-3,
     )
 
     with pytest.warns(UserWarning, match="under the limit"):
         assert model.fit(X)
 
-    epochs_run = 2
-    assert [len(scores) for scores in model.loadings_learning_scores_] == [epochs_run]
+    (epochs_run,) = [len(scores) for scores in model.loadings_learning_scores_]
+    assert epochs_run < model.max_iter
+    assert model.loadings_learning_rates_[-1][-1][0] < LEARNING_RATE_LIMIT
+
+
+def test_a_fit_that_keeps_improving_does_not_lower_the_learning_rate() -> None:
+    X = sample(GLMFamily.poisson)
+    model = GLMPCA(N_PC, family="poisson", max_iter=PLATEAU_PATIENCE, batch_size=16)
+
+    model.fit(X)
+
+    # The plateau scheduler waits for PLATEAU_PATIENCE epochs without progress, so a
+    # fit this short always runs at the rate it started from.
+    rates = [rate[0] for rate in model.loadings_learning_rates_[-1]]
+    assert rates == [model.initial_learning_rate_] * len(rates)
 
 
 def test_a_batch_size_larger_than_the_row_count_is_reduced_with_a_warning() -> None:

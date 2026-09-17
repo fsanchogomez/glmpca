@@ -23,6 +23,8 @@ from .manifolds import (
 )
 
 LEARNING_RATE_LIMIT = 1e-8
+PLATEAU_PATIENCE = 10
+PLATEAU_THRESHOLD = 1e-4
 DEFAULT_CHUNK_ROWS = 8192
 DEPTH_CORRELATION_LIMIT = 0.8
 
@@ -120,22 +122,22 @@ class GLMPCA:
         high and leads to NaN, our implementation automatically restarts the
         optimisation with a smaller value. Defaults to 0.2.
 
-        The scheduler lowers this rate every step_size epochs (see gamma), with no
-        floor of its own. A fit whose scheduled rate falls under LEARNING_RATE_LIMIT
-        stops with a warning, because the steps no longer move the loadings.
+        The scheduler lowers this rate when the cost stops falling (see gamma), with
+        no floor of its own. A fit whose scheduled rate falls under
+        LEARNING_RATE_LIMIT stops with a warning, because the steps no longer move the
+        loadings.
 
     batch_size : int
         Size of the batch in the SGD optimisation step. If the matrix to fit has
         fewer rows, the number of rows is used instead and a warning is issued.
         Defaults to 256.
 
-    step_size: int
-        Step size in optimiser scheduler. Defaults to 20.
-        See more: https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.StepLR.html
-
     gamma: float
-        Reduction parameter for optimiser scheduler. Defaults to 0.5.
-        See more: https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.StepLR.html
+        Factor that multiplies the learning rate when the cost reaches a plateau, that
+        is, when PLATEAU_PATIENCE epochs pass without the cost of an epoch falling by
+        PLATEAU_THRESHOLD of the cost that the fit had when the rate last fell.
+        Defaults to 0.5.
+        See more: https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.ReduceLROnPlateau.html
 
     n_init: int
         Number of GLM-PCA initializations. Useful if you want to explore different
@@ -186,7 +188,6 @@ class GLMPCA:
         max_iter: int = 100,
         learning_rate: float = 0.2,
         batch_size: int = 256,
-        step_size: int = 20,
         gamma: float = 0.5,
         n_init: int = 1,
         init: Literal["spectral", "random"] = "spectral",
@@ -207,7 +208,6 @@ class GLMPCA:
         self.batch_size = batch_size
         self.n_init = n_init
         self.gamma = gamma
-        self.step_size = step_size
         self.init = init
         self.chunk_size = chunk_size
         self.keep_depth_pc = keep_depth_pc
@@ -492,8 +492,10 @@ class GLMPCA:
 
         # Run epoch in a for loop
         with tqdm(total=self.max_iter, unit="epoch", dynamic_ncols=True) as epochs:
+            cost_anchor: float | None = None
             for _ in range(self.max_iter):
                 epoch_log_likelihood = 0.0
+                epoch_cost = 0.0
                 for batch_data, batch_parameters, batch_base in train_loader:
                     cost_step = self._optim_cost(
                         loadings=_loadings,
@@ -506,6 +508,7 @@ class GLMPCA:
                     self.loadings_learning_scores_[-1].append(cost_value)
                     # The cost leaves out log h, which the bar puts back.
                     epoch_log_likelihood += float(batch_base.sum()) - float(cost_value)
+                    epoch_cost += float(cost_value)
                     cost_step.backward()
                     _optimizer.step()
                     _optimizer.zero_grad()
@@ -513,7 +516,11 @@ class GLMPCA:
                         _lr_scheduler.get_last_lr()
                     )
                 learning_rate = _lr_scheduler.get_last_lr()[0]
-                _lr_scheduler.step()
+                if cost_anchor is None:
+                    cost_anchor = max(abs(epoch_cost), 1e-12)
+                _lr_scheduler.step(epoch_cost / cost_anchor)
+                if _lr_scheduler.get_last_lr()[0] != learning_rate:
+                    cost_anchor = max(abs(epoch_cost), 1e-12)
 
                 # The log-likelihood of the cells seen in this epoch.
                 epochs.set_postfix(
@@ -557,8 +564,8 @@ class GLMPCA:
                     msg = (
                         f"The scheduled learning rate fell to {learning_rate:.2e}, "
                         f"under the limit of {LEARNING_RATE_LIMIT:.0e}. The loadings "
-                        f"have stopped moving, so the fit wil stop after this epoch. "
-                        f"Increase step_size or gamma to for a longer fit."
+                        f"have stopped moving, so the fit will stop after this epoch. "
+                        f"Increase gamma for a longer fit."
                     )
                     warnings.warn(msg, UserWarning, stacklevel=2)
                     break
@@ -571,7 +578,7 @@ class GLMPCA:
         torch.optim.Optimizer,
         torch.Tensor,
         torch.Tensor,
-        torch.optim.lr_scheduler.StepLR,
+        torch.optim.lr_scheduler.ReduceLROnPlateau,
     ]:
         r"""Initializes the optimisation problem.
 
@@ -640,8 +647,12 @@ class GLMPCA:
                 {"params": intercept, "lr": self.learning_rate_ * 0.01},
             ]
         )
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=self.step_size, gamma=self.gamma
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            factor=self.gamma,
+            patience=PLATEAU_PATIENCE,
+            threshold=PLATEAU_THRESHOLD,
+            threshold_mode="abs",
         )
 
         return optimizer, loadings, intercept, lr_scheduler
