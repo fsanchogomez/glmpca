@@ -33,6 +33,12 @@ coordinate, as in the paper. For coordinate `k` of row `i`, with `rate = exp(H)`
 Every row shares the same design, so a coordinate is updated for all rows at once, which
 is what makes this practical in torch.
 
+Each pass is accelerated by DAAREM (`glmpca.acceleration`), which is the acceleration
+that the paper names but leaves aside. One pass is one application of the fixed-point
+map, and the accelerator proposes a jump along the residuals of the last few passes. A
+jump is taken only when it keeps the log-likelihood, so the fit is no worse per pass and
+needs fewer of them. `accelerate=False` runs the plain algorithm.
+
 After the fit, the "PCA-like" decomposition comes from the SVD of the free part of
 `U Vᵀ`, computed through the QR factors so that no `n` by `p` matrix is formed.
 """
@@ -44,6 +50,7 @@ import warnings
 import torch
 from tqdm.auto import tqdm
 
+from .acceleration import DaaremAccelerator
 from .ExponentialFamily import Poisson
 from .GLMPCA import _announce_device, _resolve_device, _to_tensor
 
@@ -74,6 +81,16 @@ class FastPoissonPCA:
         Device to fit on. None selects "cuda" if it is available, else "cpu". The "mps"
         device is not supported. Fitted attributes are stored on the CPU.
 
+    accelerate : bool
+        Whether to accelerate the passes with DAAREM (`glmpca.acceleration`).
+        Defaults to True, which reaches a given log-likelihood in fewer passes. Turn it
+        off to run the plain algorithm of the paper, or to save memory, the
+        history, which is `2 * order * (n + p) * (K + 1)` numbers.
+
+    order : int
+        Number of passes that DAAREM keeps in its memory. Defaults to 5. It has no
+        effect when accelerate is False.
+
     Attributes
     ----------
     loadings_ : torch.Tensor
@@ -95,6 +112,9 @@ class FastPoissonPCA:
         Poisson log-likelihood after each pass, with the `-log(y!)` term, so that it is
         the real log-likelihood and not the optimisation objective alone.
 
+    accelerated_ : int
+        Number of passes that ended on an accelerated jump instead of the plain pass.
+
     """
 
     def __init__(
@@ -103,11 +123,15 @@ class FastPoissonPCA:
         max_iter: int = 100,
         tol: float = 1e-6,
         device: str | torch.device | None = None,
+        accelerate: bool = True,
+        order: int = 5,
     ) -> None:
         self.n_pc = n_pc
         self.max_iter = max_iter
         self.tol = tol
         self.device = device
+        self.accelerate = accelerate
+        self.order = order
 
         self.loadings_: torch.Tensor | None = None
         self.scores_: torch.Tensor | None = None
@@ -115,6 +139,7 @@ class FastPoissonPCA:
         self.intercept_: torch.Tensor | None = None
         self.size_factors_: torch.Tensor | None = None
         self.log_likelihoods_: list[float] = []
+        self.accelerated_ = 0
 
     def fit(self, X: object) -> bool:
         r"""Fits the model to counts with cells in rows and features in columns."""
@@ -142,17 +167,44 @@ class FastPoissonPCA:
         buffer = torch.empty_like(rate)
         # log h(y) = -log(y!) does not move with U or V, so one pass is enough. It is
         # what separates the objective of the fit from a real log-likelihood.
-        log_base_measure = float(Poisson().log_base_measure(Y).sum())
+        log_base_measure = float(Poisson().log_base_measure(Y).sum(dtype=torch.float64))
+        accelerator = None
+        if self.accelerate:
+            accelerator = DaaremAccelerator(
+                Y.shape[0] * len(free_in_u) + Y.shape[1] * len(free_in_v),
+                order=self.order,
+                device=Y.device,
+                dtype=Y.dtype,
+            )
         self.log_likelihoods_ = []
+        self.accelerated_ = 0
+        previous_point = -torch.inf
         previous = -torch.inf
         with tqdm(total=self.max_iter, unit="pass", dynamic_ncols=True) as passes:
             for _ in range(self.max_iter):
+                theta = _pack(U, V, free_in_u, free_in_v)
                 _descend(Y, U, V, rate, free_in_u, buffer, over_rows=True)
                 _descend(Y.T, V, U, rate, free_in_v, buffer, over_rows=False)
+                plain = _likelihood(Y, U, V, rate)
 
-                log_likelihood = (
-                    float((U * (Y @ V)).sum() - rate.sum()) + log_base_measure
-                )
+                current = plain
+                if accelerator is not None:
+                    stepped = _pack(U, V, free_in_u, free_in_v)
+                    proposal = accelerator.propose(theta, stepped - theta)
+                    if proposal is not None:
+                        _unpack(proposal, U, V, free_in_u, free_in_v)
+                        candidate = _jump_likelihood(Y, U, V, buffer)
+                        if candidate >= previous_point - accelerator.mon_tol:
+                            rate, buffer = buffer, rate
+                            current = candidate
+                            accelerator.accept(candidate)
+                            self.accelerated_ += 1
+                        else:
+                            _unpack(stepped, U, V, free_in_u, free_in_v)
+                            accelerator.reject(plain)
+                previous_point = current
+
+                log_likelihood = current + log_base_measure
                 self.log_likelihoods_.append(log_likelihood)
                 # The postfix waits for the update, so the bar is drawn one time a pass.
                 passes.set_postfix(log_lik=f"{log_likelihood:.4E}", refresh=False)
@@ -202,7 +254,7 @@ class FastPoissonPCA:
         for _ in range(self.max_iter):
             _descend(Y, U, V, rate, free, buffer, over_rows=True)
             # The same test as fit, so that transform stops as soon as it has landed.
-            likelihood = float((U * (Y @ V)).sum() - rate.sum())
+            likelihood = _likelihood(Y, U, V, rate)
             if abs(likelihood - previous) <= self.tol * abs(likelihood):
                 break
             previous = likelihood
@@ -235,6 +287,49 @@ class FastPoissonPCA:
         self.scores_ = (q_u @ left * singular_values).detach().cpu()
         self.loadings_ = (q_v @ right.T).detach().cpu()
         self.singular_values_ = singular_values.detach().cpu()
+
+
+def _pack(
+    U: torch.Tensor, V: torch.Tensor, free_in_u: list[int], free_in_v: list[int]
+) -> torch.Tensor:
+    """The free entries of both factors, in one flat vector."""
+    return torch.cat([U[:, free_in_u].reshape(-1), V[:, free_in_v].reshape(-1)])
+
+
+def _unpack(
+    theta: torch.Tensor,
+    U: torch.Tensor,
+    V: torch.Tensor,
+    free_in_u: list[int],
+    free_in_v: list[int],
+) -> None:
+    """Writes a flat vector from `_pack` back into the free entries of both factors."""
+    cut = U.shape[0] * len(free_in_u)
+    U[:, free_in_u] = theta[:cut].view(U.shape[0], len(free_in_u))
+    V[:, free_in_v] = theta[cut:].view(V.shape[0], len(free_in_v))
+
+
+def _likelihood(
+    Y: torch.Tensor, U: torch.Tensor, V: torch.Tensor, rate: torch.Tensor
+) -> float:
+    r"""`sum(Y * H) - sum(exp(H))` for the `H` that `rate` was built from.
+
+    The sums run in float64. At the size of a real matrix they reach 1e7, where float32
+    resolves to about 1, which is coarser than the tolerance of the fit.
+    """
+    return float((U * (Y @ V)).sum(dtype=torch.float64)) - float(
+        rate.sum(dtype=torch.float64)
+    )
+
+
+def _jump_likelihood(
+    Y: torch.Tensor, U: torch.Tensor, V: torch.Tensor, buffer: torch.Tensor
+) -> float:
+    """The same value when the rate is not built yet, leaving it in `buffer`."""
+    torch.matmul(U, V.T, out=buffer)
+    value = float((Y * buffer).sum(dtype=torch.float64))
+    buffer.clamp_(max=MAX_LOG_RATE).exp_()
+    return value - float(buffer.sum(dtype=torch.float64))
 
 
 def _descend(

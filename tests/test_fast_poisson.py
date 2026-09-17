@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import scipy.special
 import torch
+from glmpca.acceleration import DaaremAccelerator
 from glmpca.fast_poisson import FastPoissonPCA
 
 N_CELLS = 400
@@ -43,15 +44,69 @@ def subspace_cosines(first: np.ndarray, second: np.ndarray) -> np.ndarray:
     return np.linalg.svd(q_first.T @ q_second, compute_uv=False)
 
 
+def noise(model: FastPoissonPCA) -> float:
+    """The fit runs in float32, which shows in the float64 objective at about 1e-7."""
+    return 1e-6 * abs(model.log_likelihoods_[-1])
+
+
 def test_the_log_likelihood_never_falls() -> None:
     counts, _ = simulate()
-    model = FastPoissonPCA(N_PC, max_iter=50, tol=1e-12)
+    model = FastPoissonPCA(N_PC, max_iter=50, tol=1e-12, accelerate=False)
 
     model.fit(torch.tensor(counts))
 
     # The block updates of APR improve the log-likelihood at every pass.
     steps = np.diff(model.log_likelihoods_)
-    assert np.all(steps >= -1e-4), float(np.min(steps))
+    assert np.all(steps >= -noise(model)), float(np.min(steps))
+    assert model.accelerated_ == 0
+
+
+def test_an_accelerated_fit_stays_within_the_monotonicity_tolerance() -> None:
+    counts, _ = simulate()
+    model = FastPoissonPCA(N_PC, max_iter=50, tol=1e-12)
+
+    model.fit(torch.tensor(counts))
+
+    # DAAREM may take a jump that loses up to mon_tol, and nothing worse than that.
+    slack = DaaremAccelerator(4).mon_tol + noise(model)
+    steps = np.diff(model.log_likelihoods_)
+    assert np.all(steps >= -slack), float(np.min(steps))
+    assert model.accelerated_ > 0
+
+
+def test_acceleration_reaches_the_plain_fit_in_fewer_passes() -> None:
+    counts, _ = simulate()
+    budget = 20
+    plain = FastPoissonPCA(N_PC, max_iter=budget, tol=1e-12, accelerate=False)
+    accelerated = FastPoissonPCA(N_PC, max_iter=budget, tol=1e-12)
+
+    with pytest.warns(UserWarning, match="still moved"):
+        plain.fit(torch.tensor(counts))
+    with pytest.warns(UserWarning, match="still moved"):
+        accelerated.fit(torch.tensor(counts))
+
+    target = plain.log_likelihoods_[-1]
+    assert accelerated.log_likelihoods_[-1] > target
+    reached = next(
+        index
+        for index, value in enumerate(accelerated.log_likelihoods_, 1)
+        if value >= target
+    )
+    assert reached < budget
+
+
+def test_both_fits_find_the_same_subspace() -> None:
+    counts, _ = simulate()
+    plain = FastPoissonPCA(N_PC, max_iter=200, tol=1e-10, accelerate=False)
+    accelerated = FastPoissonPCA(N_PC, max_iter=200, tol=1e-10)
+
+    plain.fit(torch.tensor(counts))
+    accelerated.fit(torch.tensor(counts))
+
+    assert plain.scores_ is not None
+    assert accelerated.scores_ is not None
+    cosines = subspace_cosines(accelerated.scores_.numpy(), plain.scores_.numpy())
+    assert cosines.min() > 0.99, cosines
 
 
 def test_a_fit_that_did_not_converge_warns() -> None:

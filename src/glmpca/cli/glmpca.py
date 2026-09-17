@@ -248,6 +248,8 @@ def run_fast_poisson(
         "(--learningRate, --batchSize, --gamma, --nInit, --init) and "
         "--keepDepthPC do not apply. Its model holds a size factor for every cell."
     )
+    if not model.accelerate:
+        logging.info("DAAREM acceleration is off, as --noDaarem was given.")
     try:
         model.fit(adata)
     except ValueError as exc:
@@ -424,6 +426,20 @@ def main(
             ),
         ),
     ] = Optimizer.adagrad,
+    no_accelerate: Annotated[
+        bool,
+        typer.Option(
+            "--noDaarem",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Turn off the DAAREM acceleration of ``-gf fast_poisson``, which runs "
+                "the plain algorithm of the paper. The acceleration reaches a given "
+                "log-likelihood in fewer passes, at the cost of one extra pass over an "
+                "n by p matrix and a history of 2 x 5 x (n + p) x (nPrinComps + 1) "
+                "numbers. It does not apply to the other families."
+            ),
+        ),
+    ] = False,
     keep_depth_pc: Annotated[
         bool,
         typer.Option(
@@ -604,6 +620,7 @@ def main(
             optimizer=optimizer,
             chunk_size=chunk_size,
             keep_depth_pc=keep_depth_pc,
+            no_accelerate=no_accelerate,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
             cluster_resolution=cluster_resolution,
@@ -624,7 +641,13 @@ def main(
 
     if glmpca_family is FamilyChoice.fast_poisson:
         scores, loadings, intercept = run_fast_poisson(
-            FastPoissonPCA(n_pc=n_prin_comps, max_iter=max_iter, device=device), adata
+            FastPoissonPCA(
+                n_pc=n_prin_comps,
+                max_iter=max_iter,
+                device=device,
+                accelerate=not no_accelerate,
+            ),
+            adata,
         )
     else:
         scores, loadings, intercept = run_glmpca(
@@ -660,6 +683,7 @@ def main(
             "init": init.value,
             "optimizer": optimizer.value,
             "keep_depth_pc": keep_depth_pc,
+            "accelerate": not no_accelerate,
         },
     }
 

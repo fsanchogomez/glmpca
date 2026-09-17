@@ -345,3 +345,29 @@ def test_glmpca_runs_fast_poisson(tmp_path: Path) -> None:
     assert adata.varm["glmPCA_loadings"].shape == (N_FEATURES, N_PC)
     assert adata.var["glmPCA_intercept"].shape == (N_FEATURES,)
     assert adata.uns["glmPCA"]["params"]["family"] == "fast_poisson"
+    assert adata.uns["glmPCA"]["params"]["accelerate"]
+
+
+def test_no_accelerate_turns_the_acceleration_off(tmp_path: Path) -> None:
+    counts = (
+        np.random
+        .default_rng(0)
+        .poisson(3.0, size=(N_CELLS, N_FEATURES))
+        .astype(np.float32)
+    )
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(
+        write_input(tmp_path, counts),
+        out_path,
+        "-gf",
+        "fast_poisson",
+        "--maxIter",
+        "20",
+        "--noDaarem",
+    )
+
+    assert result.exit_code == 0, result.output
+    adata = ad.read_h5ad(out_path)
+    assert adata.obsm["X_glmPCA"].shape == (N_CELLS, N_PC)
+    assert not adata.uns["glmPCA"]["params"]["accelerate"]
