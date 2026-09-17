@@ -664,5 +664,5 @@ def test_every_family_fits_with_adam(family: GLMFamily) -> None:
 def test_an_unknown_optimizer_is_rejected(optimizer: str) -> None:
     model = GLMPCA(N_PC, family="poisson", optimizer=optimizer)  # ty: ignore[invalid-argument-type]
 
-    with pytest.raises(ValueError, match="Use 'adagrad' or 'adam'"):
+    with pytest.raises(ValueError, match="Use one of 'adagrad', 'adam', 'cg'"):
         model.fit(sample(GLMFamily.poisson))

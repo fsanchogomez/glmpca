@@ -6,7 +6,11 @@ The loadings live on the Stiefel manifold and the intercept in Euclidean space.
 """
 
 from .euclidean import Euclidean
-from .optimizer import RiemannianAdagrad, RiemannianAdam
+from .optimizer import (
+    RiemannianAdagrad,
+    RiemannianAdam,
+    RiemannianConjugateGradient,
+)
 from .parameter import ManifoldParameter
 from .stiefel import EuclideanStiefel
 
@@ -16,4 +20,5 @@ __all__ = [
     "ManifoldParameter",
     "RiemannianAdagrad",
     "RiemannianAdam",
+    "RiemannianConjugateGradient",
 ]

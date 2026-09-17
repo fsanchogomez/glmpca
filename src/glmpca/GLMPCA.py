@@ -20,8 +20,16 @@ from .manifolds import (
     ManifoldParameter,
     RiemannianAdagrad,
     RiemannianAdam,
+    RiemannianConjugateGradient,
 )
 
+_OPTIMIZERS = {
+    "adagrad": RiemannianAdagrad,
+    "adam": RiemannianAdam,
+    "cg": RiemannianConjugateGradient,
+}
+
+DEFAULT_LEARNING_RATE = 0.2
 LEARNING_RATE_LIMIT = 1e-8
 PLATEAU_PATIENCE = 10
 PLATEAU_THRESHOLD = 1e-4
@@ -165,10 +173,16 @@ class GLMPCA:
         machine. Defaults to 8192.
 
     optimizer: str
-        "adagrad" for the Riemannian Adagrad of this package, or "adam" for its
-        Riemannian Adam. The learning rate defaults are calibrated for Adagrad,
-        Adam usually performs better with a smaller learning rate (e.g., 0.01).
-        Defaults to "adagrad".
+        "adagrad" for the Riemannian Adagrad of this package, "adam" for its Riemannian
+        Adam, or "cg" for its Riemannian conjugate gradients. The learning rate defaults
+        are calibrated for Adagrad, Adam usually performs better with a smaller learning
+        rate (e.g., 0.01). Defaults to "adagrad".
+
+        "cg" is different in kind: it works on the whole matrix rather than on
+        mini-batches, and it has no learning rate, because it chooses every step by a
+        line search (4.5). learning_rate, gamma and the scheduler do not reach it, and
+        batch_size does not either. One of its steps costs several passes over the
+        matrix, and it lowers the cost at every one of them.
 
     keep_depth_pc: bool
         Whether to keep the components that follow the sequencing depth of the cells.
@@ -185,7 +199,7 @@ class GLMPCA:
         family: str | ExponentialFamily = "gaussian",
         family_params: dict[str, Any] | None = None,
         max_iter: int = 100,
-        learning_rate: float = 0.2,
+        learning_rate: float = DEFAULT_LEARNING_RATE,
         batch_size: int = 256,
         gamma: float = 0.5,
         n_init: int = 1,
@@ -194,7 +208,7 @@ class GLMPCA:
         device: str | torch.device | None = None,
         chunk_size: int = DEFAULT_CHUNK_ROWS,
         keep_depth_pc: bool = False,
-        optimizer: Literal["adagrad", "adam"] = "adagrad",
+        optimizer: Literal["adagrad", "adam", "cg"] = "adagrad",
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -262,12 +276,24 @@ class GLMPCA:
         if self.init not in ("spectral", "random"):
             msg = f"init={self.init!r} is not valid. Use 'spectral' or 'random'."
             raise ValueError(msg)
-        if self.optimizer not in ("adagrad", "adam"):
-            msg = f"optimizer={self.optimizer!r} is not valid. Use 'adagrad' or 'adam'."
+        if self.optimizer not in _OPTIMIZERS:
+            choices = ", ".join(repr(name) for name in _OPTIMIZERS)
+            msg = f"optimizer={self.optimizer!r} is not valid. Use one of {choices}."
             raise ValueError(msg)
         if self.chunk_size < 1:
             msg = f"chunk_size={self.chunk_size} is not valid. Use 1 or more."
             raise ValueError(msg)
+        if (
+            self.optimizer == "cg"
+            and self.initial_learning_rate_ != DEFAULT_LEARNING_RATE
+        ):
+            msg = (
+                f"learning_rate={self.initial_learning_rate_} is ignored by "
+                f"optimizer='cg', which has none: it chooses every step by a line "
+                f"search on the whole matrix. gamma and the scheduler do not reach it "
+                f"either."
+            )
+            warnings.warn(msg, UserWarning, stacklevel=2)
 
         X_fit = _to_tensor(X)
         if X_fit.shape[0] < 2:
@@ -481,52 +507,102 @@ class GLMPCA:
             )
         )
 
-        # Load dataset
-        train_data = TensorDataset(
-            X, saturated_parameters.data.clone(), log_base_measure
-        )
-        train_loader = DataLoader(
-            dataset=train_data, batch_size=batch_size, shuffle=True, drop_last=True
-        )
+        # Conjugate gradients works on the whole matrix, so it needs no loader: its
+        # line search has to see the same objective at every trial point (4.5).
+        train_data = train_loader = None
+        if self.optimizer != "cg":
+            train_data = TensorDataset(
+                X, saturated_parameters.data.clone(), log_base_measure
+            )
+            train_loader = DataLoader(
+                dataset=train_data, batch_size=batch_size, shuffle=True, drop_last=True
+            )
+
+        def closure() -> float:
+            """The cost of the whole matrix, with the gradient summed over chunks."""
+            _optimizer.zero_grad()
+            total = 0.0
+            for start in range(0, X.shape[0], self.chunk_size):
+                stop = start + self.chunk_size
+                cost = self._optim_cost(
+                    loadings=_loadings,
+                    intercept=_intercept,
+                    batch_data=X[start:stop].to(device),
+                    batch_parameters=saturated_parameters[start:stop].to(device),
+                )
+                cost.backward()
+                total += float(cost)
+            return total
 
         # Run epoch in a for loop
         with tqdm(total=self.max_iter, unit="epoch", dynamic_ncols=True) as epochs:
             cost_anchor: float | None = None
+            failed_searches = 0
             for _ in range(self.max_iter):
                 epoch_log_likelihood = 0.0
                 epoch_cost = 0.0
-                for batch_data, batch_parameters, batch_base in train_loader:
-                    cost_step = self._optim_cost(
-                        loadings=_loadings,
-                        intercept=_intercept,
-                        batch_data=batch_data.to(device),
-                        batch_parameters=batch_parameters.to(device),
+                learning_rate = self.learning_rate_
+                if isinstance(_optimizer, RiemannianConjugateGradient):
+                    # One line-search step on the whole matrix. The bar shows the step
+                    # it accepted, and the log-likelihood of every cell, not a sample.
+                    epoch_cost = float(_optimizer.step(closure))
+                    epoch_log_likelihood = float(log_base_measure.sum()) - epoch_cost
+                    self.loadings_learning_scores_[-1].append(np.float32(epoch_cost))
+                    self.loadings_learning_rates_[-1].append([_optimizer.last_step])
+                    epochs.set_postfix(
+                        step=f"{_optimizer.last_step:.2e}",
+                        log_lik=f"{epoch_log_likelihood:.4E}",
+                        refresh=False,
                     )
-
-                    cost_value = cost_step.detach().cpu().numpy()
-                    self.loadings_learning_scores_[-1].append(cost_value)
-                    # The cost leaves out log h, which the bar puts back.
-                    epoch_log_likelihood += float(batch_base.sum()) - float(cost_value)
-                    epoch_cost += float(cost_value)
-                    cost_step.backward()
-                    _optimizer.step()
-                    _optimizer.zero_grad()
-                    self.loadings_learning_rates_[-1].append(
-                        _lr_scheduler.get_last_lr()
+                    # One failed search only restarts the direction; two in a row
+                    # mean that steepest descent cannot improve the cost either.
+                    failed_searches = (
+                        failed_searches + 1 if _optimizer.last_step == 0.0 else 0
                     )
-                learning_rate = _lr_scheduler.get_last_lr()[0]
-                if cost_anchor is None:
-                    cost_anchor = max(abs(epoch_cost), 1e-12)
-                _lr_scheduler.step(epoch_cost / cost_anchor)
-                if _lr_scheduler.get_last_lr()[0] != learning_rate:
-                    cost_anchor = max(abs(epoch_cost), 1e-12)
+                    if failed_searches > 1:
+                        epochs.update(1)
+                        msg = (
+                            "The line search found no step that lowers the cost, from "
+                            "the conjugate direction or from the gradient, so the fit "
+                            "stops here. This is how optimizer='cg' converges."
+                        )
+                        warnings.warn(msg, UserWarning, stacklevel=2)
+                        break
+                elif train_loader is not None:
+                    for batch_data, batch_parameters, batch_base in train_loader:
+                        cost_step = self._optim_cost(
+                            loadings=_loadings,
+                            intercept=_intercept,
+                            batch_data=batch_data.to(device),
+                            batch_parameters=batch_parameters.to(device),
+                        )
 
-                # The log-likelihood of the cells seen in this epoch.
-                epochs.set_postfix(
-                    lr=f"{learning_rate:.2e}",
-                    log_lik=f"{epoch_log_likelihood:.4E}",
-                    refresh=False,
-                )
+                        cost_value = cost_step.detach().cpu().numpy()
+                        self.loadings_learning_scores_[-1].append(cost_value)
+                        # The cost leaves out log h, which the bar puts back.
+                        epoch_log_likelihood += float(batch_base.sum()) - float(
+                            cost_value
+                        )
+                        epoch_cost += float(cost_value)
+                        cost_step.backward()
+                        _optimizer.step()
+                        _optimizer.zero_grad()
+                        self.loadings_learning_rates_[-1].append(
+                            _lr_scheduler.get_last_lr()
+                        )
+                    learning_rate = _lr_scheduler.get_last_lr()[0]
+                    if cost_anchor is None:
+                        cost_anchor = max(abs(epoch_cost), 1e-12)
+                    _lr_scheduler.step(epoch_cost / cost_anchor)
+                    if _lr_scheduler.get_last_lr()[0] != learning_rate:
+                        cost_anchor = max(abs(epoch_cost), 1e-12)
+
+                    # The log-likelihood of the cells seen in this epoch.
+                    epochs.set_postfix(
+                        lr=f"{learning_rate:.2e}",
+                        log_lik=f"{epoch_log_likelihood:.4E}",
+                        refresh=False,
+                    )
                 epochs.update(1)
 
                 # If NaN or Inf is found in the parameters, start over optimisation with
@@ -559,7 +635,10 @@ class GLMPCA:
                         log_base_measure=log_base_measure,
                     )
 
-                if learning_rate <= LEARNING_RATE_LIMIT:
+                if (
+                    not isinstance(_optimizer, RiemannianConjugateGradient)
+                    and learning_rate <= LEARNING_RATE_LIMIT
+                ):
                     msg = (
                         f"The learning rate reached its floor of "
                         f"{LEARNING_RATE_LIMIT:.0e}. The loadings have stopped moving, "
@@ -637,7 +716,7 @@ class GLMPCA:
             )
 
         tqdm.write(f"LEARNING RATE: {self.learning_rate_}")
-        algorithm = RiemannianAdagrad if self.optimizer == "adagrad" else RiemannianAdam
+        algorithm = _OPTIMIZERS[self.optimizer]
         optimizer = algorithm(
             params=[
                 {"params": loadings, "lr": self.learning_rate_},

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 import pickle
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -12,7 +14,11 @@ from glmpca.manifolds import (
     ManifoldParameter,
     RiemannianAdagrad,
     RiemannianAdam,
+    RiemannianConjugateGradient,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 N_ROWS = 40
 N_COLUMNS = 4
@@ -170,3 +176,149 @@ def test_riemannian_adam_keeps_the_loadings_orthonormal() -> None:
     torch.testing.assert_close(
         parameter.data.T @ parameter.data, torch.eye(N_COLUMNS), atol=1e-5, rtol=0
     )
+
+
+def quadratic(
+    parameter: torch.Tensor, matrix: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """An ill-conditioned quadratic, where conjugacy is what buys the speed."""
+    difference = parameter - target
+    return (difference * (matrix @ difference)).sum()
+
+
+def quadratic_problem(size: int = 30) -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(0)
+    return torch.diag(torch.logspace(0, 3, size)), torch.randn(size, 1)
+
+
+def closure_of(
+    optimizer: torch.optim.Optimizer,
+    parameter: ManifoldParameter,
+    matrix: torch.Tensor,
+    target: torch.Tensor,
+) -> Callable[[], torch.Tensor]:
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad()
+        loss = quadratic(parameter, matrix, target)
+        loss.backward()
+        return loss
+
+    return closure
+
+
+def test_conjugate_gradient_beats_the_scaled_optimisers_on_a_quadratic() -> None:
+    matrix, target = quadratic_problem()
+    results = {}
+
+    parameter = ManifoldParameter(torch.zeros(matrix.shape[0], 1))
+    optimizer = RiemannianConjugateGradient([parameter])
+    closure = closure_of(optimizer, parameter, matrix, target)
+    for _ in range(20):
+        optimizer.step(closure)
+    results["cg"] = float(quadratic(parameter.data, matrix, target))
+
+    parameter = ManifoldParameter(torch.zeros(matrix.shape[0], 1))
+    plain = RiemannianAdagrad([parameter], lr=0.1)
+    for _ in range(20):
+        plain.zero_grad()
+        quadratic(parameter, matrix, target).backward()
+        plain.step()
+    results["adagrad"] = float(quadratic(parameter.data, matrix, target))
+
+    assert results["cg"] < results["adagrad"], results
+
+
+def test_the_line_search_never_lets_the_cost_rise() -> None:
+    matrix, target = quadratic_problem()
+    parameter = ManifoldParameter(torch.zeros(matrix.shape[0], 1))
+    optimizer = RiemannianConjugateGradient([parameter])
+    closure = closure_of(optimizer, parameter, matrix, target)
+
+    costs = [float(optimizer.step(closure)) for _ in range(20)]
+
+    assert all(later <= earlier for earlier, later in itertools.pairwise(costs)), costs
+
+
+def test_the_accepted_step_satisfies_the_wolfe_conditions() -> None:
+    matrix, target = quadratic_problem()
+    parameter = ManifoldParameter(torch.zeros(matrix.shape[0], 1))
+    optimizer = RiemannianConjugateGradient([parameter], c1=1e-4, c2=0.1)
+    closure = closure_of(optimizer, parameter, matrix, target)
+    optimizer.step(closure)
+
+    start = parameter.data.clone()
+    value = float(optimizer.step(closure))
+    state = optimizer.state[parameter]
+    direction = state["direction"].clone()
+    slope = float((state["grad"] * direction).sum())
+    step = optimizer.last_step
+
+    # Enough decrease, then enough flattening, at the point the search accepted.
+    landed = float(quadratic(parameter.data, matrix, target))
+    assert landed <= value + 1e-4 * step * slope
+    optimizer.zero_grad()
+    quadratic(parameter, matrix, target).backward()
+    assert parameter.grad is not None
+    assert abs(float((parameter.grad * direction).sum())) <= 0.1 * abs(slope)
+    assert not torch.equal(parameter.data, start)
+
+
+def test_conjugate_gradient_keeps_the_loadings_orthonormal() -> None:
+    parameter = ManifoldParameter(
+        EuclideanStiefel().random(N_ROWS, N_COLUMNS), manifold=EuclideanStiefel()
+    )
+    target = torch.randn(N_ROWS, N_COLUMNS)
+    optimizer = RiemannianConjugateGradient([parameter])
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad()
+        loss = ((parameter - target) ** 2).sum()
+        loss.backward()
+        return loss
+
+    for _ in range(20):
+        optimizer.step(closure)
+
+    torch.testing.assert_close(
+        parameter.data.T @ parameter.data, torch.eye(N_COLUMNS), atol=1e-5, rtol=0
+    )
+
+
+def test_the_first_direction_is_steepest_descent() -> None:
+    matrix, target = quadratic_problem(size=4)
+    parameter = ManifoldParameter(torch.zeros(4, 1))
+    optimizer = RiemannianConjugateGradient([parameter])
+    closure = closure_of(optimizer, parameter, matrix, target)
+
+    optimizer.step(closure)
+
+    assert optimizer.restarts == 1
+    state = optimizer.state[parameter]
+    torch.testing.assert_close(state["direction"], -state["grad"], atol=0, rtol=0)
+
+
+def test_every_direction_descends() -> None:
+    matrix, target = quadratic_problem(size=20)
+    parameter = ManifoldParameter(torch.zeros(20, 1))
+    optimizer = RiemannianConjugateGradient([parameter])
+    closure = closure_of(optimizer, parameter, matrix, target)
+
+    products = []
+    for _ in range(20):
+        optimizer.step(closure)
+        state = optimizer.state[parameter]
+        products.append(float((state["direction"] * state["grad"]).sum()))
+
+    assert all(product < 0 for product in products), max(products)
+
+
+def test_a_step_without_a_closure_is_refused() -> None:
+    optimizer = RiemannianConjugateGradient([ManifoldParameter(torch.zeros(3))])
+
+    with pytest.raises(RuntimeError, match="needs a closure"):
+        optimizer.step()
+
+
+def test_wolfe_constants_out_of_order_are_rejected() -> None:
+    with pytest.raises(ValueError, match="0 < c1 < c2 < 1"):
+        RiemannianConjugateGradient([ManifoldParameter(torch.zeros(3))], c1=0.5, c2=0.1)

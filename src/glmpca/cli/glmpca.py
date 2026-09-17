@@ -63,6 +63,7 @@ class Init(str, Enum):
 class Optimizer(str, Enum):
     adagrad = "adagrad"
     adam = "adam"
+    cg = "cg"
 
 
 class FamilyChoice(str, Enum):
@@ -420,9 +421,13 @@ def main(
             help=(
                 "The optimiser on the Stiefel manifold.\n\n"
                 "One of: [bold yellow]adagrad[/bold yellow], "
-                "[bold yellow]adam[/bold yellow]. The learning rate default is "
-                "calibrated for [bold yellow]adagrad[/bold yellow], and "
-                "[bold yellow]adam[/bold yellow] usually needs a smaller one."
+                "[bold yellow]adam[/bold yellow], [bold yellow]cg[/bold yellow] "
+                "(conjugate gradients). The learning rate default is calibrated for "
+                "[bold yellow]adagrad[/bold yellow], and "
+                "[bold yellow]adam[/bold yellow] usually needs a smaller one.\n\n"
+                "[bold yellow]cg[/bold yellow] works on the whole matrix and picks "
+                "every step by a line search, so --learningRate, --gamma and "
+                "--batchSize do not reach it. It stops when no step lowers the cost."
             ),
         ),
     ] = Optimizer.adagrad,
@@ -660,7 +665,7 @@ def main(
                 gamma=gamma,
                 n_init=n_init,
                 init="spectral" if init is Init.spectral else "random",
-                optimizer="adagrad" if optimizer is Optimizer.adagrad else "adam",
+                optimizer=optimizer.value,
                 n_jobs=number_of_processors,
                 device=device,
                 chunk_size=chunk_size,
