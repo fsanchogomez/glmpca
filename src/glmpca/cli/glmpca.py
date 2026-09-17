@@ -16,7 +16,8 @@ import pandas as pd
 import typer
 from matplotlib.figure import Figure
 
-from glmpca.ExponentialFamily import GLMFamily, _n_workers
+from glmpca.ExponentialFamily import _n_workers
+from glmpca.fast_poisson import FastPoissonPCA
 from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, DEPTH_CORRELATION_LIMIT, GLMPCA
 
 DESCRIPTION = (
@@ -57,6 +58,23 @@ CM_PER_INCH = 2.54
 class Init(str, Enum):
     spectral = "spectral"
     random = "random"
+
+
+class FamilyChoice(str, Enum):
+    """Every family of GLMPCA, and the direct Poisson fit of fast_poisson.
+
+    A test keeps this list equal to GLMFamily plus fast_poisson.
+    """
+
+    gaussian = "gaussian"
+    poisson = "poisson"
+    bernoulli = "bernoulli"
+    negative_binomial = "negative_binomial"
+    beta = "beta"
+    gamma = "gamma"
+    lognormal = "lognormal"
+    sigmoid_beta = "sigmoid_beta"
+    fast_poisson = "fast_poisson"
 
 
 class PlotFileFormat(str, Enum):
@@ -199,6 +217,49 @@ def plot_umap(
     figure.savefig(path, dpi=dpi, format=file_format.value)
 
 
+def run_glmpca(
+    model: GLMPCA, adata: ad.AnnData
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fits the saturated-parameter model and returns the arrays to store."""
+    try:
+        model.fit(adata)
+    except ValueError as exc:
+        raise fail(str(exc)) from exc
+
+    report_depth_components(model)
+
+    loadings, intercept = model.saturated_loadings_, model.saturated_intercept_
+    assert loadings is not None
+    assert intercept is not None
+    return model.transform(adata).numpy(), loadings.numpy(), intercept.numpy()
+
+
+def run_fast_poisson(
+    model: FastPoissonPCA, adata: ad.AnnData
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fits the counts directly by Alternating Poisson Regression."""
+    logging.info(
+        "fast_poisson fits the counts directly, so the optimisation options "
+        "(--learningRate, --batchSize, --stepSize, --gamma, --nInit, --init) and "
+        "--keepDepthPC do not apply. Its model holds a size factor for every cell."
+    )
+    try:
+        model.fit(adata)
+    except ValueError as exc:
+        raise fail(str(exc)) from exc
+
+    scores, loadings, intercept = model.scores_, model.loadings_, model.intercept_
+    assert scores is not None
+    assert loadings is not None
+    assert intercept is not None
+    logging.info(
+        "fast_poisson converged in %d passes, log-likelihood %.1f.",
+        len(model.log_likelihoods_),
+        model.log_likelihoods_[-1],
+    )
+    return scores.numpy(), loadings.numpy(), intercept.numpy()
+
+
 @app.callback(invoke_without_command=True)
 def main(
     # Input / Output options
@@ -254,7 +315,7 @@ def main(
         ),
     ] = 20,
     glmpca_family: Annotated[
-        GLMFamily,
+        FamilyChoice,
         typer.Option(
             "-gf",
             "--glmPCAfamily",
@@ -269,10 +330,14 @@ def main(
                 "[bold yellow]gamma[/bold yellow], "
                 "[bold yellow]lognormal[/bold yellow], "
                 "[bold yellow]sigmoid_beta[/bold yellow], "
-                "[bold yellow]negative_binomial[/bold yellow]."
+                "[bold yellow]negative_binomial[/bold yellow], "
+                "[bold yellow]fast_poisson[/bold yellow].\n\n"
+                "[bold yellow]fast_poisson[/bold yellow] fits the counts directly by "
+                "Alternating Poisson Regression (Weine et al. 2024) instead of the "
+                "saturated parameters, and ignores the optimisation options."
             ),
         ),
-    ] = GLMFamily.poisson,
+    ] = FamilyChoice.poisson,
     # Optimisation options
     max_iter: Annotated[
         int,
@@ -544,35 +609,32 @@ def main(
         msg = f"'{input}' has no matrix in .X."
         raise fail(msg)
 
-    model = GLMPCA(
-        n_pc=n_prin_comps,
-        family=glmpca_family.value,
-        max_iter=max_iter,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        step_size=step_size,
-        gamma=gamma,
-        n_init=n_init,
-        init="spectral" if init is Init.spectral else "random",
-        n_jobs=number_of_processors,
-        device=device,
-        chunk_size=chunk_size,
-        keep_depth_pc=keep_depth_pc,
-    )
-    try:
-        model.fit(adata)
-    except ValueError as exc:
-        raise fail(str(exc)) from exc
-
-    report_depth_components(model)
-
-    loadings, intercept = model.saturated_loadings_, model.saturated_intercept_
-    assert loadings is not None
-    assert intercept is not None
-    scores = model.transform(adata).numpy()
+    if glmpca_family is FamilyChoice.fast_poisson:
+        scores, loadings, intercept = run_fast_poisson(
+            FastPoissonPCA(n_pc=n_prin_comps, max_iter=max_iter, device=device), adata
+        )
+    else:
+        scores, loadings, intercept = run_glmpca(
+            GLMPCA(
+                n_pc=n_prin_comps,
+                family=glmpca_family.value,
+                max_iter=max_iter,
+                learning_rate=learning_rate,
+                batch_size=batch_size,
+                step_size=step_size,
+                gamma=gamma,
+                n_init=n_init,
+                init="spectral" if init is Init.spectral else "random",
+                n_jobs=number_of_processors,
+                device=device,
+                chunk_size=chunk_size,
+                keep_depth_pc=keep_depth_pc,
+            ),
+            adata,
+        )
     adata.obsm["X_glmPCA"] = scores
-    adata.varm["glmPCA_loadings"] = loadings.numpy()
-    adata.var["glmPCA_intercept"] = intercept.numpy()
+    adata.varm["glmPCA_loadings"] = loadings
+    adata.var["glmPCA_intercept"] = intercept
     adata.uns["glmPCA"] = {
         "params": {
             "n_pc": n_prin_comps,

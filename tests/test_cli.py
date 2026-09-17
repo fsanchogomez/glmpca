@@ -11,11 +11,12 @@ import torch
 import typer
 from glmpca.cli.glmpca import (
     AVAILABLE_PROCESSORS,
+    FamilyChoice,
     app,
     normalize_processors,
     umap_leiden,
 )
-from glmpca.ExponentialFamily import Gaussian
+from glmpca.ExponentialFamily import Gaussian, GLMFamily
 from glmpca.GLMPCA import GLMPCA
 from scipy import sparse
 from typer.testing import CliRunner
@@ -312,3 +313,35 @@ def test_glmpca_prints_the_help() -> None:
     assert "--nPrinComps" in result.output
     assert "--learningRate" in result.output
     assert "--outFileUMAP" in result.output
+
+
+def test_the_family_choices_are_the_library_families_plus_fast_poisson() -> None:
+    assert {choice.value for choice in FamilyChoice} == {
+        family.value for family in GLMFamily
+    } | {"fast_poisson"}
+
+
+def test_glmpca_runs_fast_poisson(tmp_path: Path) -> None:
+    counts = (
+        np.random
+        .default_rng(0)
+        .poisson(3.0, size=(N_CELLS, N_FEATURES))
+        .astype(np.float32)
+    )
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(
+        write_input(tmp_path, counts),
+        out_path,
+        "-gf",
+        "fast_poisson",
+        "--maxIter",
+        "20",
+    )
+
+    assert result.exit_code == 0, result.output
+    adata = ad.read_h5ad(out_path)
+    assert adata.obsm["X_glmPCA"].shape == (N_CELLS, N_PC)
+    assert adata.varm["glmPCA_loadings"].shape == (N_FEATURES, N_PC)
+    assert adata.var["glmPCA_intercept"].shape == (N_FEATURES,)
+    assert adata.uns["glmPCA"]["params"]["family"] == "fast_poisson"
