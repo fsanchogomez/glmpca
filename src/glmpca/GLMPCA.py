@@ -122,10 +122,9 @@ class GLMPCA:
         high and leads to NaN, our implementation automatically restarts the
         optimisation with a smaller value. Defaults to 0.2.
 
-        The scheduler lowers this rate when the cost stops falling (see gamma), with
-        no floor of its own. A fit whose scheduled rate falls under
-        LEARNING_RATE_LIMIT stops with a warning, because the steps no longer move the
-        loadings.
+        The scheduler lowers this rate when the cost stops falling (see gamma) and
+        never takes it below LEARNING_RATE_LIMIT. A fit that reaches that floor stops
+        with a warning, because the steps no longer move the loadings.
 
     batch_size : int
         Size of the batch in the SGD optimisation step. If the matrix to fit has
@@ -560,12 +559,12 @@ class GLMPCA:
                         log_base_measure=log_base_measure,
                     )
 
-                if learning_rate < LEARNING_RATE_LIMIT:
+                if learning_rate <= LEARNING_RATE_LIMIT:
                     msg = (
-                        f"The scheduled learning rate fell to {learning_rate:.2e}, "
-                        f"under the limit of {LEARNING_RATE_LIMIT:.0e}. The loadings "
-                        f"have stopped moving, so the fit will stop after this epoch. "
-                        f"Increase gamma for a longer fit."
+                        f"The learning rate reached its floor of "
+                        f"{LEARNING_RATE_LIMIT:.0e}. The loadings have stopped moving, "
+                        f"so the fit will stop after this epoch. Increase gamma for a "
+                        f"longer fit."
                     )
                     warnings.warn(msg, UserWarning, stacklevel=2)
                     break
@@ -637,8 +636,6 @@ class GLMPCA:
                 torch.mean(parameters[random_idx], dim=0).to(device)
             )
 
-        # Create optimizer
-        # TODO: learning rate for intercept.
         tqdm.write(f"LEARNING RATE: {self.learning_rate_}")
         algorithm = RiemannianAdagrad if self.optimizer == "adagrad" else RiemannianAdam
         optimizer = algorithm(
@@ -653,6 +650,8 @@ class GLMPCA:
             patience=PLATEAU_PATIENCE,
             threshold=PLATEAU_THRESHOLD,
             threshold_mode="abs",
+            min_lr=[LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * 0.01],
+            eps=0.0,
         )
 
         return optimizer, loadings, intercept, lr_scheduler

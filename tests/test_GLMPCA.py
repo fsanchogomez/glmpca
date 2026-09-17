@@ -207,12 +207,14 @@ def test_a_scheduled_learning_rate_under_the_limit_stops_the_fit() -> None:
         gamma=1e-3,
     )
 
-    with pytest.warns(UserWarning, match="under the limit"):
+    with pytest.warns(UserWarning, match="reached its floor"):
         assert model.fit(X)
 
     (epochs_run,) = [len(scores) for scores in model.loadings_learning_scores_]
     assert epochs_run < model.max_iter
-    assert model.loadings_learning_rates_[-1][-1][0] < LEARNING_RATE_LIMIT
+    rates = [rate[0] for rate in model.loadings_learning_rates_[-1]]
+    assert rates[-1] == LEARNING_RATE_LIMIT
+    assert min(rates) >= LEARNING_RATE_LIMIT
 
 
 def test_a_fit_that_keeps_improving_does_not_lower_the_learning_rate() -> None:
