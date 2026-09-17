@@ -13,13 +13,11 @@ import igraph
 import matplotlib as mpl
 import numpy as np
 import pandas as pd
-import torch
 import typer
 from matplotlib.figure import Figure
-from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 
 from glmpca.ExponentialFamily import GLMFamily, _n_workers
-from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, GLMPCA
+from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, DEPTH_CORRELATION_LIMIT, GLMPCA
 
 DESCRIPTION = (
     "Reduce the dimensionality of a cell-by-feature matrix with GLM-PCA.\n\n"
@@ -115,6 +113,36 @@ def configure_logging() -> None:
 def fail(message: str) -> typer.Exit:
     sys.stderr.write(message + "\n")
     return typer.Exit(code=1)
+
+
+def report_depth_components(model: GLMPCA) -> None:
+    """Logs which components follow the sequencing depth, dropped or kept.
+
+    The command hides warnings without --verbose, so the outcome is logged instead.
+    """
+    correlations = model.depth_correlations_
+    if correlations is None:
+        return
+    depth_pc = [
+        f"{component} (Spearman {correlations[component]:+.2f})"
+        for component in range(len(correlations))
+        if abs(float(correlations[component])) > DEPTH_CORRELATION_LIMIT
+    ]
+    if not depth_pc:
+        logging.info("No component follows the sequencing depth of the cells.")
+    elif model.keep_depth_pc:
+        logging.info(
+            "Kept %d component(s) that follow the sequencing depth "
+            "(--keepDepthPC): %s.",
+            len(depth_pc),
+            ", ".join(depth_pc),
+        )
+    else:
+        logging.info(
+            "Dropped %d component(s) that follow the sequencing depth: %s.",
+            len(depth_pc),
+            ", ".join(depth_pc),
+        )
 
 
 def umap_leiden(
@@ -318,6 +346,19 @@ def main(
             ),
         ),
     ] = Init.spectral,
+    keep_depth_pc: Annotated[
+        bool,
+        typer.Option(
+            "--keepDepthPC",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Keep the components that follow the sequencing depth of the cells. "
+                "Without this flag, every component whose absolute Spearman "
+                "correlation with the total counts per cell is above 0.8 is dropped, "
+                "so the output may hold fewer components than ``--nPrinComps``."
+            ),
+        ),
+    ] = False,
     chunk_size: Annotated[
         int,
         typer.Option(
@@ -484,6 +525,7 @@ def main(
             n_init=n_init,
             init=init,
             chunk_size=chunk_size,
+            keep_depth_pc=keep_depth_pc,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
             cluster_resolution=cluster_resolution,
@@ -498,13 +540,9 @@ def main(
         warnings.filterwarnings("ignore")
 
     adata = ad.read_h5ad(input)
-    counts = adata.X
-    if counts is None:
+    if adata.X is None:
         msg = f"'{input}' has no matrix in .X."
         raise fail(msg)
-    if isinstance(counts, csr_matrix | csc_matrix | csr_array | csc_array):
-        counts = counts.toarray()
-    X = torch.Tensor(np.asarray(counts))
 
     model = GLMPCA(
         n_pc=n_prin_comps,
@@ -519,16 +557,19 @@ def main(
         n_jobs=number_of_processors,
         device=device,
         chunk_size=chunk_size,
+        keep_depth_pc=keep_depth_pc,
     )
     try:
-        model.fit(X)
+        model.fit(adata)
     except ValueError as exc:
         raise fail(str(exc)) from exc
+
+    report_depth_components(model)
 
     loadings, intercept = model.saturated_loadings_, model.saturated_intercept_
     assert loadings is not None
     assert intercept is not None
-    scores = model.transform(X).numpy()
+    scores = model.transform(adata).numpy()
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings.numpy()
     adata.var["glmPCA_intercept"] = intercept.numpy()
@@ -543,6 +584,7 @@ def main(
             "gamma": gamma,
             "n_init": n_init,
             "init": init.value,
+            "keep_depth_pc": keep_depth_pc,
         },
     }
 

@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 import anndata as ad
 import numpy as np
+import scipy.stats
 import torch
 import torch.optim
 from anndata.abc import CSCDataset, CSRDataset
@@ -18,6 +19,7 @@ from .manifolds import EuclideanStiefel, ManifoldParameter, RiemannianAdagrad
 
 LEARNING_RATE_LIMIT = 10 ** (-10)
 DEFAULT_CHUNK_ROWS = 8192
+DEPTH_CORRELATION_LIMIT = 0.8
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -145,6 +147,13 @@ class GLMPCA:
         steps and does not change the result. Lower it for a large dataset on a small
         machine. Defaults to 8192.
 
+    keep_depth_pc: bool
+        Whether to keep the components that follow the sequencing depth of the cells.
+        With an AnnData input and keep_depth_pc False, fit drops every component whose
+        absolute Spearman correlation with the total counts per cell is above 0.9, and
+        records all the correlations in depth_correlations_. A tensor or ndarray input
+        is never filtered. Defaults to False.
+
     """
 
     def __init__(
@@ -162,6 +171,7 @@ class GLMPCA:
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
         chunk_size: int = DEFAULT_CHUNK_ROWS,
+        keep_depth_pc: bool = False,
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -177,8 +187,11 @@ class GLMPCA:
         self.step_size = step_size
         self.init = init
         self.chunk_size = chunk_size
+        self.keep_depth_pc = keep_depth_pc
 
         self.saturated_loadings_: torch.Tensor | None = None
+        # Spearman correlation of each component with the sequencing depth
+        self.depth_correlations_: torch.Tensor | None = None
         # saturated_intercept_: before projecting
         self.saturated_intercept_: torch.Tensor | None = None
         # reconstruction_intercept: after projecting
@@ -286,7 +299,67 @@ class GLMPCA:
         self.saturated_loadings_ = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
 
+        if isinstance(X, ad.AnnData):
+            self._check_depth_components(X_fit, saturated_parameters)
+
         return True
+
+    def _check_depth_components(
+        self, X_fit: torch.Tensor, saturated_parameters: torch.Tensor
+    ) -> None:
+        r"""Measures every component against the sequencing depth of the cells.
+
+        The first components of a count matrix often carry the depth of each cell and
+        not its biology. This measures each component against the total counts per cell
+        with a Spearman correlation, which needs no linear relation. Components above
+        DEPTH_CORRELATION_LIMIT are dropped, or kept with a message when
+        keep_depth_pc is True.
+        """
+        loadings, intercept = self.saturated_loadings_, self.saturated_intercept_
+        assert loadings is not None
+        assert intercept is not None
+
+        scores = (saturated_parameters - intercept.unsqueeze(0)).matmul(loadings)
+        depth = X_fit.sum(dim=1).numpy()
+        correlations = torch.tensor([
+            scipy.stats.spearmanr(scores[:, component].numpy(), depth).statistic
+            for component in range(scores.shape[1])
+        ])
+        # A component that never moves has no correlation to report.
+        self.depth_correlations_ = torch.nan_to_num(correlations, nan=0.0)
+
+        keep = self.depth_correlations_.abs() <= DEPTH_CORRELATION_LIMIT
+        if bool(keep.all()):
+            return
+
+        following = [
+            f"{component} (Spearman {self.depth_correlations_[component]:+.2f})"
+            for component in (~keep).nonzero().flatten().tolist()
+        ]
+        if self.keep_depth_pc:
+            msg = (
+                f"{len(following)} of {keep.numel()} components follow the sequencing "
+                f"depth and were kept because keep_depth_pc is True: "
+                f"{', '.join(following)}."
+            )
+            warnings.warn(msg, UserWarning, stacklevel=3)
+            return
+
+        if not bool(keep.any()):
+            msg = (
+                f"Every component follows the sequencing depth: "
+                f"{', '.join(following)}. Pass keep_depth_pc=True to keep them, or "
+                f"check the data for a depth effect that dominates the biology."
+            )
+            raise ValueError(msg)
+
+        msg = (
+            f"Dropped {len(following)} of {keep.numel()} components that follow the "
+            f"sequencing depth: {', '.join(following)}. Pass keep_depth_pc=True to "
+            f"keep them."
+        )
+        warnings.warn(msg, UserWarning, stacklevel=3)
+        self.saturated_loadings_ = loadings[:, keep]
 
     def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
         r"""Transforms and projects dataset X onto the principal components.

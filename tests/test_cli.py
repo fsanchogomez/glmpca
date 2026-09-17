@@ -170,6 +170,7 @@ def test_glmpca_passes_every_option_to_the_model(
             "cpu",
             "--chunkSize",
             "16",
+            "--keepDepthPC",
             "-p",
             "1",
         ],
@@ -188,6 +189,7 @@ def test_glmpca_passes_every_option_to_the_model(
     assert model.init == "random"
     assert model.device == "cpu"
     assert model.chunk_size == 16
+    assert model.keep_depth_pc is True
     assert model.exponential_family.family_params["n_jobs"] == 1
 
 

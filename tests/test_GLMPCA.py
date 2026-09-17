@@ -534,3 +534,64 @@ def test_a_negative_binomial_fit_accepts_the_mle_dispersion() -> None:
     assert model.fit(X)
     assert model.exponential_family.family_params["nu"].shape == (N_FEATURES,)
     assert model.exponential_family.family_params["chunk_size"] == model.chunk_size
+
+
+DEPTH_CELLS = 200
+DEPTH_FEATURES = 30
+
+
+def depth_driven_anndata() -> ad.AnnData:
+    """Counts whose first component is the sequencing depth of each cell."""
+    rng = np.random.default_rng(0)
+    rates = rng.gamma(2.0, 1.0, size=DEPTH_FEATURES)
+    depth = rng.lognormal(0.0, 1.0, size=DEPTH_CELLS)[:, None]
+    return ad.AnnData(rng.poisson(rates * depth).astype(np.float32))
+
+
+def test_a_component_that_follows_the_depth_is_dropped() -> None:
+    adata = depth_driven_anndata()
+    model = GLMPCA(3, family="poisson", max_iter=5, batch_size=32)
+
+    with pytest.warns(UserWarning, match="follow the sequencing depth"):
+        model.fit(adata)
+
+    assert model.depth_correlations_ is not None
+    assert model.depth_correlations_.shape == (3,)
+    assert model.depth_correlations_.abs().max() > 0.9
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape[1] < 3
+    assert model.transform(adata).shape == (
+        DEPTH_CELLS,
+        model.saturated_loadings_.shape[1],
+    )
+
+
+def test_keep_depth_pc_keeps_every_component_and_says_which() -> None:
+    adata = depth_driven_anndata()
+    model = GLMPCA(3, family="poisson", max_iter=5, batch_size=32, keep_depth_pc=True)
+
+    with pytest.warns(UserWarning, match="were kept because keep_depth_pc is True"):
+        model.fit(adata)
+
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape[1] == 3
+    assert model.depth_correlations_ is not None
+
+
+def test_a_tensor_input_is_never_filtered() -> None:
+    counts = torch.Tensor(np.asarray(depth_driven_anndata().X))
+    model = GLMPCA(3, family="poisson", max_iter=5, batch_size=32)
+
+    model.fit(counts)
+
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape[1] == 3
+    assert model.depth_correlations_ is None
+
+
+def test_dropping_every_component_is_refused() -> None:
+    adata = depth_driven_anndata()
+    model = GLMPCA(1, family="poisson", max_iter=5, batch_size=32)
+
+    with pytest.raises(ValueError, match="Every component follows"):
+        model.fit(adata)
