@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import scipy
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable

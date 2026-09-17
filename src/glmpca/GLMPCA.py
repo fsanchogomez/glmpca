@@ -12,7 +12,7 @@ import torch.optim
 from anndata.abc import CSCDataset, CSRDataset
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from .ExponentialFamily import ExponentialFamily, GLMFamily
 from .manifolds import (
@@ -457,52 +457,66 @@ class GLMPCA:
         )
 
         # Run epoch in a for loop
-        for _ in tqdm(range(self.max_iter)):
-            for batch_data, batch_parameters in train_loader:
-                cost_step = self._optim_cost(
-                    loadings=_loadings,
-                    intercept=_intercept,
-                    batch_data=batch_data.to(device),
-                    batch_parameters=batch_parameters.to(device),
-                )
+        with tqdm(total=self.max_iter, unit="epoch", dynamic_ncols=True) as epochs:
+            for _ in range(self.max_iter):
+                epoch_costs: list[float] = []
+                for batch_data, batch_parameters in train_loader:
+                    cost_step = self._optim_cost(
+                        loadings=_loadings,
+                        intercept=_intercept,
+                        batch_data=batch_data.to(device),
+                        batch_parameters=batch_parameters.to(device),
+                    )
 
-                self.loadings_learning_scores_[-1].append(
-                    cost_step.detach().cpu().numpy()
-                )
-                cost_step.backward()
-                _optimizer.step()
-                _optimizer.zero_grad()
-                self.loadings_learning_rates_[-1].append(_lr_scheduler.get_last_lr())
-            _lr_scheduler.step()
+                    cost_value = cost_step.detach().cpu().numpy()
+                    self.loadings_learning_scores_[-1].append(cost_value)
+                    epoch_costs.append(float(cost_value))
+                    cost_step.backward()
+                    _optimizer.step()
+                    _optimizer.zero_grad()
+                    self.loadings_learning_rates_[-1].append(
+                        _lr_scheduler.get_last_lr()
+                    )
+                learning_rate = _lr_scheduler.get_last_lr()[0]
+                _lr_scheduler.step()
 
-            # If NaN or Inf is found in the parameters, start over optimisation with
-            # reduced learning rate.
-            if np.isinf(self.loadings_learning_scores_[-1][-1]) or np.isnan(
-                self.loadings_learning_scores_[-1][-1]
-            ):
-                print("\tRESTART BECAUSE INF/NAN FOUND", flush=True)
-                self.learning_rate_ = self.learning_rate_ * self.gamma
-                self.loadings_learning_scores_ = self.loadings_learning_scores_[:-1]
-                self.loadings_learning_rates_ = self.loadings_learning_rates_[:-1]
-
-                # Remove memory
-                del (
-                    train_data,
-                    train_loader,
-                    _optimizer,
-                    _loadings,
-                    _intercept,
-                    _lr_scheduler,
+                # The cost is the negative log-likelihood, averaged over the batches
+                # of the epoch.
+                epochs.set_postfix(
+                    lr=f"{learning_rate:.2e}",
+                    cost=f"{np.mean(epoch_costs):.2f}",
+                    refresh=False,
                 )
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                epochs.update(1)
 
-                return self._saturated_loading_iter(
-                    saturated_parameters=saturated_parameters,
-                    X=X,
-                    batch_size=batch_size,
-                    device=device,
-                )
+                # If NaN or Inf is found in the parameters, start over optimisation with
+                # reduced learning rate.
+                if np.isinf(self.loadings_learning_scores_[-1][-1]) or np.isnan(
+                    self.loadings_learning_scores_[-1][-1]
+                ):
+                    tqdm.write("\tRESTART BECAUSE INF/NAN FOUND")
+                    self.learning_rate_ = self.learning_rate_ * self.gamma
+                    self.loadings_learning_scores_ = self.loadings_learning_scores_[:-1]
+                    self.loadings_learning_rates_ = self.loadings_learning_rates_[:-1]
+
+                    # Remove memory
+                    del (
+                        train_data,
+                        train_loader,
+                        _optimizer,
+                        _loadings,
+                        _intercept,
+                        _lr_scheduler,
+                    )
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+                    return self._saturated_loading_iter(
+                        saturated_parameters=saturated_parameters,
+                        X=X,
+                        batch_size=batch_size,
+                        device=device,
+                    )
 
         return (_loadings, _intercept)
 
@@ -573,7 +587,7 @@ class GLMPCA:
 
         # Create optimizer
         # TODO: learning rate for intercept.
-        print(f"LEARNING RATE: {self.learning_rate_}")
+        tqdm.write(f"LEARNING RATE: {self.learning_rate_}")
         algorithm = RiemannianAdagrad if self.optimizer == "adagrad" else RiemannianAdam
         optimizer = algorithm(
             params=[

@@ -42,7 +42,7 @@ from __future__ import annotations
 import warnings
 
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from .GLMPCA import _resolve_device, _to_tensor
 
@@ -137,7 +137,7 @@ class FastPoissonPCA:
         rate = torch.exp((U @ V.T).clip(max=MAX_LOG_RATE))
         self.log_likelihoods_ = []
         previous = -torch.inf
-        with tqdm(total=self.max_iter, unit="pass") as passes:
+        with tqdm(total=self.max_iter, unit="pass", dynamic_ncols=True) as passes:
             for _ in range(self.max_iter):
                 _descend(Y, U, V, rate, free_in_u)
                 _descend(Y.T, V, U, rate.T, free_in_v)
@@ -145,7 +145,7 @@ class FastPoissonPCA:
                 likelihood = float((U * (Y @ V)).sum() - rate.sum())
                 self.log_likelihoods_.append(likelihood)
                 # The postfix waits for the update, so the bar is drawn one time a pass.
-                passes.set_postfix(log_likelihood=f"{likelihood:.1f}", refresh=False)
+                passes.set_postfix(cost=f"{likelihood:.2f}", refresh=False)
                 passes.update(1)
                 if abs(likelihood - previous) <= self.tol * abs(likelihood):
                     break
