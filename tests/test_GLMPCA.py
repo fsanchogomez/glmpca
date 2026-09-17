@@ -14,6 +14,8 @@ from glmpca.GLMPCA import (
     GLMPCA,
     LEARNING_RATE_LIMIT,
     PLATEAU_PATIENCE,
+    _inverse_document_frequency,
+    _tf_idf,
     _to_tensor,
 )
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
@@ -310,13 +312,16 @@ def test_backed_anndata_input_is_fitted_like_in_memory_input(
         adata.file.close()
 
 
-@pytest.mark.parametrize("init", ["spectral", "random"])
+@pytest.mark.parametrize("init", ["spectral", "random", "lsi"])
 @pytest.mark.parametrize("family", list(GLMFamily))
 def test_fitted_loadings_are_orthonormal(
-    family: GLMFamily, init: Literal["spectral", "random"]
+    family: GLMFamily, init: Literal["spectral", "random", "lsi"]
 ) -> None:
+    X = sample(family)
+    if init == "lsi" and bool(torch.any(X < 0)):
+        pytest.skip("TF-IDF needs counts, and this family lives on other data.")
     model = GLMPCA(N_PC, family=family, init=init, max_iter=5, batch_size=16)
-    model.fit(sample(family))
+    model.fit(X)
 
     assert model.saturated_loadings_ is not None
     loadings = model.saturated_loadings_.detach()
@@ -666,3 +671,101 @@ def test_an_unknown_optimizer_is_rejected(optimizer: str) -> None:
 
     with pytest.raises(ValueError, match="Use one of 'adagrad', 'adam', 'cg'"):
         model.fit(sample(GLMFamily.poisson))
+
+
+def test_tf_idf_lifts_a_rare_feature_over_a_common_one() -> None:
+    # The first feature is in every cell, the third in one cell only.
+    counts = torch.tensor([
+        [5.0, 1.0, 0.0],
+        [5.0, 0.0, 0.0],
+        [5.0, 0.0, 0.0],
+        [5.0, 0.0, 3.0],
+    ])
+
+    weighted = _tf_idf(counts, _inverse_document_frequency(counts))
+
+    common = weighted[3, 0]
+    rare = weighted[3, 2]
+    # Both cells hold 5 and 3 counts, so the term frequencies are close, and it is the
+    # document frequency that puts the rare feature above the common one.
+    assert rare > common
+    assert torch.all(weighted[counts == 0] == 0)
+    assert torch.all(torch.isfinite(weighted))
+
+
+def test_tf_idf_survives_an_empty_row_and_an_empty_column() -> None:
+    counts = torch.tensor([[0.0, 2.0], [0.0, 0.0]])
+
+    weighted = _tf_idf(counts, _inverse_document_frequency(counts))
+
+    assert torch.all(torch.isfinite(weighted))
+    assert float(weighted[1, 1]) == 0.0
+
+
+def test_the_lsi_start_rejects_negative_values() -> None:
+    model = GLMPCA(N_PC, family="gaussian", init="lsi", max_iter=2, batch_size=16)
+
+    with pytest.raises(ValueError, match="TF-IDF needs counts"):
+        model.fit(torch.randn(20, 6))
+
+
+def test_the_lsi_start_differs_from_the_spectral_one() -> None:
+    X = sample(GLMFamily.poisson)
+    starts = {}
+    for init in ("spectral", "lsi"):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = GLMPCA(N_PC, family="poisson", init=init, max_iter=1, batch_size=16)
+        model.fit(X)
+        assert model.saturated_loadings_ is not None
+        starts[init] = model.saturated_loadings_.detach().clone()
+
+    assert not torch.allclose(starts["spectral"], starts["lsi"], atol=1e-4)
+
+
+def test_the_tfidf_option_fits_the_weighted_matrix() -> None:
+    X = sample(GLMFamily.poisson)
+    seen: list[torch.Tensor] = []
+    family = Poisson()
+    original = family.invert_g
+
+    def recording_invert_g(data: torch.Tensor) -> torch.Tensor:
+        seen.append(data.clone())
+        return original(data)
+
+    family.invert_g = recording_invert_g  # ty: ignore[invalid-assignment]
+    model = GLMPCA(N_PC, family=family, tfidf=True, max_iter=2, batch_size=16)
+
+    model.fit(X)
+
+    weighted = _tf_idf(X, _inverse_document_frequency(X))
+    torch.testing.assert_close(seen[0], weighted, rtol=0, atol=1e-6)
+    assert model.tfidf_weights_ is not None
+    assert model.tfidf_weights_.shape == (N_FEATURES,)
+
+
+def test_transform_weighs_new_cells_with_the_frequencies_of_the_fit() -> None:
+    X = sample(GLMFamily.poisson)
+    model = GLMPCA(N_PC, family="poisson", tfidf=True, max_iter=2, batch_size=16)
+    model.fit(X)
+    assert model.tfidf_weights_ is not None
+    fitted_weights = model.tfidf_weights_.clone()
+
+    # A subset holds different document frequencies, and transform must ignore them.
+    model.transform(X[:8])
+
+    torch.testing.assert_close(model.tfidf_weights_, fitted_weights, rtol=0, atol=0)
+
+
+def test_the_tfidf_option_is_refused_by_the_bounded_families() -> None:
+    model = GLMPCA(N_PC, family="bernoulli", tfidf=True, max_iter=2, batch_size=16)
+
+    with pytest.raises(ValueError, match="whose support is bounded"):
+        model.fit(sample(GLMFamily.bernoulli))
+
+
+def test_the_tfidf_option_rejects_negative_values() -> None:
+    model = GLMPCA(N_PC, family="gaussian", tfidf=True, max_iter=2, batch_size=16)
+
+    with pytest.raises(ValueError, match="TF-IDF needs counts"):
+        model.fit(torch.randn(20, 6))

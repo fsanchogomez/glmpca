@@ -58,6 +58,7 @@ CM_PER_INCH = 2.54
 class Init(str, Enum):
     spectral = "spectral"
     random = "random"
+    lsi = "lsi"
 
 
 class Optimizer(str, Enum):
@@ -405,10 +406,13 @@ def main(
             help=(
                 "Start values of the loadings. [bold yellow]spectral[/bold yellow] "
                 "uses the SVD of the saturated parameters of a random subset of "
-                "cells. [bold yellow]random[/bold yellow] uses a random point on the "
+                "cells. [bold yellow]lsi[/bold yellow] uses the SVD of the TF-IDF "
+                "of the counts of that subset, the start that LSI uses for sparse "
+                "single-cell data, and it needs counts. "
+                "[bold yellow]random[/bold yellow] uses a random point on the "
                 "Stiefel manifold.\n\n"
                 "One of: [bold yellow]spectral[/bold yellow], "
-                "[bold yellow]random[/bold yellow]."
+                "[bold yellow]lsi[/bold yellow], [bold yellow]random[/bold yellow]."
             ),
         ),
     ] = Init.spectral,
@@ -442,6 +446,19 @@ def main(
                 "log-likelihood in fewer passes, at the cost of one extra pass over an "
                 "n by p matrix and a history of 2 x 5 x (n + p) x (nPrinComps + 1) "
                 "numbers. It does not apply to the other families."
+            ),
+        ),
+    ] = False,
+    tfidf: Annotated[
+        bool,
+        typer.Option(
+            "--tfidf",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Fit the model to the TF-IDF of the counts rather than to the counts. "
+                "This is the weighting that ``--init lsi`` uses for its start, applied "
+                "to the matrix itself. It needs counts, and the families whose support "
+                "is bounded (bernoulli, beta, sigmoid_beta) refuse it."
             ),
         ),
     ] = False,
@@ -625,6 +642,7 @@ def main(
             optimizer=optimizer,
             chunk_size=chunk_size,
             keep_depth_pc=keep_depth_pc,
+            tfidf=tfidf,
             no_accelerate=no_accelerate,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
@@ -664,12 +682,13 @@ def main(
                 batch_size=batch_size,
                 gamma=gamma,
                 n_init=n_init,
-                init="spectral" if init is Init.spectral else "random",
+                init=init.value,
                 optimizer=optimizer.value,
                 n_jobs=number_of_processors,
                 device=device,
                 chunk_size=chunk_size,
                 keep_depth_pc=keep_depth_pc,
+                tfidf=tfidf,
             ),
             adata,
         )
@@ -688,6 +707,7 @@ def main(
             "init": init.value,
             "optimizer": optimizer.value,
             "keep_depth_pc": keep_depth_pc,
+            "tfidf": tfidf,
             "accelerate": not no_accelerate,
         },
     }

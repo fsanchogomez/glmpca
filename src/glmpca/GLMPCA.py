@@ -30,6 +30,8 @@ _OPTIMIZERS = {
 }
 
 DEFAULT_LEARNING_RATE = 0.2
+TFIDF_SCALE = 1e4
+BOUNDED_FAMILIES = ("bernoulli", "beta", "sigmoid_beta")
 LEARNING_RATE_LIMIT = 1e-8
 PLATEAU_PATIENCE = 10
 PLATEAU_THRESHOLD = 1e-4
@@ -43,6 +45,31 @@ def _announce_device(device: torch.device) -> None:
         tqdm.write(f"DEVICE: {device} ({torch.cuda.get_device_name(device)})")
     else:
         tqdm.write(f"DEVICE: {device}")
+
+
+def _inverse_document_frequency(counts: torch.Tensor) -> torch.Tensor:
+    """The number of cells over the number of cells that hold each feature."""
+    holders = (counts > 0).sum(dim=0).clip(min=1)
+    return counts.shape[0] / holders
+
+
+def _tf_idf(counts: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
+    r"""Term frequency times inverse document frequency, the matrix that LSI reduces.
+
+    The count of a feature in a cell is divided by the depth of that cell (the term
+    frequency), multiplied by `inverse` (the inverse document frequency, from
+    `_inverse_document_frequency`), scaled by TFIDF_SCALE and passed through `log1p`.
+    This is the "log-TF" form that Signac uses by default, with the document frequency
+    counted over cells rather than over reads, which is the textbook definition.
+
+    It is not centred: LSI reduces the TF-IDF matrix itself, and the component that
+    follows the depth of a cell is the one that `keep_depth_pc` deals with.
+
+    `inverse` is an argument rather than a second pass over `counts`, so that
+    `transform` can weigh new cells by the frequencies of the fit.
+    """
+    depth = counts.sum(dim=1, keepdim=True).clip(min=1.0)
+    return torch.log1p(counts / depth * inverse * TFIDF_SCALE)
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -152,8 +179,18 @@ class GLMPCA:
 
     init: str
         Method to initialize loadings. "spectral" performs SVD on  the saturated
-        parameters from a small random batch of the dataset, "random" performs a random
-        initialization on the Stiefel manifold. Defaults to "spectral".
+        parameters from a small random batch of the dataset, "lsi" performs SVD on the
+        TF-IDF of the counts of that batch, and "random" performs a random
+        initialization on the Stiefel manifold. "lsi" needs counts, so it rejects an
+        input with negative values. Defaults to "spectral".
+
+    tfidf: bool
+        Whether to fit the model to the TF-IDF of the counts rather than to the counts
+        themselves (4.4). The weighting is the one that init="lsi" uses for its start,
+        and transform weighs new cells by the document frequencies of the fit, so that
+        they land on the same scale. It needs counts, and it is refused for the families
+        whose support is bounded (bernoulli, beta, sigmoid_beta), because the TF-IDF of
+        counts is continuous and reaches past 1. Defaults to False.
 
     n_jobs: int or None
         Number of jobs for the per-feature fits of the family parameters. If given,
@@ -203,7 +240,8 @@ class GLMPCA:
         batch_size: int = 256,
         gamma: float = 0.5,
         n_init: int = 1,
-        init: Literal["spectral", "random"] = "spectral",
+        init: Literal["spectral", "random", "lsi"] = "spectral",
+        tfidf: bool = False,
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
         chunk_size: int = DEFAULT_CHUNK_ROWS,
@@ -222,6 +260,8 @@ class GLMPCA:
         self.n_init = n_init
         self.gamma = gamma
         self.init = init
+        self.tfidf = tfidf
+        self.tfidf_weights_: torch.Tensor | None = None
         self.chunk_size = chunk_size
         self.keep_depth_pc = keep_depth_pc
         self.optimizer = optimizer
@@ -273,8 +313,8 @@ class GLMPCA:
 
         """
         device = _resolve_device(self.device)
-        if self.init not in ("spectral", "random"):
-            msg = f"init={self.init!r} is not valid. Use 'spectral' or 'random'."
+        if self.init not in ("spectral", "random", "lsi"):
+            msg = f"init={self.init!r} is not valid. Use 'spectral', 'random' or 'lsi'."
             raise ValueError(msg)
         if self.optimizer not in _OPTIMIZERS:
             choices = ", ".join(repr(name) for name in _OPTIMIZERS)
@@ -296,6 +336,26 @@ class GLMPCA:
             warnings.warn(msg, UserWarning, stacklevel=2)
 
         X_fit = _to_tensor(X)
+        if (self.init == "lsi" or self.tfidf) and bool(torch.any(X_fit < 0)):
+            msg = (
+                "TF-IDF needs counts, but the input has negative values. Use "
+                "init='spectral' and tfidf=False for data that is not counts."
+            )
+            raise ValueError(msg)
+        if self.tfidf and self.exponential_family.family_name in BOUNDED_FAMILIES:
+            msg = (
+                f"tfidf=True does not fit "
+                f"family={self.exponential_family.family_name!r}, whose support is "
+                f"bounded: the TF-IDF of counts is continuous and reaches past 1. Use "
+                f"'gaussian', 'poisson' or 'negative_binomial'."
+            )
+            raise ValueError(msg)
+
+        # The depth check reads the counts, not the weights built from them (4.9).
+        counts = X_fit
+        if self.tfidf:
+            self.tfidf_weights_ = _inverse_document_frequency(X_fit)
+            X_fit = _tf_idf(X_fit, self.tfidf_weights_)
         if X_fit.shape[0] < 2:
             msg = (
                 f"A fit needs at least 2 rows (cells), but the input has "
@@ -369,7 +429,7 @@ class GLMPCA:
         self.saturated_intercept_ = best_intercept.detach()
 
         if isinstance(X, ad.AnnData):
-            self._check_depth_components(X_fit, saturated_parameters)
+            self._check_depth_components(counts, saturated_parameters)
 
         return True
 
@@ -451,6 +511,11 @@ class GLMPCA:
             raise RuntimeError(msg)
 
         X_transform = _to_tensor(X)
+        if self.tfidf and self.tfidf_weights_ is not None:
+            # The weights of the fit, so that new cells land on the same scale.
+            X_transform = _tf_idf(
+                X_transform, self.tfidf_weights_.to(X_transform.device)
+            )
         device = X_transform.device
         loadings, intercept = loadings.to(device), intercept.to(device)
         self.exponential_family.load_family_params_to_gpu(device)
@@ -697,6 +762,16 @@ class GLMPCA:
             )
             loadings = ManifoldParameter(v[: self.n_pc, :].T.to(device))
             loadings.manifold = EuclideanStiefel()
+        elif self.init == "lsi":
+            # LSI: the SVD of the TF-IDF of the counts, not of the saturated parameters.
+            subset = X[random_idx]
+            _, _, v = torch.linalg.svd(
+                _tf_idf(subset, _inverse_document_frequency(subset)),
+                full_matrices=False,
+            )
+            loadings = ManifoldParameter(
+                v[: self.n_pc, :].T.to(device), manifold=EuclideanStiefel()
+            )
         elif self.init == "random":
             loadings = ManifoldParameter(
                 EuclideanStiefel().random(
