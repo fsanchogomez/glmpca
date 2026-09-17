@@ -137,6 +137,7 @@ class FastPoissonPCA:
         free_in_v = [1, *range(2, self.n_pc + 2)]
 
         rate = torch.exp((U @ V.T).clip(max=MAX_LOG_RATE))
+        buffer = torch.empty_like(rate)
         # log h(y) = -log(y!) does not move with U or V, so one pass is enough. It is
         # what separates the objective of the fit from a real log-likelihood.
         log_base_measure = float(Poisson().log_base_measure(Y).sum())
@@ -144,8 +145,8 @@ class FastPoissonPCA:
         previous = -torch.inf
         with tqdm(total=self.max_iter, unit="pass", dynamic_ncols=True) as passes:
             for _ in range(self.max_iter):
-                _descend(Y, U, V, rate, free_in_u)
-                _descend(Y.T, V, U, rate.T, free_in_v)
+                _descend(Y, U, V, rate, free_in_u, buffer, over_rows=True)
+                _descend(Y.T, V, U, rate, free_in_v, buffer, over_rows=False)
 
                 log_likelihood = (
                     float((U * (Y @ V)).sum() - rate.sum()) + log_base_measure
@@ -193,8 +194,16 @@ class FastPoissonPCA:
         U[:, 1] = 1.0
 
         rate = torch.exp((U @ V.T).clip(max=MAX_LOG_RATE))
+        buffer = torch.empty_like(rate)
+        free = [0, *range(2, V.shape[1])]
+        previous = -torch.inf
         for _ in range(self.max_iter):
-            _descend(Y, U, V, rate, [0, *range(2, V.shape[1])])
+            _descend(Y, U, V, rate, free, buffer, over_rows=True)
+            # The same test as fit, so that transform stops as soon as it has landed.
+            likelihood = float((U * (Y @ V)).sum() - rate.sum())
+            if abs(likelihood - previous) <= self.tol * abs(likelihood):
+                break
+            previous = likelihood
         return U[:, 2:]
 
     def _initialize(self, Y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -232,20 +241,37 @@ def _descend(
     D: torch.Tensor,
     rate: torch.Tensor,
     free: list[int],
+    buffer: torch.Tensor,
+    *,
+    over_rows: bool,
 ) -> None:
     r"""One cyclic coordinate descent pass over the rows of `W`, in place.
 
     `Y` holds the counts with the rows of `W` in its rows, `D` is the design (the other
-    factor matrix), and `rate` is `exp(W Dᵀ)`, updated as the coordinates move.
+    factor matrix), and `rate` is `exp(U Vᵀ)` in its `(cells, features)` layout, updated
+    as the coordinates move. `over_rows` says whether a row of `W` is a row of `rate`
+    (the `U` block) or one of its columns (the `V` block); the maths is the same, and
+    keeping `rate` in one layout keeps every pass over it contiguous.
+
+    `buffer` is an `n` by `p` workspace, so that a pass allocates nothing.
     """
     statistics = Y @ D
     for column in free:
         design = D[:, column]
-        gradient = rate @ design - statistics[:, column]
-        curvature = rate @ design.square()
+        if over_rows:
+            gradient = rate @ design - statistics[:, column]
+            curvature = rate @ design.square()
+        else:
+            gradient = design @ rate - statistics[:, column]
+            curvature = design.square() @ rate
         step = (gradient / curvature.clip(min=1e-12)).clip(-MAX_STEP, MAX_STEP)
 
         W[:, column] -= step
-        rate *= torch.exp(
-            (-step.unsqueeze(1) * design.unsqueeze(0)).clip(max=MAX_LOG_RATE)
-        )
+        # exp of the outer product, in place, so the pass costs one read and one write
+        # of `rate` instead of three of each.
+        if over_rows:
+            torch.outer(-step, design, out=buffer)
+        else:
+            torch.outer(-design, step, out=buffer)
+        buffer.clamp_(max=MAX_LOG_RATE).exp_()
+        rate.mul_(buffer)
