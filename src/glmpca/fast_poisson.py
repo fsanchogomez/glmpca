@@ -45,7 +45,7 @@ import torch
 from tqdm.auto import tqdm
 
 from .ExponentialFamily import Poisson
-from .GLMPCA import _resolve_device, _to_tensor
+from .GLMPCA import _announce_device, _resolve_device, _to_tensor
 
 MAX_LOG_RATE = 30.0
 """Upper bound of `H`, so that `exp(H)` stays finite in float32."""
@@ -129,6 +129,8 @@ class FastPoissonPCA:
         if torch.any(Y < 0):
             msg = "Poisson GLM-PCA needs counts, but the input has negative values."
             raise ValueError(msg)
+
+        _announce_device(device)
 
         U, V = self._initialize(Y)
         # Column 0 is the size factor, free in U and fixed in V. Column 1 is the

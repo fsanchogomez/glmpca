@@ -183,6 +183,14 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
     assert model.learning_rate_ == 0.1
 
 
+def test_the_fit_says_which_device_it_uses(capsys: pytest.CaptureFixture[str]) -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16)
+
+    model.fit(sample(GLMFamily.poisson))
+
+    assert "DEVICE: cpu" in capsys.readouterr().out
+
+
 def test_a_scheduled_learning_rate_under_the_limit_stops_the_fit() -> None:
     X = sample(GLMFamily.poisson)[:16]
     model = GLMPCA(

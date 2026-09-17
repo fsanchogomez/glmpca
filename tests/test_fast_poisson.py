@@ -126,6 +126,15 @@ def test_transform_reproduces_the_fitted_coordinates() -> None:
         assert abs(correlation) > 0.95
 
 
+def test_the_fit_says_which_device_it_uses(capsys: pytest.CaptureFixture[str]) -> None:
+    counts, _ = simulate()
+    model = FastPoissonPCA(N_PC, max_iter=20, tol=1e-6)
+
+    model.fit(torch.tensor(counts))
+
+    assert "DEVICE: cpu" in capsys.readouterr().out
+
+
 def test_an_anndata_input_is_accepted() -> None:
     counts, _ = simulate()
     model = FastPoissonPCA(N_PC, max_iter=20, tol=1e-6)

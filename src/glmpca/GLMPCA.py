@@ -27,6 +27,14 @@ DEFAULT_CHUNK_ROWS = 8192
 DEPTH_CORRELATION_LIMIT = 0.8
 
 
+def _announce_device(device: torch.device) -> None:
+    """Prints the device on which the fit will be run."""
+    if device.type == "cuda":
+        tqdm.write(f"DEVICE: {device} ({torch.cuda.get_device_name(device)})")
+    else:
+        tqdm.write(f"DEVICE: {device}")
+
+
 def _resolve_device(device: str | torch.device | None) -> torch.device:
     if device is None:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,9 +120,9 @@ class GLMPCA:
         high and leads to NaN, our implementation automatically restarts the
         optimisation with a smaller value. Defaults to 0.2.
 
-        The scheduler lowers this rate every step_size epochs (see gamma), with no floor
-        of its own. A fit whose scheduled rate falls under 1e-10 stops with a warning,
-        because the steps no longer move the loadings.
+        The scheduler lowers this rate every step_size epochs (see gamma), with no
+        floor of its own. A fit whose scheduled rate falls under LEARNING_RATE_LIMIT
+        stops with a warning, because the steps no longer move the loadings.
 
     batch_size : int
         Size of the batch in the SGD optimisation step. If the matrix to fit has
@@ -279,6 +287,8 @@ class GLMPCA:
             )
             warnings.warn(msg, UserWarning, stacklevel=2)
             batch_size = X_fit.shape[0]
+
+        _announce_device(device)
 
         # Fit exponential family params (e.g., dispersion for negative binomial)
         self.exponential_family.initialize_family_parameters(X_fit)
