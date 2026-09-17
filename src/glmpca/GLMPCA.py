@@ -22,7 +22,7 @@ from .manifolds import (
     RiemannianAdam,
 )
 
-LEARNING_RATE_LIMIT = 10 ** (-10)
+LEARNING_RATE_LIMIT = 1e-8
 DEFAULT_CHUNK_ROWS = 8192
 DEPTH_CORRELATION_LIMIT = 0.8
 
@@ -109,8 +109,12 @@ class GLMPCA:
 
     learning_rate: float
         Learning rate to be used in the GLM-PCA optimisation. If learning_rate is too
-        high and lead to NaN, our implementation automatically restarts the optimisation
-        with a smaller value. Defaults to 0.2.
+        high and leads to NaN, our implementation automatically restarts the
+        optimisation with a smaller value. Defaults to 0.2.
+
+        The scheduler lowers this rate every step_size epochs (see gamma), with no floor
+        of its own. A fit whose scheduled rate falls under 1e-10 stops with a warning,
+        because the steps no longer move the loadings.
 
     batch_size : int
         Size of the batch in the SGD optimisation step. If the matrix to fit has
@@ -538,6 +542,16 @@ class GLMPCA:
                         device=device,
                         log_base_measure=log_base_measure,
                     )
+
+                if learning_rate < LEARNING_RATE_LIMIT:
+                    msg = (
+                        f"The scheduled learning rate fell to {learning_rate:.2e}, "
+                        f"under the limit of {LEARNING_RATE_LIMIT:.0e}. The loadings "
+                        f"have stopped moving, so the fit wil stop after this epoch. "
+                        f"Increase step_size or gamma to for a longer fit."
+                    )
+                    warnings.warn(msg, UserWarning, stacklevel=2)
+                    break
 
         return (_loadings, _intercept)
 

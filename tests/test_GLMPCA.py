@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson, _n_workers
-from glmpca.GLMPCA import GLMPCA, _to_tensor
+from glmpca.GLMPCA import GLMPCA, LEARNING_RATE_LIMIT, _to_tensor
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
 from scipy import sparse
 
@@ -181,6 +181,25 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
 
     assert start_rates == [0.2, 0.2, 0.2]
     assert model.learning_rate_ == 0.1
+
+
+def test_a_scheduled_learning_rate_under_the_limit_stops_the_fit() -> None:
+    X = sample(GLMFamily.poisson)[:16]
+    model = GLMPCA(
+        N_PC,
+        family="poisson",
+        max_iter=20,
+        batch_size=16,
+        learning_rate=2 * LEARNING_RATE_LIMIT,
+        step_size=1,
+        gamma=1e-3,
+    )
+
+    with pytest.warns(UserWarning, match="under the limit"):
+        assert model.fit(X)
+
+    epochs_run = 2
+    assert [len(scores) for scores in model.loadings_learning_scores_] == [epochs_run]
 
 
 def test_a_batch_size_larger_than_the_row_count_is_reduced_with_a_warning() -> None:
