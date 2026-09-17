@@ -15,7 +15,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from .ExponentialFamily import ExponentialFamily, GLMFamily
-from .manifolds import EuclideanStiefel, ManifoldParameter, RiemannianAdagrad
+from .manifolds import (
+    EuclideanStiefel,
+    ManifoldParameter,
+    RiemannianAdagrad,
+    RiemannianAdam,
+)
 
 LEARNING_RATE_LIMIT = 10 ** (-10)
 DEFAULT_CHUNK_ROWS = 8192
@@ -120,7 +125,6 @@ class GLMPCA:
         Reduction parameter for optimiser scheduler. Defaults to 0.5.
         See more: https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.StepLR.html
 
-
     n_init: int
         Number of GLM-PCA initializations. Useful if you want to explore different
         random seeds and starting points. Defaults to 1.
@@ -147,6 +151,12 @@ class GLMPCA:
         steps and does not change the result. Lower it for a large dataset on a small
         machine. Defaults to 8192.
 
+    optimizer: str
+        "adagrad" for the Riemannian Adagrad of this package, or "adam" for its
+        Riemannian Adam. The learning rate defaults are calibrated for Adagrad,
+        Adam usually performs better with a smaller learning rate (e.g., 0.01).
+        Defaults to "adagrad".
+
     keep_depth_pc: bool
         Whether to keep the components that follow the sequencing depth of the cells.
         With an AnnData input and keep_depth_pc False, fit drops every component whose
@@ -172,6 +182,7 @@ class GLMPCA:
         device: str | torch.device | None = None,
         chunk_size: int = DEFAULT_CHUNK_ROWS,
         keep_depth_pc: bool = False,
+        optimizer: Literal["adagrad", "adam"] = "adagrad",
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -188,6 +199,7 @@ class GLMPCA:
         self.init = init
         self.chunk_size = chunk_size
         self.keep_depth_pc = keep_depth_pc
+        self.optimizer = optimizer
 
         self.saturated_loadings_: torch.Tensor | None = None
         # Spearman correlation of each component with the sequencing depth
@@ -236,6 +248,9 @@ class GLMPCA:
         device = _resolve_device(self.device)
         if self.init not in ("spectral", "random"):
             msg = f"init={self.init!r} is not valid. Use 'spectral' or 'random'."
+            raise ValueError(msg)
+        if self.optimizer not in ("adagrad", "adam"):
+            msg = f"optimizer={self.optimizer!r} is not valid. Use 'adagrad' or 'adam'."
             raise ValueError(msg)
         if self.chunk_size < 1:
             msg = f"chunk_size={self.chunk_size} is not valid. Use 1 or more."
@@ -557,10 +572,10 @@ class GLMPCA:
             )
 
         # Create optimizer
-        # TODO: allow for other optimizer to be used.
         # TODO: learning rate for intercept.
         print(f"LEARNING RATE: {self.learning_rate_}")
-        optimizer = RiemannianAdagrad(
+        algorithm = RiemannianAdagrad if self.optimizer == "adagrad" else RiemannianAdam
+        optimizer = algorithm(
             params=[
                 {"params": loadings, "lr": self.learning_rate_},
                 {"params": intercept, "lr": self.learning_rate_ * 0.01},

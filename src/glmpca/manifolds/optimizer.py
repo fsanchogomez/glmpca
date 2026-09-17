@@ -14,9 +14,9 @@ if TYPE_CHECKING:
 class RiemannianAdagrad(torch.optim.Optimizer):
     """Adagrad on a manifold.
 
-    Each step converts the Euclidean gradient to the Riemannian one, accumulates the
-    squares as Adagrad does, projects the scaled direction on the tangent space, and
-    then retracts back to the manifold.
+    Each step converts the Euclidean gradient to the Riemannian one, accumulates
+    the squares as Adagrad does, projects the scaled direction on the tangent space,
+    and then retracts back to the manifold.
     """
 
     def __init__(self, params: ParamsT, lr: float = 1e-2, eps: float = 1e-10) -> None:
@@ -47,4 +47,69 @@ class RiemannianAdagrad(torch.optim.Optimizer):
                 std = state["sum"].sqrt().add_(group["eps"])
                 direction = manifold.proju(point, rgrad / std)
                 point.copy_(manifold.retr(point, -group["lr"] * direction))
+        return loss
+
+
+class RiemannianAdam(torch.optim.Optimizer):
+    """Adam on a manifold.
+
+    Both moments follow the Riemannian gradient. After a step, the first moment
+    is carried to the tangent space of the new point, which is a projection on
+    `EuclideanStiefel`.
+
+    The second moment is element-wise, as in `torch.optim.Adam` and in
+    `RiemannianAdagrad`.
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__(params, {"lr": lr, "betas": betas, "eps": eps})
+
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            first_decay, second_decay = group["betas"]
+            for point in group["params"]:
+                if point.grad is None:
+                    continue
+                manifold = point.manifold
+                state = self.state[point]
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(point)
+                    state["exp_avg_sq"] = torch.zeros_like(point)
+                state["step"] += 1
+
+                rgrad = manifold.egrad2rgrad(point, point.grad)
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                exp_avg.mul_(first_decay).add_(rgrad, alpha=1 - first_decay)
+                exp_avg_sq.mul_(second_decay).addcmul_(
+                    rgrad, rgrad, value=1 - second_decay
+                )
+
+                first_bias = 1 - first_decay ** state["step"]
+                second_bias = 1 - second_decay ** state["step"]
+                std = (exp_avg_sq / second_bias).sqrt().add_(group["eps"])
+                direction = manifold.proju(point, exp_avg / first_bias / std)
+
+                moved = manifold.retr(point, -group["lr"] * direction)
+                # Carry the momentum to the tangent space of the new point.
+                state["exp_avg"] = manifold.proju(moved, exp_avg)
+                point.copy_(moved)
         return loss

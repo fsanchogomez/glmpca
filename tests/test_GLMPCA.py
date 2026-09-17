@@ -595,3 +595,27 @@ def test_dropping_every_component_is_refused() -> None:
 
     with pytest.raises(ValueError, match="Every component follows"):
         model.fit(adata)
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_every_family_fits_with_adam(family: GLMFamily) -> None:
+    model = GLMPCA(
+        N_PC, family=family, optimizer="adam", max_iter=2, batch_size=16, n_jobs=1
+    )
+
+    assert model.fit(sample(family))
+    assert model.saturated_loadings_ is not None
+    torch.testing.assert_close(
+        model.saturated_loadings_.T @ model.saturated_loadings_,
+        torch.eye(N_PC),
+        atol=1e-5,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("optimizer", ["adamw", ""])
+def test_an_unknown_optimizer_is_rejected(optimizer: str) -> None:
+    model = GLMPCA(N_PC, family="poisson", optimizer=optimizer)  # ty: ignore[invalid-argument-type]
+
+    with pytest.raises(ValueError, match="Use 'adagrad' or 'adam'"):
+        model.fit(sample(GLMFamily.poisson))

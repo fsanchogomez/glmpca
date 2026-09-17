@@ -11,6 +11,7 @@ from glmpca.manifolds import (
     EuclideanStiefel,
     ManifoldParameter,
     RiemannianAdagrad,
+    RiemannianAdam,
 )
 
 N_ROWS = 40
@@ -128,6 +129,40 @@ def test_the_optimiser_keeps_the_loadings_orthonormal() -> None:
     optimizer = RiemannianAdagrad([parameter], lr=0.1)
 
     for _ in range(20):
+        optimizer.zero_grad()
+        ((parameter - target) ** 2).sum().backward()
+        optimizer.step()
+
+    torch.testing.assert_close(
+        parameter.data.T @ parameter.data, torch.eye(N_COLUMNS), atol=1e-5, rtol=0
+    )
+
+
+def test_riemannian_adam_on_euclidean_matches_torch_adam() -> None:
+    start = torch.randn(6, 3)
+    target = torch.randn(6, 3)
+    ours = ManifoldParameter(start.clone())
+    theirs = torch.nn.Parameter(start.clone())
+    our_optimizer = RiemannianAdam([ours], lr=0.05)
+    their_optimizer = torch.optim.Adam([theirs], lr=0.05)
+
+    for _ in range(50):
+        for parameter, optimizer in ((ours, our_optimizer), (theirs, their_optimizer)):
+            optimizer.zero_grad()
+            ((parameter - target) ** 2).sum().backward()
+            optimizer.step()
+
+    torch.testing.assert_close(ours.data, theirs.data, atol=1e-6, rtol=0)
+
+
+def test_riemannian_adam_keeps_the_loadings_orthonormal() -> None:
+    parameter = ManifoldParameter(
+        EuclideanStiefel().random(N_ROWS, N_COLUMNS), manifold=EuclideanStiefel()
+    )
+    target = torch.randn(N_ROWS, N_COLUMNS)
+    optimizer = RiemannianAdam([parameter], lr=0.05)
+
+    for _ in range(30):
         optimizer.zero_grad()
         ((parameter - target) ** 2).sum().backward()
         optimizer.step()

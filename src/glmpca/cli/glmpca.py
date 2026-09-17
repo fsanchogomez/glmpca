@@ -60,6 +60,11 @@ class Init(str, Enum):
     random = "random"
 
 
+class Optimizer(str, Enum):
+    adagrad = "adagrad"
+    adam = "adam"
+
+
 class FamilyChoice(str, Enum):
     """Every family of GLMPCA, and the direct Poisson fit of fast_poisson.
 
@@ -411,6 +416,21 @@ def main(
             ),
         ),
     ] = Init.spectral,
+    optimizer: Annotated[
+        Optimizer,
+        typer.Option(
+            "--optimizer",
+            metavar="NAME",
+            rich_help_panel=_OPTIMISATION,
+            help=(
+                "The optimiser on the Stiefel manifold.\n\n"
+                "One of: [bold yellow]adagrad[/bold yellow], "
+                "[bold yellow]adam[/bold yellow]. The learning rate default is "
+                "calibrated for [bold yellow]adagrad[/bold yellow], and "
+                "[bold yellow]adam[/bold yellow] usually needs a smaller one."
+            ),
+        ),
+    ] = Optimizer.adagrad,
     keep_depth_pc: Annotated[
         bool,
         typer.Option(
@@ -589,6 +609,7 @@ def main(
             gamma=gamma,
             n_init=n_init,
             init=init,
+            optimizer=optimizer,
             chunk_size=chunk_size,
             keep_depth_pc=keep_depth_pc,
             out_file_umap=out_file_umap,
@@ -625,6 +646,7 @@ def main(
                 gamma=gamma,
                 n_init=n_init,
                 init="spectral" if init is Init.spectral else "random",
+                optimizer="adagrad" if optimizer is Optimizer.adagrad else "adam",
                 n_jobs=number_of_processors,
                 device=device,
                 chunk_size=chunk_size,
@@ -646,6 +668,7 @@ def main(
             "gamma": gamma,
             "n_init": n_init,
             "init": init.value,
+            "optimizer": optimizer.value,
             "keep_depth_pc": keep_depth_pc,
         },
     }
