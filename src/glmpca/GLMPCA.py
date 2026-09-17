@@ -202,6 +202,8 @@ class GLMPCA:
         self.optimizer = optimizer
 
         self.saturated_loadings_: torch.Tensor | None = None
+        # Log-likelihood of the fit, the real one, with the base measure
+        self.log_likelihood_: float | None = None
         # Spearman correlation of each component with the sequencing depth
         self.depth_correlations_: torch.Tensor | None = None
         # saturated_intercept_: before projecting
@@ -286,6 +288,18 @@ class GLMPCA:
                 X_fit[start:stop].to(device)
             ).cpu()
 
+        # log h(x) of every cell, summed over its features. It turns the cost into
+        # the real log-likelihood.
+        log_base_measure = torch.empty(X_fit.shape[0])
+        for start in range(0, X_fit.shape[0], self.chunk_size):
+            stop = start + self.chunk_size
+            log_base_measure[start:stop] = (
+                self.exponential_family
+                .log_base_measure(X_fit[start:stop].to(device))
+                .sum(dim=1)
+                .cpu()
+            )
+
         # Initialize the learning procedure
         self.loadings_learning_scores_ = []
         self.loadings_learning_rates_ = []
@@ -296,7 +310,7 @@ class GLMPCA:
             self.learning_rate_ = self.initial_learning_rate_
             runs.append(
                 self._saturated_loading_iter(
-                    saturated_parameters, X_fit, batch_size, device
+                    saturated_parameters, X_fit, batch_size, device, log_base_measure
                 )
             )
 
@@ -309,6 +323,7 @@ class GLMPCA:
                 self._full_cost(loadings, intercept, X_fit, saturated_parameters)
                 for loadings, intercept in runs
             ])
+        self.log_likelihood_ = float(-training_cost.min() + log_base_measure.sum())
         best_model_idx = int(torch.argmin(training_cost))
         best_loadings, best_intercept = runs[best_model_idx]
         self.saturated_loadings_ = best_loadings.detach()
@@ -416,6 +431,7 @@ class GLMPCA:
         X: torch.Tensor,
         batch_size: int,
         device: torch.device,
+        log_base_measure: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Computes the loadings solution of the GLM-PCA optimisation problem.
 
@@ -429,6 +445,8 @@ class GLMPCA:
             Size of the batch in the SGD optimisation step.
         device : torch.device
             Device used to train.
+        log_base_measure : torch.Tensor
+            `log h(x)` of every cell, summed over its features.
 
         Returns
         -------
@@ -451,7 +469,9 @@ class GLMPCA:
         )
 
         # Load dataset
-        train_data = TensorDataset(X, saturated_parameters.data.clone())
+        train_data = TensorDataset(
+            X, saturated_parameters.data.clone(), log_base_measure
+        )
         train_loader = DataLoader(
             dataset=train_data, batch_size=batch_size, shuffle=True, drop_last=True
         )
@@ -459,8 +479,8 @@ class GLMPCA:
         # Run epoch in a for loop
         with tqdm(total=self.max_iter, unit="epoch", dynamic_ncols=True) as epochs:
             for _ in range(self.max_iter):
-                epoch_costs: list[float] = []
-                for batch_data, batch_parameters in train_loader:
+                epoch_log_likelihood = 0.0
+                for batch_data, batch_parameters, batch_base in train_loader:
                     cost_step = self._optim_cost(
                         loadings=_loadings,
                         intercept=_intercept,
@@ -470,7 +490,8 @@ class GLMPCA:
 
                     cost_value = cost_step.detach().cpu().numpy()
                     self.loadings_learning_scores_[-1].append(cost_value)
-                    epoch_costs.append(float(cost_value))
+                    # The cost leaves out log h, which the bar puts back.
+                    epoch_log_likelihood += float(batch_base.sum()) - float(cost_value)
                     cost_step.backward()
                     _optimizer.step()
                     _optimizer.zero_grad()
@@ -480,11 +501,10 @@ class GLMPCA:
                 learning_rate = _lr_scheduler.get_last_lr()[0]
                 _lr_scheduler.step()
 
-                # The cost is the negative log-likelihood, averaged over the batches
-                # of the epoch.
+                # The log-likelihood of the cells seen in this epoch.
                 epochs.set_postfix(
                     lr=f"{learning_rate:.2e}",
-                    cost=f"{np.mean(epoch_costs):.2f}",
+                    log_lik=f"{epoch_log_likelihood:.4E}",
                     refresh=False,
                 )
                 epochs.update(1)
@@ -516,6 +536,7 @@ class GLMPCA:
                         X=X,
                         batch_size=batch_size,
                         device=device,
+                        log_base_measure=log_base_measure,
                     )
 
         return (_loadings, _intercept)

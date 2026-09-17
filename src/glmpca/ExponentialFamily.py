@@ -130,17 +130,21 @@ class ExponentialFamily:
             self.sufficient_statistics(X), self.natural_parametrization(theta)
         )
 
-    def distribution(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        f = self.base_measure(X)
-        expt = self.exponential_term(X, theta) - self.log_partition(theta)
+    def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
+        r"""`log h(x)`, the part of the density that carries no parameter.
 
-        return torch.multiply(f, torch.exp(expt))
+        The density of an exponential family is `exp(T(x) eta(theta) - A(theta)) h(x)`.
+        The optimisation never needs `h`, because it does not move with the parameters,
+        but a log-likelihood that can be compared between families does.
+        """
+        return torch.zeros_like(X)
+
+    def distribution(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        return torch.exp(self.log_distribution(X, theta))
 
     def log_distribution(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        f = self.base_measure(X)
         expt = self.exponential_term(X, theta) - self.log_partition(theta)
-
-        return expt - torch.log(f)
+        return expt + self.log_base_measure(X)
 
     def neg_log_likelihood(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """Computes negative log-likelihood between dataset X and parameters theta"""
@@ -184,6 +188,9 @@ class Gaussian(ExponentialFamily):
 
     def log_partition(self, theta: torch.Tensor) -> torch.Tensor:
         return torch.square(theta) / 2.0
+
+    def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
+        return -torch.square(X) / 2.0 - np.log(2.0 * np.pi) / 2.0
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
         return torch.exp(-torch.square(X) / 2.0) / np.sqrt(2.0 * torch.pi)
@@ -267,6 +274,9 @@ class Poisson(ExponentialFamily):
     def log_partition(self, theta: torch.Tensor) -> torch.Tensor:
         return torch.exp(theta)
 
+    def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
+        return -torch.lgamma(X + 1)
+
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
         return torch.exp(-torch.lgamma(X + 1))
 
@@ -335,6 +345,10 @@ class NegativeBinomial(ExponentialFamily):
         """`-nu log(1 - exp(theta))`, through `expm1` for the small values."""
         theta = theta.clip(max=-self.family_params["eps"])
         return -self.family_params["nu"] * torch.log(-torch.expm1(theta))
+
+    def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
+        nu = self.family_params["nu"]
+        return torch.lgamma(X + nu) - torch.lgamma(nu) - torch.lgamma(X + 1)
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
         nu = self.family_params["nu"]
@@ -481,6 +495,10 @@ class Beta(ExponentialFamily):
         if nat_params.shape[1] == 1:
             nat_params = nat_params.flatten()
         return nat_params
+
+    def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
+        X = X.clip(self.family_params["min_val"], 1 - self.family_params["min_val"])
+        return -torch.log(X) - torch.log(1 - X)
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
         return torch.mul(X, 1 - X)
@@ -769,6 +787,9 @@ class LogNormal(ExponentialFamily):
         if nat_params.shape[1] == 1:
             nat_params = nat_params.flatten()
         return nat_params
+
+    def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
+        return -torch.log(X) - np.log(2 * np.pi) / 2.0
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
         return 1 / (np.sqrt(2 * torch.pi) * X)

@@ -313,3 +313,50 @@ def test_negative_binomial_rejects_an_unknown_method() -> None:
 
     with pytest.raises(ValueError, match="Use 'moments' or 'mle'"):
         family.initialize_family_parameters(torch.ones(4, 2))
+
+
+def test_lognormal_log_pdf_matches_scipy() -> None:
+    X = torch.logspace(-3, 3, 200)
+    for nu in (0.5, 1.0, 2.5):
+        for theta in (-1.0, 0.0, 2.0):
+            family = LogNormal()
+            family.family_params["nu"] = torch.full_like(X, nu)
+            log_pdf = family.log_distribution(X, torch.full_like(X, theta))
+            np.testing.assert_array_almost_equal(
+                log_pdf.numpy(),
+                scipy.stats.lognorm.logpdf(X.numpy(), s=nu, scale=math.exp(theta)),
+                decimal=3,
+            )
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
+def test_the_log_base_measure_completes_the_density(family: GLMFamily) -> None:
+    """log h is what the optimisation objective leaves out of the log density."""
+    rng = np.random.default_rng(0)
+    shape = (20, 3)
+    if family in {GLMFamily.beta, GLMFamily.sigmoid_beta}:
+        X = rng.random(size=shape).clip(0.05, 0.95)
+    elif family in {GLMFamily.gamma, GLMFamily.lognormal}:
+        X = rng.random(size=shape) + 0.5
+    elif family is GLMFamily.bernoulli:
+        X = rng.binomial(1, 0.4, size=shape)
+    elif family is GLMFamily.gaussian:
+        X = rng.normal(size=shape)
+    else:
+        X = rng.poisson(3.0, size=shape)
+    X = torch.tensor(X.astype(np.float32))
+    distribution = family.distribution()()
+    distribution.initialize_family_parameters(X)
+    theta = distribution.invert_g(X)
+
+    log_density = distribution.log_distribution(X, theta)
+    without_base = distribution.exponential_term(X, theta) - distribution.log_partition(
+        theta
+    )
+
+    torch.testing.assert_close(
+        log_density - without_base,
+        distribution.log_base_measure(X),
+        rtol=1e-5,
+        atol=1e-5,
+    )

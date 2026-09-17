@@ -170,6 +170,7 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
         X: torch.Tensor,
         batch_size: int,
         device: torch.device,
+        log_base_measure: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma

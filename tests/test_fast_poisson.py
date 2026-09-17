@@ -5,6 +5,7 @@ from __future__ import annotations
 import anndata as ad
 import numpy as np
 import pytest
+import scipy.special
 import torch
 from glmpca.fast_poisson import FastPoissonPCA
 
@@ -82,7 +83,11 @@ def test_the_fit_recovers_the_simulated_structure() -> None:
 def test_the_fit_reaches_the_log_likelihood_of_the_true_parameters() -> None:
     counts, truth = simulate()
     log_rate = truth["log_rate"]
-    oracle = float((counts * log_rate).sum() - np.exp(log_rate).sum())
+    oracle = float(
+        (counts * log_rate).sum()
+        - np.exp(log_rate).sum()
+        - scipy.special.gammaln(counts + 1).sum()
+    )
     model = FastPoissonPCA(N_PC, max_iter=100, tol=1e-8)
 
     model.fit(torch.tensor(counts))

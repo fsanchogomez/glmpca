@@ -44,6 +44,7 @@ import warnings
 import torch
 from tqdm.auto import tqdm
 
+from .ExponentialFamily import Poisson
 from .GLMPCA import _resolve_device, _to_tensor
 
 MAX_LOG_RATE = 30.0
@@ -91,7 +92,8 @@ class FastPoissonPCA:
         Size factor of every cell, shape `(n,)`.
 
     log_likelihoods_ : list[float]
-        Poisson log-likelihood, without the constant term, after each pass.
+        Poisson log-likelihood after each pass, with the `-log(y!)` term, so that it is
+        the real log-likelihood and not the optimisation objective alone.
 
     """
 
@@ -135,6 +137,9 @@ class FastPoissonPCA:
         free_in_v = [1, *range(2, self.n_pc + 2)]
 
         rate = torch.exp((U @ V.T).clip(max=MAX_LOG_RATE))
+        # log h(y) = -log(y!) does not move with U or V, so one pass is enough. It is
+        # what separates the objective of the fit from a real log-likelihood.
+        log_base_measure = float(Poisson().log_base_measure(Y).sum())
         self.log_likelihoods_ = []
         previous = -torch.inf
         with tqdm(total=self.max_iter, unit="pass", dynamic_ncols=True) as passes:
@@ -142,14 +147,16 @@ class FastPoissonPCA:
                 _descend(Y, U, V, rate, free_in_u)
                 _descend(Y.T, V, U, rate.T, free_in_v)
 
-                likelihood = float((U * (Y @ V)).sum() - rate.sum())
-                self.log_likelihoods_.append(likelihood)
+                log_likelihood = (
+                    float((U * (Y @ V)).sum() - rate.sum()) + log_base_measure
+                )
+                self.log_likelihoods_.append(log_likelihood)
                 # The postfix waits for the update, so the bar is drawn one time a pass.
-                passes.set_postfix(cost=f"{likelihood:.2f}", refresh=False)
+                passes.set_postfix(log_lik=f"{log_likelihood:.4E}", refresh=False)
                 passes.update(1)
-                if abs(likelihood - previous) <= self.tol * abs(likelihood):
+                if abs(log_likelihood - previous) <= self.tol * abs(log_likelihood):
                     break
-                previous = likelihood
+                previous = log_likelihood
             else:
                 msg = (
                     f"The log-likelihood still moved after {self.max_iter} passes. "
