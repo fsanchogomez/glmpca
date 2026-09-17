@@ -18,7 +18,7 @@ from matplotlib.figure import Figure
 
 from glmpca.ExponentialFamily import _n_workers
 from glmpca.fast_poisson import FastPoissonPCA
-from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, DEPTH_CORRELATION_LIMIT, GLMPCA
+from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, GLMPCA
 
 DESCRIPTION = (
     "Reduce the dimensionality of a cell-by-feature matrix with GLM-PCA.\n\n"
@@ -28,6 +28,8 @@ DESCRIPTION = (
     '* ``obsm["X_glmPCA"]``: the coordinates of the cells.\n'
     '* ``varm["glmPCA_loadings"]``: the loadings of the features.\n'
     '* ``var["glmPCA_intercept"]``: the intercept of the features.\n'
+    '* ``obs["glmPCA_depth"]``: the depth factor of the cells, absent with '
+    "``--noDepthFactor``.\n"
     '* ``uns["glmPCA"]``: the parameters of the fit.\n\n'
     "If ``--outFileUMAP`` is given, ``glmpca`` also computes a 2D projection (UMAP) "
     "and Leiden clusters of the cells from the reduction. It stores them in "
@@ -140,36 +142,6 @@ def fail(message: str) -> typer.Exit:
     return typer.Exit(code=1)
 
 
-def report_depth_components(model: GLMPCA) -> None:
-    """Logs which components follow the sequencing depth, dropped or kept.
-
-    The command hides warnings without --verbose, so the outcome is logged instead.
-    """
-    correlations = model.depth_correlations_
-    if correlations is None:
-        return
-    depth_pc = [
-        f"{component} (Spearman {correlations[component]:+.2f})"
-        for component in range(len(correlations))
-        if abs(float(correlations[component])) > DEPTH_CORRELATION_LIMIT
-    ]
-    if not depth_pc:
-        logging.info("No component follows the sequencing depth of the cells.")
-    elif model.keep_depth_pc:
-        logging.info(
-            "Kept %d component(s) that follow the sequencing depth "
-            "(--keepDepthPC): %s.",
-            len(depth_pc),
-            ", ".join(depth_pc),
-        )
-    else:
-        logging.info(
-            "Dropped %d component(s) that follow the sequencing depth: %s.",
-            len(depth_pc),
-            ", ".join(depth_pc),
-        )
-
-
 def umap_leiden(
     coordinates: np.ndarray, n_neighbors: int, resolution: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -226,29 +198,34 @@ def plot_umap(
 
 def run_glmpca(
     model: GLMPCA, adata: ad.AnnData
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Fits the saturated-parameter model and returns the arrays to store."""
     try:
         model.fit(adata)
     except ValueError as exc:
         raise fail(str(exc)) from exc
 
-    report_depth_components(model)
-
     loadings, intercept = model.saturated_loadings_, model.saturated_intercept_
     assert loadings is not None
     assert intercept is not None
-    return model.transform(adata).numpy(), loadings.numpy(), intercept.numpy()
+    depth = model.saturated_depth_
+    return (
+        model.transform(adata).numpy(),
+        loadings.numpy(),
+        intercept.numpy(),
+        None if depth is None else depth.numpy(),
+    )
 
 
 def run_fast_poisson(
     model: FastPoissonPCA, adata: ad.AnnData
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Fits the counts directly by Alternating Poisson Regression."""
     logging.info(
         "fast_poisson fits the counts directly, so the optimisation options "
-        "(--learningRate, --batchSize, --gamma, --nInit, --init) and "
-        "--keepDepthPC do not apply. Its model holds a size factor for every cell."
+        "(--learningRate, --batchSize, --gamma, --nInit, --init) do not apply. Its "
+        "model holds a size factor for every cell, which is what --noDepthFactor "
+        "turns off for the other families."
     )
     if not model.accelerate:
         logging.info("DAAREM acceleration is off, as --noDaarem was given.")
@@ -261,12 +238,20 @@ def run_fast_poisson(
     assert scores is not None
     assert loadings is not None
     assert intercept is not None
+    assert model.size_factors_ is not None
     logging.info(
         "fast_poisson converged in %d passes, log-likelihood %.1f.",
         len(model.log_likelihoods_),
         model.log_likelihoods_[-1],
     )
-    return scores.numpy(), loadings.numpy(), intercept.numpy()
+    # The size factor of a cell is the same quantity as the depth factor of the other
+    # families, so it goes to the same column.
+    return (
+        scores.numpy(),
+        loadings.numpy(),
+        intercept.numpy(),
+        model.size_factors_.numpy(),
+    )
 
 
 @app.callback(invoke_without_command=True)
@@ -449,6 +434,20 @@ def main(
             ),
         ),
     ] = False,
+    no_depth_factor: Annotated[
+        bool,
+        typer.Option(
+            "--noDepthFactor",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Do not fit an offset for every cell. With the offset, which is on by "
+                "default, the model holds a term for the depth of a cell beside the "
+                "term for every feature, as ``-gf fast_poisson`` does, so a component "
+                "does not have to carry the depth. It has its own learning rate, 1% of "
+                "``--learningRate``, the same as the per-feature intercept."
+            ),
+        ),
+    ] = False,
     tfidf: Annotated[
         bool,
         typer.Option(
@@ -459,19 +458,6 @@ def main(
                 "This is the weighting that ``--init lsi`` uses for its start, applied "
                 "to the matrix itself. It needs counts, and the families whose support "
                 "is bounded (bernoulli, beta, sigmoid_beta) refuse it."
-            ),
-        ),
-    ] = False,
-    keep_depth_pc: Annotated[
-        bool,
-        typer.Option(
-            "--keepDepthPC",
-            rich_help_panel=_GLMPCA,
-            help=(
-                "Keep the components that follow the sequencing depth of the cells. "
-                "Without this flag, every component whose absolute Spearman "
-                "correlation with the total counts per cell is above 0.8 is dropped, "
-                "so the output may hold fewer components than ``--nPrinComps``."
             ),
         ),
     ] = False,
@@ -641,7 +627,7 @@ def main(
             init=init,
             optimizer=optimizer,
             chunk_size=chunk_size,
-            keep_depth_pc=keep_depth_pc,
+            no_depth_factor=no_depth_factor,
             tfidf=tfidf,
             no_accelerate=no_accelerate,
             out_file_umap=out_file_umap,
@@ -663,7 +649,7 @@ def main(
         raise fail(msg)
 
     if glmpca_family is FamilyChoice.fast_poisson:
-        scores, loadings, intercept = run_fast_poisson(
+        scores, loadings, intercept, depth = run_fast_poisson(
             FastPoissonPCA(
                 n_pc=n_prin_comps,
                 max_iter=max_iter,
@@ -673,7 +659,7 @@ def main(
             adata,
         )
     else:
-        scores, loadings, intercept = run_glmpca(
+        scores, loadings, intercept, depth = run_glmpca(
             GLMPCA(
                 n_pc=n_prin_comps,
                 family=glmpca_family.value,
@@ -687,14 +673,16 @@ def main(
                 n_jobs=number_of_processors,
                 device=device,
                 chunk_size=chunk_size,
-                keep_depth_pc=keep_depth_pc,
                 tfidf=tfidf,
+                depth_factor=not no_depth_factor,
             ),
             adata,
         )
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
     adata.var["glmPCA_intercept"] = intercept
+    if depth is not None:
+        adata.obs["glmPCA_depth"] = depth
     adata.uns["glmPCA"] = {
         "params": {
             "n_pc": n_prin_comps,
@@ -706,8 +694,8 @@ def main(
             "n_init": n_init,
             "init": init.value,
             "optimizer": optimizer.value,
-            "keep_depth_pc": keep_depth_pc,
             "tfidf": tfidf,
+            "depth_factor": not no_depth_factor,
             "accelerate": not no_accelerate,
         },
     }

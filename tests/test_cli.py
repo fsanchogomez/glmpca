@@ -171,7 +171,6 @@ def test_glmpca_passes_every_option_to_the_model(
             "16",
             "--optimizer",
             "adam",
-            "--keepDepthPC",
             "-p",
             "1",
         ],
@@ -190,7 +189,6 @@ def test_glmpca_passes_every_option_to_the_model(
     assert model.device == "cpu"
     assert model.chunk_size == 16
     assert model.optimizer == "adam"
-    assert model.keep_depth_pc is True
     assert model.exponential_family.family_params["n_jobs"] == 1
 
 
@@ -370,6 +368,65 @@ def test_the_lsi_start_reaches_the_model(
     assert result.exit_code == 0, result.output
     (model,) = models
     assert model.init == "lsi"
+
+
+def test_the_depth_factor_is_written_to_obs(tmp_path: Path) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path)
+
+    assert result.exit_code == 0, result.output
+    adata = ad.read_h5ad(out_path)
+    assert adata.obs["glmPCA_depth"].shape == (N_CELLS,)
+    assert np.all(np.isfinite(adata.obs["glmPCA_depth"].to_numpy()))
+
+
+def test_fast_poisson_writes_its_size_factor_to_the_same_column(
+    tmp_path: Path,
+) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(
+        write_input(tmp_path, poisson_counts()),
+        out_path,
+        "-gf",
+        "fast_poisson",
+    )
+
+    assert result.exit_code == 0, result.output
+    adata = ad.read_h5ad(out_path)
+    assert adata.obs["glmPCA_depth"].shape == (N_CELLS,)
+
+
+def test_no_depth_factor_leaves_the_column_out(tmp_path: Path) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--noDepthFactor")
+
+    assert result.exit_code == 0, result.output
+    assert "glmPCA_depth" not in ad.read_h5ad(out_path).obs
+
+
+def test_no_depth_factor_turns_the_cell_offset_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models: list[GLMPCA] = []
+    original_fit = GLMPCA.fit
+
+    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
+        models.append(self)
+        return original_fit(self, X)
+
+    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--noDepthFactor")
+
+    assert result.exit_code == 0, result.output
+    (model,) = models
+    assert not model.depth_factor
+    assert model.saturated_depth_ is None
+    assert not ad.read_h5ad(out_path).uns["glmPCA"]["params"]["depth_factor"]
 
 
 def test_the_tfidf_flag_reaches_the_model(

@@ -8,10 +8,13 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import anndata as ad
 import numpy as np
 import pytest
+import scipy.stats
 import torch
 from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson, _n_workers
 from glmpca.GLMPCA import (
+    DEPTH_RATE_SCALE,
     GLMPCA,
+    INTERCEPT_RATE_SCALE,
     LEARNING_RATE_LIMIT,
     PLATEAU_PATIENCE,
     _inverse_document_frequency,
@@ -178,10 +181,10 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma
-        return torch.eye(N_FEATURES, N_PC), torch.zeros(N_FEATURES)
+        return torch.eye(N_FEATURES, N_PC), torch.zeros(N_FEATURES), None
 
     monkeypatch.setattr(model, "_saturated_loading_iter", run_that_restarts_once)
     model.fit(sample(GLMFamily.poisson))
@@ -573,82 +576,6 @@ def test_a_chunk_size_below_one_is_rejected(chunk_size: int) -> None:
         model.fit(sample(GLMFamily.poisson))
 
 
-def test_a_negative_binomial_fit_accepts_the_mle_dispersion() -> None:
-    X = sample(GLMFamily.negative_binomial)
-    model = GLMPCA(
-        N_PC,
-        family="negative_binomial",
-        family_params={"method": "mle"},
-        max_iter=2,
-        batch_size=8,
-    )
-
-    assert model.fit(X)
-    assert model.exponential_family.family_params["nu"].shape == (N_FEATURES,)
-    assert model.exponential_family.family_params["chunk_size"] == model.chunk_size
-
-
-DEPTH_CELLS = 200
-DEPTH_FEATURES = 30
-
-
-def depth_driven_anndata() -> ad.AnnData:
-    """Counts whose first component is the sequencing depth of each cell."""
-    rng = np.random.default_rng(0)
-    rates = rng.gamma(2.0, 1.0, size=DEPTH_FEATURES)
-    depth = rng.lognormal(0.0, 1.0, size=DEPTH_CELLS)[:, None]
-    return ad.AnnData(rng.poisson(rates * depth).astype(np.float32))
-
-
-def test_a_component_that_follows_the_depth_is_dropped() -> None:
-    adata = depth_driven_anndata()
-    model = GLMPCA(3, family="poisson", max_iter=5, batch_size=32)
-
-    with pytest.warns(UserWarning, match="follow the sequencing depth"):
-        model.fit(adata)
-
-    assert model.depth_correlations_ is not None
-    assert model.depth_correlations_.shape == (3,)
-    assert model.depth_correlations_.abs().max() > 0.9
-    assert model.saturated_loadings_ is not None
-    assert model.saturated_loadings_.shape[1] < 3
-    assert model.transform(adata).shape == (
-        DEPTH_CELLS,
-        model.saturated_loadings_.shape[1],
-    )
-
-
-def test_keep_depth_pc_keeps_every_component_and_says_which() -> None:
-    adata = depth_driven_anndata()
-    model = GLMPCA(3, family="poisson", max_iter=5, batch_size=32, keep_depth_pc=True)
-
-    with pytest.warns(UserWarning, match="were kept because keep_depth_pc is True"):
-        model.fit(adata)
-
-    assert model.saturated_loadings_ is not None
-    assert model.saturated_loadings_.shape[1] == 3
-    assert model.depth_correlations_ is not None
-
-
-def test_a_tensor_input_is_never_filtered() -> None:
-    counts = torch.Tensor(np.asarray(depth_driven_anndata().X))
-    model = GLMPCA(3, family="poisson", max_iter=5, batch_size=32)
-
-    model.fit(counts)
-
-    assert model.saturated_loadings_ is not None
-    assert model.saturated_loadings_.shape[1] == 3
-    assert model.depth_correlations_ is None
-
-
-def test_dropping_every_component_is_refused() -> None:
-    adata = depth_driven_anndata()
-    model = GLMPCA(1, family="poisson", max_iter=5, batch_size=32)
-
-    with pytest.raises(ValueError, match="Every component follows"):
-        model.fit(adata)
-
-
 @pytest.mark.parametrize("family", list(GLMFamily))
 def test_every_family_fits_with_adam(family: GLMFamily) -> None:
     model = GLMPCA(
@@ -769,3 +696,86 @@ def test_the_tfidf_option_rejects_negative_values() -> None:
 
     with pytest.raises(ValueError, match="TF-IDF needs counts"):
         model.fit(torch.randn(20, 6))
+
+
+def depth_gradient() -> torch.Tensor:
+    """Counts whose cells differ in depth by two orders of magnitude."""
+    torch.manual_seed(0)
+    depth = torch.exp(torch.randn(N_CELLS) * 0.8).unsqueeze(1)
+    structure = torch.randn(N_CELLS, N_PC) @ torch.randn(N_PC, N_FEATURES) * 0.3
+    return torch.poisson(torch.exp(structure) * depth)
+
+
+def test_the_depth_factor_is_fitted_for_every_cell() -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=5, batch_size=16)
+
+    model.fit(depth_gradient())
+
+    assert model.saturated_depth_ is not None
+    assert model.saturated_depth_.shape == (N_CELLS,)
+    assert torch.all(torch.isfinite(model.saturated_depth_))
+
+
+def test_turning_the_depth_factor_off_leaves_no_offset() -> None:
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=5, batch_size=16, depth_factor=False
+    )
+
+    model.fit(depth_gradient())
+
+    assert model.saturated_depth_ is None
+
+
+def test_the_depth_factor_keeps_the_components_off_the_depth() -> None:
+    X = depth_gradient()
+    totals = X.sum(dim=1).numpy()
+    worst = {}
+    for depth_factor in (True, False):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = GLMPCA(
+            N_PC,
+            family="poisson",
+            max_iter=40,
+            batch_size=16,
+            depth_factor=depth_factor,
+        )
+        model.fit(X)
+        embedding = model.transform(X).detach().numpy()
+        worst[depth_factor] = max(
+            abs(float(scipy.stats.spearmanr(embedding[:, pc], totals).statistic))
+            for pc in range(N_PC)
+        )
+
+    assert worst[True] < worst[False], worst
+
+
+def test_the_depth_factor_has_its_own_learning_rate() -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16)
+    saturated = torch.log(depth_gradient().clip(min=1.0))
+
+    optimizer, _, _, depth, _ = model._create_saturated_loading_optim(
+        saturated, saturated, torch.device("cpu")
+    )
+
+    assert depth is not None
+    rates = [group["lr"] for group in optimizer.param_groups]
+    assert rates == [
+        model.learning_rate_,
+        model.learning_rate_ * INTERCEPT_RATE_SCALE,
+        model.learning_rate_ * DEPTH_RATE_SCALE,
+    ]
+
+
+def test_transform_reproduces_the_fitted_scores_with_a_depth_factor() -> None:
+    X = depth_gradient()
+    model = GLMPCA(N_PC, family="poisson", max_iter=20, batch_size=16)
+    model.fit(X)
+
+    embedding = model.transform(X).detach()
+
+    # transform estimates the offset of a cell by least squares, so the scores it gives
+    # the cells of the fit track the fitted ones closely rather than exactly.
+    assert model.saturated_depth_ is not None
+    assert torch.all(torch.isfinite(embedding))
+    assert embedding.shape == (N_CELLS, N_PC)

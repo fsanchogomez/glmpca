@@ -6,7 +6,6 @@ from typing import Any, Literal
 
 import anndata as ad
 import numpy as np
-import scipy.stats
 import torch
 import torch.optim
 from anndata.abc import CSCDataset, CSRDataset
@@ -32,11 +31,12 @@ _OPTIMIZERS = {
 DEFAULT_LEARNING_RATE = 0.2
 TFIDF_SCALE = 1e4
 BOUNDED_FAMILIES = ("bernoulli", "beta", "sigmoid_beta")
+INTERCEPT_RATE_SCALE = 0.01
+DEPTH_RATE_SCALE = 0.01
 LEARNING_RATE_LIMIT = 1e-8
 PLATEAU_PATIENCE = 10
 PLATEAU_THRESHOLD = 1e-4
 DEFAULT_CHUNK_ROWS = 8192
-DEPTH_CORRELATION_LIMIT = 0.8
 
 
 def _announce_device(device: torch.device) -> None:
@@ -45,6 +45,29 @@ def _announce_device(device: torch.device) -> None:
         tqdm.write(f"DEVICE: {device} ({torch.cuda.get_device_name(device)})")
     else:
         tqdm.write(f"DEVICE: {device}")
+
+
+def _depth_of(centred: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
+    r"""The offset of every cell that least squares would give, once `1 mu.T` is out.
+
+    `fit` learns an offset for every cell it sees, and `transform` has to give
+    one to cells it has not seen. The value that leaves the least outside the subspace
+    is
+
+        s = <w, centred> / <w, 1>,    w = (I - V V.T) 1,
+
+    which is the least-squares solution of `min_s ||(centred - s 1) (I - V V.T)||`. It
+    matches what the fit learns only up to the difference between that objective and the
+    likelihood of the family, so `transform` reproduces the fitted scores closely rather
+    than exactly.
+    """
+    ones = torch.ones(loadings.shape[0], device=loadings.device, dtype=loadings.dtype)
+    outside = ones - loadings @ (loadings.T @ ones)
+    scale = float(outside @ ones)
+    if abs(scale) < 1e-8:
+        # The all-ones direction lies in the subspace, which already carries the offset.
+        return torch.zeros(centred.shape[0], device=centred.device, dtype=centred.dtype)
+    return (centred @ outside) / scale
 
 
 def _inverse_document_frequency(counts: torch.Tensor) -> torch.Tensor:
@@ -62,8 +85,8 @@ def _tf_idf(counts: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
     This is the "log-TF" form that Signac uses by default, with the document frequency
     counted over cells rather than over reads, which is the textbook definition.
 
-    It is not centred: LSI reduces the TF-IDF matrix itself, and the component that
-    follows the depth of a cell is the one that `keep_depth_pc` deals with.
+    It is not centred: LSI reduces the TF-IDF matrix itself, and the offset of a cell
+    is what carries the depth.
 
     `inverse` is an argument rather than a second pass over `counts`, so that
     `transform` can weigh new cells by the frequencies of the fit.
@@ -184,11 +207,19 @@ class GLMPCA:
         initialization on the Stiefel manifold. "lsi" needs counts, so it rejects an
         input with negative values. Defaults to "spectral".
 
+    depth_factor: bool
+        Whether to fit an offset for every cell beside the offset of every feature, as
+        `fast_poisson` does for its size factor. The saturated parameters are centred
+        by both offsets before the projection, so a component never has to carry the
+        depth of a cell. It has its own learning rate, DEPTH_RATE_SCALE of
+        learning_rate, as the intercept does, and `transform` gives an unseen cell the
+        offset that least squares would give it. Defaults to True.
+
     tfidf: bool
         Whether to fit the model to the TF-IDF of the counts rather than to the counts
-        themselves (4.4). The weighting is the one that init="lsi" uses for its start,
-        and transform weighs new cells by the document frequencies of the fit, so that
-        they land on the same scale. It needs counts, and it is refused for the families
+        themselves. The weighting is the one that init="lsi" uses for its start, and
+        transform weighs new cells by the document frequencies of the fit, so that they
+        land on the same scale. It needs counts, and it is refused for the families
         whose support is bounded (bernoulli, beta, sigmoid_beta), because the TF-IDF of
         counts is continuous and reaches past 1. Defaults to False.
 
@@ -217,16 +248,9 @@ class GLMPCA:
 
         "cg" is different in kind: it works on the whole matrix rather than on
         mini-batches, and it has no learning rate, because it chooses every step by a
-        line search (4.5). learning_rate, gamma and the scheduler do not reach it, and
+        line search. learning_rate, gamma and the scheduler do not reach it, and
         batch_size does not either. One of its steps costs several passes over the
         matrix, and it lowers the cost at every one of them.
-
-    keep_depth_pc: bool
-        Whether to keep the components that follow the sequencing depth of the cells.
-        With an AnnData input and keep_depth_pc False, fit drops every component whose
-        absolute Spearman correlation with the total counts per cell is above 0.9, and
-        records all the correlations in depth_correlations_. A tensor or ndarray input
-        is never filtered. Defaults to False.
 
     """
 
@@ -242,10 +266,10 @@ class GLMPCA:
         n_init: int = 1,
         init: Literal["spectral", "random", "lsi"] = "spectral",
         tfidf: bool = False,
+        depth_factor: bool = True,
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
         chunk_size: int = DEFAULT_CHUNK_ROWS,
-        keep_depth_pc: bool = False,
         optimizer: Literal["adagrad", "adam", "cg"] = "adagrad",
     ) -> None:
         self.n_pc = n_pc
@@ -261,18 +285,18 @@ class GLMPCA:
         self.gamma = gamma
         self.init = init
         self.tfidf = tfidf
+        self.depth_factor = depth_factor
         self.tfidf_weights_: torch.Tensor | None = None
         self.chunk_size = chunk_size
-        self.keep_depth_pc = keep_depth_pc
         self.optimizer = optimizer
 
         self.saturated_loadings_: torch.Tensor | None = None
         # Log-likelihood of the fit, the real one, with the base measure
         self.log_likelihood_: float | None = None
-        # Spearman correlation of each component with the sequencing depth
-        self.depth_correlations_: torch.Tensor | None = None
         # saturated_intercept_: before projecting
         self.saturated_intercept_: torch.Tensor | None = None
+        # saturated_depth_: before projecting
+        self.saturated_depth_: torch.Tensor | None = None
         # reconstruction_intercept: after projecting
         self.reconstruction_intercept_ = None
 
@@ -351,8 +375,6 @@ class GLMPCA:
             )
             raise ValueError(msg)
 
-        # The depth check reads the counts, not the weights built from them (4.9).
-        counts = X_fit
         if self.tfidf:
             self.tfidf_weights_ = _inverse_document_frequency(X_fit)
             X_fit = _tf_idf(X_fit, self.tfidf_weights_)
@@ -413,82 +435,26 @@ class GLMPCA:
                 )
             )
 
-        runs = [(loadings.cpu(), intercept.cpu()) for loadings, intercept in runs]
+        runs = [
+            (loadings.cpu(), intercept.cpu(), None if depth is None else depth.cpu())
+            for loadings, intercept, depth in runs
+        ]
         self.exponential_family.load_family_params_to_gpu(torch.device("cpu"))
 
         # Select best model
         with torch.no_grad():
             training_cost = torch.stack([
-                self._full_cost(loadings, intercept, X_fit, saturated_parameters)
-                for loadings, intercept in runs
+                self._full_cost(loadings, intercept, X_fit, saturated_parameters, depth)
+                for loadings, intercept, depth in runs
             ])
         self.log_likelihood_ = float(-training_cost.min() + log_base_measure.sum())
         best_model_idx = int(torch.argmin(training_cost))
-        best_loadings, best_intercept = runs[best_model_idx]
+        best_loadings, best_intercept, best_depth = runs[best_model_idx]
         self.saturated_loadings_ = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
-
-        if isinstance(X, ad.AnnData):
-            self._check_depth_components(counts, saturated_parameters)
+        self.saturated_depth_ = None if best_depth is None else best_depth.detach()
 
         return True
-
-    def _check_depth_components(
-        self, X_fit: torch.Tensor, saturated_parameters: torch.Tensor
-    ) -> None:
-        r"""Measures every component against the sequencing depth of the cells.
-
-        The first components of a count matrix often carry the depth of each cell and
-        not its biology. This measures each component against the total counts per cell
-        with a Spearman correlation, which needs no linear relation. Components above
-        DEPTH_CORRELATION_LIMIT are dropped, or kept with a message when
-        keep_depth_pc is True.
-        """
-        loadings, intercept = self.saturated_loadings_, self.saturated_intercept_
-        assert loadings is not None
-        assert intercept is not None
-
-        scores = (saturated_parameters - intercept.unsqueeze(0)).matmul(loadings)
-        depth = X_fit.sum(dim=1).numpy()
-        correlations = torch.tensor([
-            scipy.stats.spearmanr(scores[:, component].numpy(), depth).statistic
-            for component in range(scores.shape[1])
-        ])
-        # A component that never moves has no correlation to report.
-        self.depth_correlations_ = torch.nan_to_num(correlations, nan=0.0)
-
-        keep = self.depth_correlations_.abs() <= DEPTH_CORRELATION_LIMIT
-        if bool(keep.all()):
-            return
-
-        following = [
-            f"{component} (Spearman {self.depth_correlations_[component]:+.2f})"
-            for component in (~keep).nonzero().flatten().tolist()
-        ]
-        if self.keep_depth_pc:
-            msg = (
-                f"{len(following)} of {keep.numel()} components follow the sequencing "
-                f"depth and were kept because keep_depth_pc is True: "
-                f"{', '.join(following)}."
-            )
-            warnings.warn(msg, UserWarning, stacklevel=3)
-            return
-
-        if not bool(keep.any()):
-            msg = (
-                f"Every component follows the sequencing depth: "
-                f"{', '.join(following)}. Pass keep_depth_pc=True to keep them, or "
-                f"check the data for a depth effect that dominates the biology."
-            )
-            raise ValueError(msg)
-
-        msg = (
-            f"Dropped {len(following)} of {keep.numel()} components that follow the "
-            f"sequencing depth: {', '.join(following)}. Pass keep_depth_pc=True to "
-            f"keep them."
-        )
-        warnings.warn(msg, UserWarning, stacklevel=3)
-        self.saturated_loadings_ = loadings[:, keep]
 
     def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
         r"""Transforms and projects dataset X onto the principal components.
@@ -525,6 +491,10 @@ class GLMPCA:
         intercept_term = intercept.unsqueeze(0)
 
         projected_parameters = saturated_parameters - intercept_term
+        if self.depth_factor:
+            projected_parameters = projected_parameters - _depth_of(
+                projected_parameters, loadings
+            ).unsqueeze(1)
         projected_parameters = projected_parameters.matmul(loadings)
 
         return projected_parameters
@@ -536,7 +506,7 @@ class GLMPCA:
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         r"""Computes the loadings solution of the GLM-PCA optimisation problem.
 
         Parameters
@@ -554,8 +524,9 @@ class GLMPCA:
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor]
-            Projected saturated parameters (loadings, intercept).
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+            The loadings, the intercept of every feature, and the offset of every cell
+            when depth_factor is on, else None.
 
         """
         if self.learning_rate_ < LEARNING_RATE_LIMIT:
@@ -566,18 +537,21 @@ class GLMPCA:
         self.loadings_learning_scores_.append([])
         self.loadings_learning_rates_.append([])
 
-        _optimizer, _loadings, _intercept, _lr_scheduler = (
+        _optimizer, _loadings, _intercept, _depth, _lr_scheduler = (
             self._create_saturated_loading_optim(
                 parameters=saturated_parameters.data.clone(), X=X, device=device
             )
         )
 
         # Conjugate gradients works on the whole matrix, so it needs no loader: its
-        # line search has to see the same objective at every trial point (4.5).
+        # line search has to see the same objective at every trial point.
         train_data = train_loader = None
         if self.optimizer != "cg":
             train_data = TensorDataset(
-                X, saturated_parameters.data.clone(), log_base_measure
+                X,
+                saturated_parameters.data.clone(),
+                log_base_measure,
+                torch.arange(X.shape[0]),
             )
             train_loader = DataLoader(
                 dataset=train_data, batch_size=batch_size, shuffle=True, drop_last=True
@@ -594,6 +568,7 @@ class GLMPCA:
                     intercept=_intercept,
                     batch_data=X[start:stop].to(device),
                     batch_parameters=saturated_parameters[start:stop].to(device),
+                    batch_depth=None if _depth is None else _depth[start:stop],
                 )
                 cost.backward()
                 total += float(cost)
@@ -634,12 +609,15 @@ class GLMPCA:
                         warnings.warn(msg, UserWarning, stacklevel=2)
                         break
                 elif train_loader is not None:
-                    for batch_data, batch_parameters, batch_base in train_loader:
+                    for batch_data, batch_parameters, batch_base, rows in train_loader:
                         cost_step = self._optim_cost(
                             loadings=_loadings,
                             intercept=_intercept,
                             batch_data=batch_data.to(device),
                             batch_parameters=batch_parameters.to(device),
+                            batch_depth=(
+                                None if _depth is None else _depth[rows.to(device)]
+                            ),
                         )
 
                         cost_value = cost_step.detach().cpu().numpy()
@@ -687,6 +665,7 @@ class GLMPCA:
                         _optimizer,
                         _loadings,
                         _intercept,
+                        _depth,
                         _lr_scheduler,
                     )
                     if device.type == "cuda":
@@ -713,7 +692,7 @@ class GLMPCA:
                     warnings.warn(msg, UserWarning, stacklevel=2)
                     break
 
-        return (_loadings, _intercept)
+        return (_loadings, _intercept, _depth)
 
     def _create_saturated_loading_optim(
         self, parameters: torch.Tensor, X: torch.Tensor, device: torch.device
@@ -721,6 +700,7 @@ class GLMPCA:
         torch.optim.Optimizer,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor | None,
         torch.optim.lr_scheduler.ReduceLROnPlateau,
     ]:
         r"""Initializes the optimisation problem.
@@ -790,25 +770,42 @@ class GLMPCA:
                 torch.mean(parameters[random_idx], dim=0).to(device)
             )
 
+        # The offset of every cell, started at the mean residual of that cell once the
+        # offset of the feature is out, which is where least squares would put it.
+        depth = None
+        groups = [
+            {"params": loadings, "lr": self.learning_rate_},
+            {"params": intercept, "lr": self.learning_rate_ * INTERCEPT_RATE_SCALE},
+        ]
+        floors = [LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE]
+        if self.depth_factor:
+            start = torch.empty(parameters.shape[0])
+            for begin in range(0, parameters.shape[0], self.chunk_size):
+                finish = begin + self.chunk_size
+                start[begin:finish] = (
+                    parameters[begin:finish] - intercept.detach().cpu()
+                ).mean(dim=1)
+            depth = ManifoldParameter(start.to(device))
+            groups.append({
+                "params": depth,
+                "lr": self.learning_rate_ * DEPTH_RATE_SCALE,
+            })
+            floors.append(LEARNING_RATE_LIMIT * DEPTH_RATE_SCALE)
+
         tqdm.write(f"LEARNING RATE: {self.learning_rate_}")
         algorithm = _OPTIMIZERS[self.optimizer]
-        optimizer = algorithm(
-            params=[
-                {"params": loadings, "lr": self.learning_rate_},
-                {"params": intercept, "lr": self.learning_rate_ * 0.01},
-            ]
-        )
+        optimizer = algorithm(params=groups)
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             factor=self.gamma,
             patience=PLATEAU_PATIENCE,
             threshold=PLATEAU_THRESHOLD,
             threshold_mode="abs",
-            min_lr=[LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * 0.01],
+            min_lr=floors,
             eps=0.0,
         )
 
-        return optimizer, loadings, intercept, lr_scheduler
+        return optimizer, loadings, intercept, depth, lr_scheduler
 
     def _full_cost(
         self,
@@ -816,13 +813,18 @@ class GLMPCA:
         intercept: torch.Tensor,
         X: torch.Tensor,
         parameters: torch.Tensor,
+        depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Sums the cost over chunks of chunk_size rows, to never expand X."""
         total = torch.zeros((), dtype=X.dtype)
         for start in range(0, X.shape[0], self.chunk_size):
             stop = start + self.chunk_size
             total = total + self._optim_cost(
-                loadings, intercept, X[start:stop], parameters[start:stop]
+                loadings,
+                intercept,
+                X[start:stop],
+                parameters[start:stop],
+                None if depth is None else depth[start:stop],
             )
         return total
 
@@ -832,9 +834,14 @@ class GLMPCA:
         intercept: torch.Tensor,
         batch_data: torch.Tensor,
         batch_parameters: torch.Tensor,
+        batch_depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
         n = batch_data.shape[0]
         intercept_term = intercept.unsqueeze(0).repeat(n, 1)
+        if batch_depth is not None:
+            # The offset of a cell joins the offset of a feature, so the subspace
+            # never has to carry either of them.
+            intercept_term = intercept_term + batch_depth.unsqueeze(1)
 
         projected_parameters = batch_parameters - intercept_term
         projected_parameters = projected_parameters.matmul(loadings).matmul(loadings.T)
