@@ -705,7 +705,7 @@ class GLMPCA:
 
         _optimizer, _loadings, _intercept, _depth, _lr_scheduler = (
             self._create_saturated_loading_optim(
-                parameters=saturated_parameters.data.clone(), X=X, device=device
+                parameters=saturated_parameters, X=X, device=device
             )
         )
 
@@ -715,7 +715,7 @@ class GLMPCA:
         if self.optimizer != "cg":
             train_data = TensorDataset(
                 X,
-                saturated_parameters.data.clone(),
+                saturated_parameters,
                 log_base_measure,
                 torch.arange(X.shape[0]),
             )
