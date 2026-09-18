@@ -72,19 +72,72 @@ def test_poisson_log_pmf_matches_scipy() -> None:
         )
 
 
-@pytest.mark.parametrize("m", [1.0, 2.5])
-def test_poisson_saturated_parameters_map_zero_counts_to_minus_m(m: float) -> None:
-    X = torch.tensor([0.0, 1.0, 3.0, 0.0])
+def expected_counts(X: torch.Tensor) -> torch.Tensor:
+    """`depth_i · mean_j / mean depth`, written out for the tests."""
+    depth = X.sum(dim=1, keepdim=True)
+    return depth * X.mean(dim=0) / depth.mean()
+
+
+ZEROS_AND_COUNTS = torch.tensor([
+    [0.0, 1.0, 3.0],
+    [2.0, 0.0, 4.0],
+    [1.0, 5.0, 0.0],
+])
+
+
+def test_poisson_places_a_zero_at_its_expected_count() -> None:
+    family = Poisson()
+    family.initialize_family_parameters(ZEROS_AND_COUNTS)
+
+    theta = family.invert_g(ZEROS_AND_COUNTS)
+
+    expected = torch.log(expected_counts(ZEROS_AND_COUNTS))
+    zeros = ZEROS_AND_COUNTS == 0
+    torch.testing.assert_close(theta[zeros], expected[zeros])
+    torch.testing.assert_close(theta[~zeros], torch.log(ZEROS_AND_COUNTS[~zeros]))
+
+
+def test_a_zero_in_a_deeper_cell_sits_higher() -> None:
+    X = torch.tensor([[0.0, 1.0, 1.0], [0.0, 9.0, 9.0], [3.0, 2.0, 2.0]])
+    family = Poisson()
+    family.initialize_family_parameters(X)
+
+    theta = family.invert_g(X)
+
+    assert float(theta[1, 0]) > float(theta[0, 0])
+
+
+def test_new_cells_are_placed_against_the_background_of_the_fit() -> None:
+    family = Poisson()
+    family.initialize_family_parameters(ZEROS_AND_COUNTS)
+    new = torch.tensor([[0.0, 2.0, 2.0]])
+
+    theta = family.invert_g(new)
+
+    feature_mean = ZEROS_AND_COUNTS.mean(dim=0)
+    mean_depth = ZEROS_AND_COUNTS.sum(dim=1).mean()
     torch.testing.assert_close(
-        Poisson({"m": m}).invert_g(X), torch.tensor([-m, 0.0, math.log(3.0), -m])
+        theta[0, 0], torch.log(new.sum() * feature_mean[0] / mean_depth)
     )
 
 
-@pytest.mark.parametrize(
-    "family_params", [None, {"n_jobs": 2}], ids=["none", "partial"]
-)
-def test_poisson_m_defaults_to_one(family_params: dict[str, int] | None) -> None:
-    assert Poisson(family_params).invert_g(torch.zeros(2)).tolist() == [-1.0, -1.0]
+def test_the_zero_value_does_not_depend_on_the_chunks() -> None:
+    torch.manual_seed(0)
+    X = torch.poisson(torch.full((20, 6), 0.7))
+    family = Poisson()
+    family.initialize_family_parameters(X)
+
+    whole = family.invert_g(X)
+    chunked = torch.cat([family.invert_g(X[start : start + 7]) for start in (0, 7, 14)])
+
+    torch.testing.assert_close(chunked, whole, rtol=0, atol=0)
+
+
+def test_an_unfitted_poisson_takes_the_background_from_its_input() -> None:
+    theta = Poisson().invert_g(ZEROS_AND_COUNTS)
+
+    expected = torch.log(expected_counts(ZEROS_AND_COUNTS))
+    torch.testing.assert_close(theta[0, 0], expected[0, 0])
 
 
 @pytest.mark.parametrize(
@@ -189,14 +242,23 @@ def test_negative_binomial_log_pmf_matches_scipy() -> None:
             )
 
 
-@pytest.mark.parametrize("m", [1.0, 2.5])
-def test_negative_binomial_maps_zero_counts_to_minus_m(m: float) -> None:
-    family = NegativeBinomial({"m": m})
-    family.family_params["nu"] = torch.tensor(4.0)
+def test_negative_binomial_places_a_zero_at_its_expected_count() -> None:
+    family = NegativeBinomial()
+    family.initialize_family_parameters(ZEROS_AND_COUNTS)
+    nu = family.family_params["nu"]
 
-    theta = family.invert_g(torch.tensor([0.0, 4.0, 12.0]))
+    theta = family.invert_g(ZEROS_AND_COUNTS)
 
-    torch.testing.assert_close(theta, torch.tensor([-m, math.log(0.5), math.log(0.75)]))
+    mu = expected_counts(ZEROS_AND_COUNTS)
+    zeros = ZEROS_AND_COUNTS == 0
+    torch.testing.assert_close(
+        theta[zeros], torch.log(mu / (mu + nu))[zeros].clip(max=-1e-6)
+    )
+    counts = ZEROS_AND_COUNTS[~zeros]
+    nu_of_counts = nu.expand_as(ZEROS_AND_COUNTS)[~zeros]
+    torch.testing.assert_close(
+        theta[~zeros], torch.log(counts / (counts + nu_of_counts)).clip(max=-1e-6)
+    )
 
 
 def test_negative_binomial_dispersion_is_estimated_per_feature() -> None:

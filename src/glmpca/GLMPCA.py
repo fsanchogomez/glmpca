@@ -171,7 +171,6 @@ class GLMPCA:
 
         - "n_jobs" (int) for parallelization, specifically for "beta" and "gamma".
         - "min_val" (float) for truncating in "beta".
-        - "m" (float) for the saturated parameter of zero counts in "poisson".
         - "eps" (float) for convergence in inverse computation in "beta".
 
         Defaults to None.

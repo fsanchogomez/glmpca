@@ -85,6 +85,34 @@ class GLMFamily(str, Enum):
         }[self]
 
 
+MIN_EXPECTED = 1e-4
+"""Floor of the expected count of an entry, and so of the mean count of a feature."""
+
+
+def _zero_background(X: torch.Tensor) -> tuple[torch.Tensor, float]:
+    """The mean count of every feature and the mean depth of the cells, of `X`."""
+    feature_mean = X.mean(dim=0).clip(min=MIN_EXPECTED)
+    mean_depth = max(float(X.sum(dim=1).mean()), 1.0)
+    return feature_mean, mean_depth
+
+
+def _expected_counts(
+    X: torch.Tensor, feature_mean: torch.Tensor, mean_depth: float
+) -> torch.Tensor:
+    r"""The count of every entry under independence: `depth_i · mean_j / mean depth`.
+
+    It is what the saturated parameter of a zero is built from. The saturated map of a
+    count family is infinite at 0, so a zero needs a finite stand-in, and the fit then
+    reconstructs whatever it is given. The expected count under independence puts a
+    zero where the model would put it before any component is fitted: low for a zero
+    in a shallow cell or a rare feature, and lower still for a zero that a deep cell in
+    an abundant feature should not have shown. The depth of a cell is the sum of its own
+    row, so the value does not depend on how the rows are split into chunks.
+    """
+    depth = X.sum(dim=1, keepdim=True).clip(min=1.0)
+    return (depth * feature_mean.to(X.device) / mean_depth).clip(min=MIN_EXPECTED)
+
+
 class ExponentialFamily:
     r"""Encodes an exponential family distribution using PyTorch autodiff structures.
 
@@ -257,10 +285,15 @@ class Bernoulli(ExponentialFamily):
 class Poisson(ExponentialFamily):
     r"""Poisson distribution
 
+    The saturated parameter of a zero, `log 0`, is infinite, so a zero is placed at
+    the log of its expected count under independence instead (`_expected_counts`).
+    initialize_family_parameters fits the background of that value.
+
     family_params of interest:
-        - "m" (float): saturated parameter of zero counts is -m instead of -inf
-        (Landgraf and Lee, 2020). Large values let zero counts dominate the
-        projection. Defaults to 1.
+        - "feature_mean" (torch.Tensor) and "mean_depth" (float): the mean count of
+        every feature and the mean depth of the cells that the family was fitted to,
+        set by initialize_family_parameters. Before it runs, invert_g takes them from
+        the matrix it is given.
 
     """
 
@@ -268,7 +301,7 @@ class Poisson(ExponentialFamily):
         self, family_params: dict[str, Any] | None = None, **kwargs: object
     ) -> None:
         self.family_name = "poisson"
-        default_family_params: dict[str, Any] = {"m": 1.0}
+        default_family_params: dict[str, Any] = {}
         self.family_params = (
             dict(family_params) if family_params else default_family_params
         )
@@ -292,7 +325,19 @@ class Poisson(ExponentialFamily):
         return torch.exp(-torch.lgamma(X + 1))
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.where(X > 0, torch.log(X), -self.family_params["m"])
+        zero = torch.log(_expected_counts(X, *self._background(X)))
+        return torch.where(X > 0, torch.log(X), zero)
+
+    def initialize_family_parameters(self, X: torch.Tensor) -> None:
+        """The background of the saturated parameter of a zero."""
+        feature_mean, mean_depth = _zero_background(X)
+        self.family_params["feature_mean"] = feature_mean
+        self.family_params["mean_depth"] = mean_depth
+
+    def _background(self, X: torch.Tensor) -> tuple[torch.Tensor, float]:
+        if "feature_mean" not in self.family_params:
+            return _zero_background(X)
+        return self.family_params["feature_mean"], self.family_params["mean_depth"]
 
     def log_distribution(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """The computation of gamma function for the base measure (h) would lead to inf,
@@ -314,8 +359,9 @@ class NegativeBinomial(ExponentialFamily):
     family_params of interest:
         - "nu" (torch.Tensor): dispersion of each feature, computed by
         initialize_family_parameters. A large value gives a Poisson-like feature.
-        - "m" (float): saturated parameter of zero counts is -m instead of -inf,
-        as in Poisson. Defaults to 1.
+        - "feature_mean" (torch.Tensor) and "mean_depth" (float): the background of
+        the saturated parameter of a zero, as in Poisson. A zero is placed at
+        `log(mu / (mu + nu))` for its expected count `mu` under independence.
         - "eps" (float): theta is clipped to at most -eps, because the log-partition
         is infinite at 0. Defaults to 1e-6.
         - "max_val" (float): dispersion given to a feature that is not overdispersed.
@@ -334,7 +380,6 @@ class NegativeBinomial(ExponentialFamily):
     ) -> None:
         self.family_name = "negative_binomial"
         default_family_params: dict[str, Any] = {
-            "m": 1.0,
             "eps": 1e-6,
             "max_val": 1e4,
             "method": "mle",
@@ -368,8 +413,16 @@ class NegativeBinomial(ExponentialFamily):
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
         nu = self.family_params["nu"]
+        if "feature_mean" in self.family_params:
+            background = (
+                self.family_params["feature_mean"],
+                self.family_params["mean_depth"],
+            )
+        else:
+            background = _zero_background(X)
+        expected = _expected_counts(X, *background)
         return torch.where(
-            X > 0, torch.log(X / (X + nu)), -self.family_params["m"]
+            X > 0, torch.log(X / (X + nu)), torch.log(expected / (expected + nu))
         ).clip(max=-self.family_params["eps"])
 
     def initialize_family_parameters(self, X: torch.Tensor) -> None:
@@ -389,6 +442,9 @@ class NegativeBinomial(ExponentialFamily):
         self.family_params["nu"] = nu.clip(
             min=self.family_params["eps"], max=max_val
         ).to(X.dtype)
+        feature_mean, mean_depth = _zero_background(X)
+        self.family_params["feature_mean"] = feature_mean
+        self.family_params["mean_depth"] = mean_depth
 
     def _dispersion_by_moments(self, X: torch.Tensor) -> torch.Tensor:
         """`mean^2 / (var - mean)` per feature.
@@ -636,7 +692,7 @@ class SigmoidBeta(Beta):
     This distribution is similar to the previous Beta (which it
     inherits from) but the natural parameter is re-parametrized using
     a Sigmoid. This is shown experimentally to stabilize the
-    optimisation by removing the ]0,1[ constraint.
+    optimisation by removing the [0,1] constraint.
 
     family_params of interest:
         - "min_val" (int): min data value (replaces 0 and 1).

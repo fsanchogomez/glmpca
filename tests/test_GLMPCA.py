@@ -10,7 +10,13 @@ import numpy as np
 import pytest
 import scipy.stats
 import torch
-from glmpca.ExponentialFamily import Beta, GLMFamily, Poisson, _n_workers
+from glmpca.ExponentialFamily import (
+    Beta,
+    GLMFamily,
+    NegativeBinomial,
+    Poisson,
+    _n_workers,
+)
 from glmpca.GLMPCA import (
     DEPTH_RATE_SCALE,
     GLMPCA,
@@ -81,16 +87,16 @@ def test_a_family_name_and_its_member_select_the_same_distribution(
 
 
 def test_an_exponential_family_instance_is_copied_with_its_parameters() -> None:
-    family = Poisson({"m": 2.0})
+    family = NegativeBinomial({"max_val": 50.0})
 
     used = GLMPCA(N_PC, family=family, chunk_size=64).exponential_family
 
     assert used is not family
-    assert type(used) is Poisson
-    assert used.family_params["m"] == 2.0
+    assert type(used) is NegativeBinomial
+    assert used.family_params["max_val"] == 50.0
     # GLMPCA gives its own chunk_size to the copy, and leaves the caller's instance.
     assert used.family_params["chunk_size"] == 64
-    assert "chunk_size" not in family.family_params
+    assert family.family_params["chunk_size"] == 8192
 
 
 @pytest.mark.parametrize("family", list(GLMFamily))
