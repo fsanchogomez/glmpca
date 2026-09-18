@@ -25,10 +25,12 @@ from glmpca.GLMPCA import (
     PLATEAU_PATIENCE,
     _fits_in,
     _inverse_document_frequency,
+    _Rows,
     _tf_idf,
     _to_tensor,
 )
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
+from glmpca.sparse import SparseRows
 from scipy import sparse
 
 if TYPE_CHECKING:
@@ -197,12 +199,10 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
     start_rates: list[float] = []
 
     def run_that_restarts_once(
-        saturated_parameters: torch.Tensor,
-        X: torch.Tensor,
+        rows: _Rows,
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
-        full: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma
@@ -571,7 +571,10 @@ def test_the_chunked_cost_equals_the_cost_of_the_whole_matrix() -> None:
             model.saturated_loadings_, model.saturated_intercept_, X, parameters
         )
         chunked = model._full_cost(
-            model.saturated_loadings_, model.saturated_intercept_, X, parameters
+            model.saturated_loadings_,
+            model.saturated_intercept_,
+            _Rows(X, model.exponential_family, parameters),
+            torch.device("cpu"),
         )
 
     torch.testing.assert_close(chunked, whole, rtol=1e-5, atol=1e-4)
@@ -788,7 +791,7 @@ def test_the_depth_factor_has_its_own_learning_rate() -> None:
     saturated = torch.log(depth_gradient().clip(min=1.0))
 
     optimizer, _, _, depth, _ = model._create_saturated_loading_optim(
-        saturated, saturated, torch.device("cpu")
+        _Rows(saturated, model.exponential_family, saturated), torch.device("cpu")
     )
 
     assert depth is not None
@@ -843,3 +846,83 @@ def test_the_offset_of_a_cell_is_the_optimum_of_its_likelihood(family: str) -> N
     at_optimum = costs(depth)
     for shift in (-1e-2, 1e-2):
         assert torch.all(costs(depth + shift) >= at_optimum - 1e-3)
+
+
+@pytest.mark.parametrize(
+    "family", ["gaussian", "poisson", "negative_binomial", "bernoulli"]
+)
+@pytest.mark.parametrize("optimizer", ["adagrad", "cg"])
+def test_keep_sparse_fits_what_the_dense_matrix_fits(
+    family: str, optimizer: Literal["adagrad", "cg"]
+) -> None:
+    X = sample(GLMFamily(family)) * (torch.rand(N_CELLS, N_FEATURES) < 0.3)
+    fits = {}
+    for keep_sparse in (False, True):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = GLMPCA(
+            N_PC,
+            family=family,
+            max_iter=5,
+            batch_size=16,
+            chunk_size=15,
+            optimizer=optimizer,
+            keep_sparse=keep_sparse,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(ad.AnnData(sparse.csr_matrix(X.numpy())) if keep_sparse else X)
+        fits[keep_sparse] = model
+
+    dense, kept = fits[False], fits[True]
+    assert dense.saturated_loadings_ is not None
+    assert kept.saturated_loadings_ is not None
+    torch.testing.assert_close(kept.saturated_loadings_, dense.saturated_loadings_)
+    torch.testing.assert_close(kept.saturated_intercept_, dense.saturated_intercept_)
+    torch.testing.assert_close(kept.saturated_depth_, dense.saturated_depth_)
+    assert kept.log_likelihood_ == pytest.approx(dense.log_likelihood_, rel=1e-6)
+    torch.testing.assert_close(kept.transform(X), dense.transform(X))
+
+
+def test_keep_sparse_reads_a_sparse_anndata_with_tfidf() -> None:
+    X = torch.poisson(torch.full((N_CELLS, N_FEATURES), 0.5))
+    fits = {}
+    for keep_sparse in (False, True):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = GLMPCA(
+            N_PC,
+            family="gaussian",
+            max_iter=5,
+            batch_size=16,
+            tfidf=True,
+            init="lsi",
+            keep_sparse=keep_sparse,
+        )
+        model.fit(ad.AnnData(sparse.csr_matrix(X.numpy())))
+        fits[keep_sparse] = model
+
+    dense, kept = fits[False], fits[True]
+    assert dense.saturated_loadings_ is not None
+    assert kept.saturated_loadings_ is not None
+    torch.testing.assert_close(
+        kept.saturated_loadings_, dense.saturated_loadings_, rtol=1e-4, atol=1e-4
+    )
+
+
+@pytest.mark.parametrize("family", ["beta", "sigmoid_beta", "gamma", "lognormal"])
+def test_keep_sparse_rejects_the_families_without_zeros(family: str) -> None:
+    model = GLMPCA(N_PC, family=family, max_iter=1, keep_sparse=True)
+
+    with pytest.raises(ValueError, match="keep_sparse=True does not fit"):
+        model.fit(sample(GLMFamily(family)))
+
+
+def test_sparse_rows_hand_out_dense_blocks() -> None:
+    matrix = sparse.random(30, 8, density=0.2, format="csr", dtype=np.float32, rng=0)
+    rows = SparseRows(matrix)
+    order = torch.tensor([4, 0, 29, 4])
+
+    assert rows.shape == (30, 8)
+    torch.testing.assert_close(rows[3:9], torch.from_numpy(matrix[3:9].toarray()))
+    torch.testing.assert_close(rows[order], torch.from_numpy(matrix.toarray())[order])

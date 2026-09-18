@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import warnings
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import anndata as ad
 import numpy as np
@@ -10,7 +10,6 @@ import torch
 import torch.optim
 from anndata.abc import CSCDataset, CSRDataset
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
 from .ExponentialFamily import ExponentialFamily, GLMFamily
@@ -22,6 +21,7 @@ from .manifolds import (
     RiemannianConjugateGradient,
     canonical_basis,
 )
+from .sparse import SparseRows
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,6 +35,7 @@ _OPTIMIZERS = {
 DEFAULT_LEARNING_RATE = 0.2
 TFIDF_SCALE = 1e4
 BOUNDED_FAMILIES = ("bernoulli", "beta", "sigmoid_beta")
+SPARSE_FAMILIES = ("gaussian", "poisson", "negative_binomial", "bernoulli")
 INTERCEPT_RATE_SCALE = 0.01
 DEPTH_RATE_SCALE = 0.01
 LEARNING_RATE_LIMIT = 1e-8
@@ -151,13 +152,24 @@ def _fitted_depth(
     return depth
 
 
-def _inverse_document_frequency(counts: torch.Tensor) -> torch.Tensor:
+def _inverse_document_frequency(counts: torch.Tensor | SparseRows) -> torch.Tensor:
     """The number of cells over the number of cells that hold each feature."""
-    holders = (counts > 0).sum(dim=0).clip(min=1)
+    if isinstance(counts, SparseRows):
+        matrix = counts.matrix
+        held = np.bincount(matrix.indices[matrix.data > 0], minlength=matrix.shape[1])
+        holders = torch.from_numpy(held).clip(min=1)
+    else:
+        holders = (counts > 0).sum(dim=0).clip(min=1)
     return counts.shape[0] / holders
 
 
-def _tf_idf(counts: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
+@overload
+def _tf_idf(counts: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor: ...
+@overload
+def _tf_idf(counts: SparseRows, inverse: torch.Tensor) -> SparseRows: ...
+def _tf_idf(
+    counts: torch.Tensor | SparseRows, inverse: torch.Tensor
+) -> torch.Tensor | SparseRows:
     r"""Term frequency times inverse document frequency, the matrix that LSI reduces.
 
     The count of a feature in a cell is divided by the depth of that cell (the term
@@ -171,9 +183,31 @@ def _tf_idf(counts: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
 
     `inverse` is an argument rather than a second pass over `counts`, so that
     `transform` can weigh new cells by the frequencies of the fit.
+
+    A zero stays a zero, so the TF-IDF of a `SparseRows` is one too.
     """
+    if isinstance(counts, SparseRows):
+        matrix = counts.matrix
+        depth = np.asarray(matrix.sum(axis=1), dtype=np.float32).ravel().clip(min=1.0)
+        row_of = np.repeat(np.arange(matrix.shape[0]), np.diff(matrix.indptr))
+        weight = inverse.cpu().numpy().astype(np.float32)[matrix.indices]
+        values = np.log1p(
+            matrix.data / depth[row_of] * weight * np.float32(TFIDF_SCALE)
+        )
+        return SparseRows(
+            csr_matrix(
+                (values.astype(np.float32), matrix.indices, matrix.indptr),
+                shape=matrix.shape,
+            )
+        )
     depth = counts.sum(dim=1, keepdim=True).clip(min=1.0)
     return torch.log1p(counts / depth * inverse * TFIDF_SCALE)
+
+
+def _has_negative(X: torch.Tensor | SparseRows) -> bool:
+    if isinstance(X, SparseRows):
+        return bool((X.matrix.data < 0).any())
+    return bool(torch.any(X < 0))
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -211,6 +245,61 @@ def _to_tensor(
         f"anndata.AnnData"
     )
     raise ValueError(msg)
+
+
+def _to_sparse(X: torch.Tensor | np.ndarray | ad.AnnData) -> SparseRows:
+    """The input as a float32 CSR matrix, for keep_sparse=True."""
+    if isinstance(X, ad.AnnData):
+        counts = X.X
+        if isinstance(counts, CSRDataset | CSCDataset):
+            counts = counts.to_memory()
+    elif isinstance(X, torch.Tensor):
+        counts = X.detach().cpu().numpy()
+    elif isinstance(X, np.ndarray):
+        counts = X
+    else:
+        msg = (
+            f"X format unrecognised: {type(X)} != torch.Tensor, np.ndarray or "
+            f"anndata.AnnData"
+        )
+        raise ValueError(msg)
+    return SparseRows(csr_matrix(counts, dtype=np.float32))
+
+
+class _Rows:
+    """The matrix of a fit and its saturated parameters, read by blocks of rows.
+
+    `data` is a tensor, or a `SparseRows` with keep_sparse. `theta` holds the saturated
+    parameters when they were computed once, or is None, and then every block computes
+    its own from its data. That is what keeps a CSR input from being densified whole.
+    """
+
+    def __init__(
+        self,
+        data: torch.Tensor | SparseRows,
+        family: ExponentialFamily,
+        theta: torch.Tensor | None,
+    ) -> None:
+        self.data = data
+        self.family = family
+        self.theta = theta
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.data.shape
+
+    def block(
+        self, rows: slice | torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The data and the saturated parameters of `rows`, on `device`."""
+        data = self.data[rows].to(device, non_blocking=True)
+        if self.theta is None:
+            return data, self.family.invert_g(data)
+        return data, self.theta[rows].to(device, non_blocking=True)
+
+    def slices(self, size: int) -> Iterator[slice]:
+        for start in range(0, self.shape[0], size):
+            yield slice(start, start + size)
 
 
 class GLMPCA:
@@ -332,6 +421,16 @@ class GLMPCA:
         batch_size does not either. One of its steps costs several passes over the
         matrix, and it lowers the cost at every one of them.
 
+    keep_sparse: bool
+        Whether to hold the input as a CSR matrix for the whole fit, instead of as a
+        dense matrix beside a dense copy of its saturated parameters. Every block of
+        rows is densified, and its saturated parameters computed, when it is read. The
+        memory of the data falls from two dense matrices to the non-zero entries, and a
+        pass over the matrix takes longer, by about half on a count matrix with 7%
+        non-zeros. transform then reads its input the same way. Only the families
+        whose data has zeros take it: "gaussian", "poisson", "negative_binomial" and
+        "bernoulli". Defaults to False.
+
     """
 
     def __init__(
@@ -351,6 +450,7 @@ class GLMPCA:
         device: str | torch.device | None = None,
         chunk_size: int = DEFAULT_CHUNK_ROWS,
         optimizer: Literal["adagrad", "adam", "cg"] = "adagrad",
+        keep_sparse: bool = False,
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -369,6 +469,7 @@ class GLMPCA:
         self.tfidf_weights_: torch.Tensor | None = None
         self.chunk_size = chunk_size
         self.optimizer = optimizer
+        self.keep_sparse = keep_sparse
 
         self.saturated_loadings_: torch.Tensor | None = None
         # Log-likelihood of the fit, the real one, with the base measure
@@ -439,17 +540,26 @@ class GLMPCA:
             )
             warnings.warn(msg, UserWarning, stacklevel=2)
 
-        X_fit = _to_tensor(X)
-        if (self.init == "lsi" or self.tfidf) and bool(torch.any(X_fit < 0)):
+        family = self.exponential_family
+        if self.keep_sparse and family.family_name not in SPARSE_FAMILIES:
+            msg = (
+                f"keep_sparse=True does not fit family={family.family_name!r}, whose "
+                f"data has no zeros, so a sparse matrix would save nothing. Use one of "
+                f"{', '.join(repr(name) for name in SPARSE_FAMILIES)}."
+            )
+            raise ValueError(msg)
+
+        X_fit = _to_sparse(X) if self.keep_sparse else _to_tensor(X)
+        if (self.init == "lsi" or self.tfidf) and _has_negative(X_fit):
             msg = (
                 "TF-IDF needs counts, but the input has negative values. Use "
                 "init='spectral' and tfidf=False for data that is not counts."
             )
             raise ValueError(msg)
-        if self.tfidf and self.exponential_family.family_name in BOUNDED_FAMILIES:
+        if self.tfidf and family.family_name in BOUNDED_FAMILIES:
             msg = (
                 f"tfidf=True does not fit "
-                f"family={self.exponential_family.family_name!r}, whose support is "
+                f"family={family.family_name!r}, whose support is "
                 f"bounded: the TF-IDF of counts is continuous and reaches past 1. Use "
                 f"'gaussian', 'poisson' or 'negative_binomial'."
             )
@@ -478,43 +588,40 @@ class GLMPCA:
         _announce_device(device)
 
         # Fit exponential family params (e.g., dispersion for negative binomial)
-        self.exponential_family.initialize_family_parameters(X_fit)
-        self.exponential_family.load_family_params_to_gpu(device)
+        family.initialize_family_parameters(X_fit)
+        family.load_family_params_to_gpu(device)
 
         # Compute saturated parameters, alongside exponential family parameters
-        saturated_parameters = torch.empty_like(X_fit)
-        for start in range(0, X_fit.shape[0], self.chunk_size):
-            stop = start + self.chunk_size
-            saturated_parameters[start:stop] = self.exponential_family.invert_g(
-                X_fit[start:stop].to(device)
-            ).cpu()
+        saturated_parameters = None
+        if isinstance(X_fit, torch.Tensor):
+            saturated_parameters = torch.empty_like(X_fit)
+            for start in range(0, X_fit.shape[0], self.chunk_size):
+                stop = start + self.chunk_size
+                saturated_parameters[start:stop] = family.invert_g(
+                    X_fit[start:stop].to(device)
+                ).cpu()
+        rows = _Rows(X_fit, family, saturated_parameters)
 
         # log h(x) of every cell, summed over its features. It turns the cost into
         # the real log-likelihood.
         log_base_measure = torch.empty(X_fit.shape[0])
-        for start in range(0, X_fit.shape[0], self.chunk_size):
-            stop = start + self.chunk_size
-            log_base_measure[start:stop] = (
-                self.exponential_family
-                .log_base_measure(X_fit[start:stop].to(device))
-                .sum(dim=1)
-                .cpu()
+        for chunk in rows.slices(self.chunk_size):
+            log_base_measure[chunk] = (
+                family.log_base_measure(X_fit[chunk].to(device)).sum(dim=1).cpu()
             )
 
-        resident = device.type != "cuda" or _fits_in(
-            torch.cuda.mem_get_info(device)[0],
-            (X_fit, saturated_parameters),
-            WORKING_COPIES * min(self.chunk_size, X_fit.shape[0]) * X_fit[0].nbytes,
-        )
+        resident = False
+        if isinstance(X_fit, torch.Tensor) and saturated_parameters is not None:
+            resident = device.type != "cuda" or _fits_in(
+                torch.cuda.mem_get_info(device)[0],
+                (X_fit, saturated_parameters),
+                WORKING_COPIES * min(self.chunk_size, X_fit.shape[0]) * X_fit[0].nbytes,
+            )
+            if resident and device.type == "cuda":
+                rows = _Rows(X_fit.to(device), family, saturated_parameters.to(device))
         if device.type == "cuda":
             tqdm.write(
                 f"DATA: {'held on the device' if resident else 'copied by chunks'}"
-            )
-        full_data, full_parameters = X_fit, saturated_parameters
-        if resident:
-            full_data, full_parameters = (
-                X_fit.to(device),
-                saturated_parameters.to(device),
             )
         after = device if resident else torch.device("cpu")
 
@@ -527,14 +634,7 @@ class GLMPCA:
         for _ in range(self.n_init):
             self.learning_rate_ = self.initial_learning_rate_
             runs.append(
-                self._saturated_loading_iter(
-                    saturated_parameters,
-                    X_fit,
-                    batch_size,
-                    device,
-                    log_base_measure,
-                    (full_data, full_parameters),
-                )
+                self._saturated_loading_iter(rows, batch_size, device, log_base_measure)
             )
 
         runs = [
@@ -545,12 +645,12 @@ class GLMPCA:
             )
             for loadings, intercept, depth in runs
         ]
-        self.exponential_family.load_family_params_to_gpu(after)
+        family.load_family_params_to_gpu(after)
 
         # Select best model
         with torch.no_grad():
             training_cost = torch.stack([
-                self._full_cost(loadings, intercept, full_data, full_parameters, depth)
+                self._full_cost(loadings, intercept, rows, after, depth)
                 for loadings, intercept, depth in runs
             ])
         best_model_idx = int(torch.argmin(training_cost))
@@ -559,40 +659,42 @@ class GLMPCA:
         self.saturated_intercept_ = best_intercept.detach()
         self.saturated_depth_ = None
         if best_depth is not None:
-            self.saturated_depth_ = torch.cat([
-                _fitted_depth(
-                    self.exponential_family,
-                    full_data[start : start + self.chunk_size],
-                    full_parameters[start : start + self.chunk_size]
-                    - self.saturated_intercept_.unsqueeze(0),
-                    self.saturated_intercept_,
-                    best_loadings,
+            offsets = []
+            for chunk in rows.slices(self.chunk_size):
+                data, theta = rows.block(chunk, after)
+                offsets.append(
+                    _fitted_depth(
+                        family,
+                        data,
+                        theta - self.saturated_intercept_.unsqueeze(0),
+                        self.saturated_intercept_,
+                        best_loadings,
+                    )
                 )
-                for start in range(0, X_fit.shape[0], self.chunk_size)
-            ])
+            self.saturated_depth_ = torch.cat(offsets)
             with torch.no_grad():
                 training_cost = self._full_cost(
                     best_loadings,
                     self.saturated_intercept_,
-                    full_data,
-                    full_parameters,
+                    rows,
+                    after,
                     self.saturated_depth_,
                 )
         self.log_likelihood_ = float(training_cost.min().neg().cpu()) + float(
             log_base_measure.sum()
         )
         self.saturated_loadings_ = canonical_basis(
-            best_loadings, self._centred_chunks(full_parameters)
+            best_loadings, self._centred_chunks(rows, after)
         ).cpu()
         self.saturated_intercept_ = self.saturated_intercept_.cpu()
         if self.saturated_depth_ is not None:
             self.saturated_depth_ = self.saturated_depth_.cpu()
-        self.exponential_family.load_family_params_to_gpu(torch.device("cpu"))
+        family.load_family_params_to_gpu(torch.device("cpu"))
 
         return True
 
     def _centred_chunks(
-        self, saturated_parameters: torch.Tensor
+        self, rows: _Rows, device: torch.device
     ) -> Iterator[torch.Tensor]:
         """The rows that transform projects, in blocks of chunk_size.
 
@@ -603,11 +705,11 @@ class GLMPCA:
         """
         intercept = self.saturated_intercept_
         assert intercept is not None
-        for start in range(0, saturated_parameters.shape[0], self.chunk_size):
-            stop = start + self.chunk_size
-            block = saturated_parameters[start:stop] - intercept.unsqueeze(0)
+        for chunk in rows.slices(self.chunk_size):
+            _, theta = rows.block(chunk, device)
+            block = theta - intercept.unsqueeze(0)
             if self.saturated_depth_ is not None:
-                block = block - self.saturated_depth_[start:stop].unsqueeze(1)
+                block = block - self.saturated_depth_[chunk].unsqueeze(1)
             yield block
 
     def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
@@ -630,7 +732,7 @@ class GLMPCA:
             msg = "GLMPCA is not fitted. Call fit() before transform()."
             raise RuntimeError(msg)
 
-        X_transform = _to_tensor(X)
+        X_transform = _to_sparse(X) if self.keep_sparse else _to_tensor(X)
         if self.tfidf and self.tfidf_weights_ is not None:
             # The weights of the fit, so that new cells land on the same scale.
             X_transform = _tf_idf(
@@ -639,54 +741,45 @@ class GLMPCA:
         device = X_transform.device
         loadings, intercept = loadings.to(device), intercept.to(device)
         self.exponential_family.load_family_params_to_gpu(device)
-        saturated_parameters = self.exponential_family.invert_g(X_transform)
 
-        # Compute intercept term
-        intercept_term = intercept.unsqueeze(0)
-
-        projected_parameters = saturated_parameters - intercept_term
-        if self.depth_factor:
-            depth = torch.cat([
-                _fitted_depth(
+        rows = _Rows(X_transform, self.exponential_family, None)
+        scores = [torch.empty(0, loadings.shape[1], device=device)]
+        for chunk in rows.slices(self.chunk_size):
+            data, theta = rows.block(chunk, device)
+            projected_parameters = theta - intercept.unsqueeze(0)
+            if self.depth_factor:
+                depth = _fitted_depth(
                     self.exponential_family,
-                    X_transform[start : start + self.chunk_size],
-                    projected_parameters[start : start + self.chunk_size],
+                    data,
+                    projected_parameters,
                     intercept,
                     loadings,
                 )
-                for start in range(0, X_transform.shape[0], self.chunk_size)
-            ])
-            projected_parameters = projected_parameters - depth.unsqueeze(1)
-        projected_parameters = projected_parameters.matmul(loadings)
+                projected_parameters = projected_parameters - depth.unsqueeze(1)
+            scores.append(projected_parameters.matmul(loadings))
 
-        return projected_parameters
+        return torch.cat(scores)
 
     def _saturated_loading_iter(
         self,
-        saturated_parameters: torch.Tensor,
-        X: torch.Tensor,
+        rows: _Rows,
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
-        full: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         r"""Computes the loadings solution of the GLM-PCA optimisation problem.
 
         Parameters
         ----------
-        saturated_parameters : torch.Tensor
-            Saturated parameters of the dataset X ($g^{-1}\left(X\right)$)
-        X : torch.Tensor
-            Dataset with cells in rows and features in columns.
+        rows : _Rows
+            The dataset, cells in rows and features in columns, with its saturated
+            parameters ($g^{-1}\left(X\right)$), read by blocks of rows.
         batch_size : int
             Size of the batch in the SGD optimisation step.
         device : torch.device
             Device used to train.
         log_base_measure : torch.Tensor
             `log h(x)` of every cell, summed over its features.
-        full : tuple[torch.Tensor, torch.Tensor]
-            X and its saturated parameters for the passes over the whole matrix: on
-            the device when they fit there, else on the host.
 
         Returns
         -------
@@ -704,44 +797,22 @@ class GLMPCA:
         self.loadings_learning_rates_.append([])
 
         _optimizer, _loadings, _intercept, _depth, _lr_scheduler = (
-            self._create_saturated_loading_optim(
-                parameters=saturated_parameters, X=X, device=device
-            )
+            self._create_saturated_loading_optim(rows=rows, device=device)
         )
-
-        # Conjugate gradients works on the whole matrix, so it needs no loader: its
-        # line search has to see the same objective at every trial point.
-        train_data = train_loader = None
-        if self.optimizer != "cg":
-            train_data = TensorDataset(
-                X,
-                saturated_parameters,
-                log_base_measure,
-                torch.arange(X.shape[0]),
-            )
-            train_loader = DataLoader(
-                dataset=train_data,
-                batch_size=batch_size,
-                shuffle=True,
-                drop_last=True,
-                pin_memory=device.type == "cuda",
-            )
+        n = rows.shape[0]
 
         def closure() -> float:
             """The cost of the whole matrix, with the gradient summed over chunks."""
             _optimizer.zero_grad()
-            data, parameters = full
             total = torch.zeros((), device=device, dtype=torch.float64)
-            for start in range(0, X.shape[0], self.chunk_size):
-                stop = start + self.chunk_size
+            for chunk in rows.slices(self.chunk_size):
+                data, parameters = rows.block(chunk, device)
                 cost = self._optim_cost(
                     loadings=_loadings,
                     intercept=_intercept,
-                    batch_data=data[start:stop].to(device, non_blocking=True),
-                    batch_parameters=parameters[start:stop].to(
-                        device, non_blocking=True
-                    ),
-                    batch_depth=None if _depth is None else _depth[start:stop],
+                    batch_data=data,
+                    batch_parameters=parameters,
+                    batch_depth=None if _depth is None else _depth[chunk],
                 )
                 cost.backward()
                 total += cost.detach()
@@ -781,25 +852,21 @@ class GLMPCA:
                         )
                         warnings.warn(msg, UserWarning, stacklevel=2)
                         break
-                elif train_loader is not None:
+                else:
                     step_costs = []
-                    epoch_base = 0.0
-                    for batch_data, batch_parameters, batch_base, rows in train_loader:
+                    order = torch.randperm(n)[: n - n % batch_size]
+                    for batch in order.split(batch_size):
+                        batch_data, batch_parameters = rows.block(batch, device)
                         cost_step = self._optim_cost(
                             loadings=_loadings,
                             intercept=_intercept,
-                            batch_data=batch_data.to(device, non_blocking=True),
-                            batch_parameters=batch_parameters.to(
-                                device, non_blocking=True
-                            ),
+                            batch_data=batch_data,
+                            batch_parameters=batch_parameters,
                             batch_depth=(
-                                None
-                                if _depth is None
-                                else _depth[rows.to(device, non_blocking=True)]
+                                None if _depth is None else _depth[batch.to(device)]
                             ),
                         )
                         step_costs.append(cost_step.detach())
-                        epoch_base += float(batch_base.sum())
                         cost_step.backward()
                         _optimizer.step()
                         _optimizer.zero_grad()
@@ -810,7 +877,9 @@ class GLMPCA:
                     self.loadings_learning_scores_[-1].extend(costs)
                     epoch_cost = float(costs.sum(dtype=np.float64))
                     # The cost leaves out log h, which the bar puts back.
-                    epoch_log_likelihood = epoch_base - epoch_cost
+                    epoch_log_likelihood = (
+                        float(log_base_measure[order].sum()) - epoch_cost
+                    )
                     learning_rate = _lr_scheduler.get_last_lr()[0]
                     if cost_anchor is None:
                         cost_anchor = max(abs(epoch_cost), 1e-12)
@@ -838,8 +907,6 @@ class GLMPCA:
 
                     # Remove memory
                     del (
-                        train_data,
-                        train_loader,
                         _optimizer,
                         _loadings,
                         _intercept,
@@ -850,12 +917,10 @@ class GLMPCA:
                         torch.cuda.empty_cache()
 
                     return self._saturated_loading_iter(
-                        saturated_parameters=saturated_parameters,
-                        X=X,
+                        rows=rows,
                         batch_size=batch_size,
                         device=device,
                         log_base_measure=log_base_measure,
-                        full=full,
                     )
 
                 if (
@@ -874,7 +939,7 @@ class GLMPCA:
         return (_loadings, _intercept, _depth)
 
     def _create_saturated_loading_optim(
-        self, parameters: torch.Tensor, X: torch.Tensor, device: torch.device
+        self, rows: _Rows, device: torch.device
     ) -> tuple[
         torch.optim.Optimizer,
         torch.Tensor,
@@ -886,10 +951,9 @@ class GLMPCA:
 
         Parameters
         ----------
-        parameters : torch.Tensor
-            Saturated parameters of the dataset X ($g^{-1}\left(X\right)$)
-        X : torch.Tensor
-            Dataset with cells in rows and features in columns.
+        rows : _Rows
+            The dataset, cells in rows and features in columns, with its saturated
+            parameters ($g^{-1}\left(X\right)$), read by blocks of rows.
         device : torch.device
             Device on which the loadings and the intercept are created.
 
@@ -910,13 +974,19 @@ class GLMPCA:
         """
         # Initialize loadings with spectrum (2**13 as maximum value for SVD to be
         # relatively fast)
-        random_batch_size = min(X.shape[0], 2**13)
+        n, p = rows.shape
+        random_batch_size = min(n, 2**13)
         random_idx = np.random.choice(
-            np.arange(parameters.shape[0]), replace=False, size=random_batch_size
+            np.arange(n), replace=False, size=random_batch_size
         )
+        subset_data, subset = (
+            part.cpu() for part in rows.block(torch.from_numpy(random_idx), device)
+        )
+        if self.init != "lsi":
+            del subset_data
         if self.init == "spectral":
             _, _, v = torch.linalg.svd(
-                parameters[random_idx] - torch.mean(parameters[random_idx], dim=0),
+                subset - torch.mean(subset, dim=0),
                 full_matrices=False,
             )
             loadings = ManifoldParameter(
@@ -924,9 +994,8 @@ class GLMPCA:
             )
         elif self.init == "lsi":
             # LSI: the SVD of the TF-IDF of the counts, not of the saturated parameters.
-            subset = X[random_idx]
             _, _, v = torch.linalg.svd(
-                _tf_idf(subset, _inverse_document_frequency(subset)),
+                _tf_idf(subset_data, _inverse_document_frequency(subset_data)),
                 full_matrices=False,
             )
             loadings = ManifoldParameter(
@@ -934,19 +1003,15 @@ class GLMPCA:
             )
         elif self.init == "random":
             loadings = ManifoldParameter(
-                Grassmann().random(parameters.shape[1], self.n_pc, device=device),
+                Grassmann().random(p, self.n_pc, device=device),
                 manifold=Grassmann(),
             )
 
         # Initialize intercept
         if self.exponential_family.family_name in ["poisson"]:
-            intercept = ManifoldParameter(
-                torch.median(parameters[random_idx], dim=0).values.to(device)
-            )
+            intercept = ManifoldParameter(torch.median(subset, dim=0).values.to(device))
         else:
-            intercept = ManifoldParameter(
-                torch.mean(parameters[random_idx], dim=0).to(device)
-            )
+            intercept = ManifoldParameter(torch.mean(subset, dim=0).to(device))
 
         # The offset of every cell, started at the mean residual of that cell once the
         # offset of the feature is out, which is where least squares would put it.
@@ -957,12 +1022,10 @@ class GLMPCA:
         ]
         floors = [LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE]
         if self.depth_factor:
-            start = torch.empty(parameters.shape[0])
-            for begin in range(0, parameters.shape[0], self.chunk_size):
-                finish = begin + self.chunk_size
-                start[begin:finish] = (
-                    parameters[begin:finish] - intercept.detach().cpu()
-                ).mean(dim=1)
+            start = torch.empty(n)
+            for chunk in rows.slices(self.chunk_size):
+                _, theta = rows.block(chunk, device)
+                start[chunk] = (theta - intercept.detach()).mean(dim=1).cpu()
             depth = ManifoldParameter(start.to(device))
             groups.append({
                 "params": depth,
@@ -990,20 +1053,20 @@ class GLMPCA:
         self,
         loadings: torch.Tensor,
         intercept: torch.Tensor,
-        X: torch.Tensor,
-        parameters: torch.Tensor,
+        rows: _Rows,
+        device: torch.device,
         depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Sums the cost over chunks of chunk_size rows, to never expand X."""
-        total = torch.zeros((), dtype=X.dtype, device=X.device)
-        for start in range(0, X.shape[0], self.chunk_size):
-            stop = start + self.chunk_size
+        total = torch.zeros((), device=device)
+        for chunk in rows.slices(self.chunk_size):
+            data, parameters = rows.block(chunk, device)
             total = total + self._optim_cost(
                 loadings,
                 intercept,
-                X[start:stop],
-                parameters[start:stop],
-                None if depth is None else depth[start:stop],
+                data,
+                parameters,
+                None if depth is None else depth[chunk],
             )
         return total
 

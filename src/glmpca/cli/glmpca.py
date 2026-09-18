@@ -488,6 +488,21 @@ def main(
             ),
         ),
     ] = DEFAULT_CHUNK_ROWS,
+    keep_sparse: Annotated[
+        bool,
+        typer.Option(
+            "--keepSparse",
+            rich_help_panel=_OPTIMISATION,
+            help=(
+                "Hold a sparse matrix as sparse for the whole fit, and densify it one "
+                "chunk of cells at a time, instead of holding it dense beside a dense "
+                "copy of its saturated parameters. It cuts the memory of the data to "
+                "its non-zero entries, and a fit takes longer, by about half on a "
+                "count matrix with 7% non-zeros. Only gaussian, poisson, "
+                "negative_binomial and bernoulli take it."
+            ),
+        ),
+    ] = False,
     # Clustering options
     n_neighbors: Annotated[
         int,
@@ -641,6 +656,7 @@ def main(
             init=init,
             optimizer=optimizer,
             chunk_size=chunk_size,
+            keep_sparse=keep_sparse,
             no_depth_factor=no_depth_factor,
             tfidf=tfidf,
             no_accelerate=no_accelerate,
@@ -689,6 +705,7 @@ def main(
                 n_jobs=number_of_processors,
                 device=device,
                 chunk_size=chunk_size,
+                keep_sparse=keep_sparse,
                 tfidf=tfidf,
                 depth_factor=not no_depth_factor,
             ),
@@ -711,6 +728,7 @@ def main(
             "init": init.value,
             "optimizer": optimizer.value,
             "tfidf": tfidf,
+            "keep_sparse": keep_sparse,
             "depth_factor": not no_depth_factor,
             "accelerate": not no_accelerate,
             "penalty": penalty,

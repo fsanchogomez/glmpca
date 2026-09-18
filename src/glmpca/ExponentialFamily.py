@@ -24,6 +24,8 @@ NEWTON_TOLERANCE = 1e-9
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+    from .sparse import SparseRows
+
 saturation_eps = 10**-10
 
 
@@ -89,11 +91,31 @@ MIN_EXPECTED = 1e-4
 """Floor of the expected count of an entry, and so of the mean count of a feature."""
 
 
-def _zero_background(X: torch.Tensor) -> tuple[torch.Tensor, float]:
+def _column_sums(
+    X: torch.Tensor | SparseRows, chunk: int, power: int = 1
+) -> torch.Tensor:
+    """The sum over the rows of `X ** power`, by blocks of rows, in float64."""
+    total = torch.zeros(X.shape[1], dtype=torch.float64, device=X.device)
+    for start in range(0, X.shape[0], chunk):
+        total += X[start : start + chunk].double().pow(power).sum(dim=0)
+    return total
+
+
+def _zero_background(
+    X: torch.Tensor | SparseRows, chunk: int = 8192
+) -> tuple[torch.Tensor, float]:
     """The mean count of every feature and the mean depth of the cells, of `X`."""
-    feature_mean = X.mean(dim=0).clip(min=MIN_EXPECTED)
-    mean_depth = max(float(X.sum(dim=1).mean()), 1.0)
+    columns = _column_sums(X, chunk)
+    feature_mean = (columns / X.shape[0]).to(X.dtype).clip(min=MIN_EXPECTED)
+    mean_depth = max(float(columns.sum()) / X.shape[0], 1.0)
     return feature_mean, mean_depth
+
+
+def _dense(X: torch.Tensor | SparseRows, family_name: str) -> torch.Tensor:
+    if not isinstance(X, torch.Tensor):
+        msg = f"The {family_name} family needs a dense matrix, not keep_sparse=True."
+        raise TypeError(msg)
+    return X
 
 
 def _expected_counts(
@@ -196,7 +218,7 @@ class ExponentialFamily:
             if type(value) is torch.Tensor:
                 self.family_params[key] = value.to(device)
 
-    def initialize_family_parameters(self, X: torch.Tensor) -> None:
+    def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
         """General method to initialize certain parameters (e.g. for Beta or Negative
         Binomial)."""
 
@@ -328,9 +350,11 @@ class Poisson(ExponentialFamily):
         zero = torch.log(_expected_counts(X, *self._background(X)))
         return torch.where(X > 0, torch.log(X), zero)
 
-    def initialize_family_parameters(self, X: torch.Tensor) -> None:
+    def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
         """The background of the saturated parameter of a zero."""
-        feature_mean, mean_depth = _zero_background(X)
+        feature_mean, mean_depth = _zero_background(
+            X, int(self.family_params.get("chunk_size", 8192))
+        )
         self.family_params["feature_mean"] = feature_mean
         self.family_params["mean_depth"] = mean_depth
 
@@ -425,7 +449,7 @@ class NegativeBinomial(ExponentialFamily):
             X > 0, torch.log(X / (X + nu)), torch.log(expected / (expected + nu))
         ).clip(max=-self.family_params["eps"])
 
-    def initialize_family_parameters(self, X: torch.Tensor) -> None:
+    def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
         """Dispersion per feature, by the method chosen in family_params["method"]."""
         method = self.family_params["method"]
         if method == "moments":
@@ -442,25 +466,31 @@ class NegativeBinomial(ExponentialFamily):
         self.family_params["nu"] = nu.clip(
             min=self.family_params["eps"], max=max_val
         ).to(X.dtype)
-        feature_mean, mean_depth = _zero_background(X)
+        feature_mean, mean_depth = _zero_background(
+            X, int(self.family_params["chunk_size"])
+        )
         self.family_params["feature_mean"] = feature_mean
         self.family_params["mean_depth"] = mean_depth
 
-    def _dispersion_by_moments(self, X: torch.Tensor) -> torch.Tensor:
+    def _dispersion_by_moments(self, X: torch.Tensor | SparseRows) -> torch.Tensor:
         """`mean^2 / (var - mean)` per feature.
 
         A feature whose variance does not exceed its mean carries no overdispersion,
-        and gets "max_val", which makes it Poisson-like.
+        and gets "max_val", which makes it Poisson-like. The sums run by blocks of
+        rows, in float64.
         """
-        mean = torch.mean(X, dim=0)
-        variance = torch.var(X, dim=0)
+        n = X.shape[0]
+        chunk = int(self.family_params["chunk_size"])
+        mean = _column_sums(X, chunk) / n
+        variance = (_column_sums(X, chunk, power=2) - n * mean.square()) / max(n - 1, 1)
+        mean, variance = mean.to(X.dtype), variance.to(X.dtype)
         return torch.where(
             variance > mean,
             mean.square() / (variance - mean).clip(min=1e-12),
             self.family_params["max_val"],
         )
 
-    def _dispersion_by_mle(self, X: torch.Tensor) -> torch.Tensor:
+    def _dispersion_by_mle(self, X: torch.Tensor | SparseRows) -> torch.Tensor:
         """Profile-likelihood dispersion per feature, by safeguarded Newton on `log nu`.
 
         With the mean of a feature fixed at its sample mean, the score of the
@@ -496,10 +526,7 @@ class NegativeBinomial(ExponentialFamily):
         max_val = float(self.family_params["max_val"])
         blocks = range(0, n, chunk)
 
-        total = torch.zeros(X.shape[1], dtype=torch.float64, device=X.device)
-        for start in blocks:
-            total += X[start : start + chunk].double().sum(dim=0)
-        mean = total / n
+        mean = _column_sums(X, chunk) / n
 
         def score_and_slope(
             nu: torch.Tensor, columns: torch.Tensor
@@ -634,7 +661,8 @@ class Beta(ExponentialFamily):
             - torch.digamma(theta * self.family_params["nu"])
         )
 
-    def initialize_family_parameters(self, X: torch.Tensor) -> None:
+    def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
+        X = _dense(X, self.family_name)
         p = X.shape[1]
         values = X.cpu().numpy()
 
@@ -834,7 +862,8 @@ class Gamma(ExponentialFamily):
 
         return theta
 
-    def initialize_family_parameters(self, X: torch.Tensor) -> None:
+    def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
+        X = _dense(X, self.family_name)
         _require_positive(X, "Gamma")
 
         p = X.shape[1]
@@ -912,6 +941,7 @@ class LogNormal(ExponentialFamily):
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
         return torch.log(X.clip(self.family_params["min_val"]))
 
-    def initialize_family_parameters(self, X: torch.Tensor) -> None:
+    def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
+        X = _dense(X, self.family_name)
         _require_positive(X, "LogNormal")
         self.family_params["nu"] = torch.sqrt(torch.var(torch.log(X), dim=0))

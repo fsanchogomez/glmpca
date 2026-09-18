@@ -450,6 +450,27 @@ def test_the_tfidf_flag_reaches_the_model(
     assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["tfidf"]
 
 
+def test_the_keep_sparse_flag_reaches_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models: list[GLMPCA] = []
+    original_fit = GLMPCA.fit
+
+    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
+        models.append(self)
+        return original_fit(self, X)
+
+    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--keepSparse")
+
+    assert result.exit_code == 0, result.output
+    (model,) = models
+    assert model.keep_sparse
+    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["keep_sparse"]
+
+
 def test_the_penalty_reaches_fast_poisson(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 
