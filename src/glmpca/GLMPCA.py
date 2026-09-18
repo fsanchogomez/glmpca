@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import warnings
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import anndata as ad
 import numpy as np
@@ -15,12 +15,16 @@ from tqdm.auto import tqdm
 
 from .ExponentialFamily import ExponentialFamily, GLMFamily
 from .manifolds import (
-    EuclideanStiefel,
+    Grassmann,
     ManifoldParameter,
     RiemannianAdagrad,
     RiemannianAdam,
     RiemannianConjugateGradient,
+    canonical_basis,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _OPTIMIZERS = {
     "adagrad": RiemannianAdagrad,
@@ -450,11 +454,33 @@ class GLMPCA:
         self.log_likelihood_ = float(-training_cost.min() + log_base_measure.sum())
         best_model_idx = int(torch.argmin(training_cost))
         best_loadings, best_intercept, best_depth = runs[best_model_idx]
-        self.saturated_loadings_ = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
         self.saturated_depth_ = None if best_depth is None else best_depth.detach()
+        self.saturated_loadings_ = canonical_basis(
+            best_loadings.detach(),
+            self._centred_chunks(saturated_parameters, best_loadings.detach()),
+        )
 
         return True
+
+    def _centred_chunks(
+        self, saturated_parameters: torch.Tensor, loadings: torch.Tensor
+    ) -> Iterator[torch.Tensor]:
+        """The rows that transform projects, in blocks of chunk_size.
+
+        They are centred the way transform centres them, with the least-squares offset
+        of a cell rather than the fitted one, so that the scores canonical_basis orders
+        are the scores that transform reports. That offset depends on the loadings only
+        through their span, so the rotation of canonical_basis leaves it alone.
+        """
+        intercept = self.saturated_intercept_
+        assert intercept is not None
+        for start in range(0, saturated_parameters.shape[0], self.chunk_size):
+            stop = start + self.chunk_size
+            block = saturated_parameters[start:stop] - intercept.unsqueeze(0)
+            if self.depth_factor:
+                block = block - _depth_of(block, loadings).unsqueeze(1)
+            yield block
 
     def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
         r"""Transforms and projects dataset X onto the principal components.
@@ -740,8 +766,9 @@ class GLMPCA:
                 parameters[random_idx] - torch.mean(parameters[random_idx], dim=0),
                 full_matrices=False,
             )
-            loadings = ManifoldParameter(v[: self.n_pc, :].T.to(device))
-            loadings.manifold = EuclideanStiefel()
+            loadings = ManifoldParameter(
+                v[: self.n_pc, :].T.to(device), manifold=Grassmann()
+            )
         elif self.init == "lsi":
             # LSI: the SVD of the TF-IDF of the counts, not of the saturated parameters.
             subset = X[random_idx]
@@ -750,14 +777,12 @@ class GLMPCA:
                 full_matrices=False,
             )
             loadings = ManifoldParameter(
-                v[: self.n_pc, :].T.to(device), manifold=EuclideanStiefel()
+                v[: self.n_pc, :].T.to(device), manifold=Grassmann()
             )
         elif self.init == "random":
             loadings = ManifoldParameter(
-                EuclideanStiefel().random(
-                    parameters.shape[1], self.n_pc, device=device
-                ),
-                manifold=EuclideanStiefel(),
+                Grassmann().random(parameters.shape[1], self.n_pc, device=device),
+                manifold=Grassmann(),
             )
 
         # Initialize intercept

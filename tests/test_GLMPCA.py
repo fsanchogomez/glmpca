@@ -522,7 +522,9 @@ def test_the_chunked_saturation_equals_one_call(family: GLMFamily) -> None:
 
     assert chunked.saturated_loadings_ is not None
     assert whole.saturated_loadings_ is not None
-    torch.testing.assert_close(chunked.saturated_loadings_, whole.saturated_loadings_)
+    chunked_span = chunked.saturated_loadings_ @ chunked.saturated_loadings_.T
+    whole_span = whole.saturated_loadings_ @ whole.saturated_loadings_.T
+    torch.testing.assert_close(chunked_span, whole_span)
 
 
 def test_the_chunked_cost_equals_the_cost_of_the_whole_matrix() -> None:
