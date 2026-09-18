@@ -61,6 +61,12 @@ MAX_STEP = 1.0
 """Largest Newton step of one coordinate, in log space. It keeps a flat curvature from
 sending a coordinate far away, where the reference implementation uses a line search."""
 
+FIRST_COMPONENT = 2
+"""Columns 0 and 1 of `U` and `V` hold the size factor and the intercept."""
+
+DEFAULT_PENALTY = 1.0
+"""Weight of the L2 penalty on the component columns. A placeholder until measured."""
+
 
 class FastPoissonPCA:
     r"""Poisson GLM-PCA fitted by Alternating Poisson Regression.
@@ -91,6 +97,15 @@ class FastPoissonPCA:
         Number of passes that DAAREM keeps in its memory. Defaults to 5. It has no
         effect when accelerate is False.
 
+    penalty : float
+        Weight `λ` of the L2 penalty `λ/2 (‖U_c‖² + ‖V_c‖²)` on the component columns;
+        the size factor and the intercept are not penalised. Without it the maximum
+        likelihood need not exist on sparse counts: where a pattern of zeros can be
+        matched by a direction of the factors, the likelihood keeps improving as the
+        fitted rates there fall towards 0, and the factors diverge. The penalty
+        equals `λ` times the sum of the singular values of the fit, so it holds real
+        structure little and the runaway directions to a finite size. 0 turns it off.
+
     Attributes
     ----------
     loadings_ : torch.Tensor
@@ -112,6 +127,11 @@ class FastPoissonPCA:
         Poisson log-likelihood after each pass, with the `-log(y!)` term, so that it is
         the real log-likelihood and not the optimisation objective alone.
 
+    objectives_ : list[float]
+        The objective after each pass: the log-likelihood minus the penalty. It is what
+        the fit increases at every pass and what its stopping rule reads, while
+        log_likelihoods_ may dip as the penalty trades fit for smaller factors.
+
     accelerated_ : int
         Number of passes that ended on an accelerated jump instead of the plain pass.
 
@@ -125,6 +145,7 @@ class FastPoissonPCA:
         device: str | torch.device | None = None,
         accelerate: bool = True,
         order: int = 5,
+        penalty: float = DEFAULT_PENALTY,
     ) -> None:
         self.n_pc = n_pc
         self.max_iter = max_iter
@@ -132,6 +153,7 @@ class FastPoissonPCA:
         self.device = device
         self.accelerate = accelerate
         self.order = order
+        self.penalty = penalty
 
         self.loadings_: torch.Tensor | None = None
         self.scores_: torch.Tensor | None = None
@@ -139,6 +161,7 @@ class FastPoissonPCA:
         self.intercept_: torch.Tensor | None = None
         self.size_factors_: torch.Tensor | None = None
         self.log_likelihoods_: list[float] = []
+        self.objectives_: list[float] = []
         self.accelerated_ = 0
 
     def fit(self, X: object) -> bool:
@@ -177,41 +200,63 @@ class FastPoissonPCA:
                 dtype=Y.dtype,
             )
         self.log_likelihoods_ = []
+        self.objectives_ = []
         self.accelerated_ = 0
         previous_point = -torch.inf
         previous = -torch.inf
         with tqdm(total=self.max_iter, unit="pass", dynamic_ncols=True) as passes:
             for _ in range(self.max_iter):
                 theta = _pack(U, V, free_in_u, free_in_v)
-                _descend(Y, U, V, rate, free_in_u, buffer, over_rows=True)
-                _descend(Y.T, V, U, rate, free_in_v, buffer, over_rows=False)
+                _descend(
+                    Y,
+                    U,
+                    V,
+                    rate,
+                    free_in_u,
+                    buffer,
+                    over_rows=True,
+                    penalty=self.penalty,
+                )
+                _descend(
+                    Y.T,
+                    V,
+                    U,
+                    rate,
+                    free_in_v,
+                    buffer,
+                    over_rows=False,
+                    penalty=self.penalty,
+                )
                 plain = _likelihood(Y, U, V, rate)
+                plain_objective = plain - self._penalty_of(U, V)
 
-                current = plain
+                current, objective = plain, plain_objective
                 if accelerator is not None:
                     stepped = _pack(U, V, free_in_u, free_in_v)
                     proposal = accelerator.propose(theta, stepped - theta)
                     if proposal is not None:
                         _unpack(proposal, U, V, free_in_u, free_in_v)
                         candidate = _jump_likelihood(Y, U, V, buffer)
-                        if candidate >= previous_point - accelerator.mon_tol:
+                        jumped = candidate - self._penalty_of(U, V)
+                        if jumped >= previous_point - accelerator.mon_tol:
                             rate, buffer = buffer, rate
-                            current = candidate
-                            accelerator.accept(candidate)
+                            current, objective = candidate, jumped
+                            accelerator.accept(jumped)
                             self.accelerated_ += 1
                         else:
                             _unpack(stepped, U, V, free_in_u, free_in_v)
-                            accelerator.reject(plain)
-                previous_point = current
+                            accelerator.reject(plain_objective)
+                previous_point = objective
 
                 log_likelihood = current + log_base_measure
                 self.log_likelihoods_.append(log_likelihood)
+                self.objectives_.append(objective + log_base_measure)
                 # The postfix waits for the update, so the bar is drawn one time a pass.
                 passes.set_postfix(log_lik=f"{log_likelihood:.4E}", refresh=False)
                 passes.update(1)
-                if abs(log_likelihood - previous) <= self.tol * abs(log_likelihood):
+                if abs(objective - previous) <= self.tol * abs(objective):
                     break
-                previous = log_likelihood
+                previous = objective
             else:
                 msg = (
                     f"The log-likelihood still moved after {self.max_iter} passes. "
@@ -252,13 +297,22 @@ class FastPoissonPCA:
         free = [0, *range(2, V.shape[1])]
         previous = -torch.inf
         for _ in range(self.max_iter):
-            _descend(Y, U, V, rate, free, buffer, over_rows=True)
+            _descend(Y, U, V, rate, free, buffer, over_rows=True, penalty=self.penalty)
             # The same test as fit, so that transform stops as soon as it has landed.
-            likelihood = _likelihood(Y, U, V, rate)
+            likelihood = _likelihood(Y, U, V, rate) - self._penalty_of(U, V)
             if abs(likelihood - previous) <= self.tol * abs(likelihood):
                 break
             previous = likelihood
         return U[:, 2:]
+
+    def _penalty_of(self, U: torch.Tensor, V: torch.Tensor) -> float:
+        """`λ/2 (‖U_c‖² + ‖V_c‖²)` over the component columns, in float64."""
+        if self.penalty == 0.0:
+            return 0.0
+        components = U[:, FIRST_COMPONENT:].square().sum(dtype=torch.float64) + V[
+            :, FIRST_COMPONENT:
+        ].square().sum(dtype=torch.float64)
+        return 0.5 * self.penalty * float(components)
 
     def _initialize(self, Y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Small random factors, as in fastglmpca, with the structural columns set."""
@@ -341,6 +395,7 @@ def _descend(
     buffer: torch.Tensor,
     *,
     over_rows: bool,
+    penalty: float = 0.0,
 ) -> None:
     r"""One cyclic coordinate descent pass over the rows of `W`, in place.
 
@@ -351,6 +406,10 @@ def _descend(
     keeping `rate` in one layout keeps every pass over it contiguous.
 
     `buffer` is an `n` by `p` workspace, so that a pass allocates nothing.
+
+    `penalty` is the weight `λ` of `λ/2 w²` on every coefficient of a component column
+    (from column 2 on). It adds `λ w` to the gradient and `λ` to the curvature of the
+    Newton step. The structural columns, the size factor and the intercept, stay free.
     """
     statistics = Y @ D
     for column in free:
@@ -361,6 +420,9 @@ def _descend(
         else:
             gradient = design @ rate - statistics[:, column]
             curvature = design.square() @ rate
+        if column >= FIRST_COMPONENT:
+            gradient = gradient + penalty * W[:, column]
+            curvature = curvature + penalty
         step = (gradient / curvature.clip(min=1e-12)).clip(-MAX_STEP, MAX_STEP)
 
         W[:, column] -= step

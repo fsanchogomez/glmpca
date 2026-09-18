@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import anndata as ad
 import numpy as np
 import pytest
@@ -49,9 +51,9 @@ def noise(model: FastPoissonPCA) -> float:
     return 1e-6 * abs(model.log_likelihoods_[-1])
 
 
-def test_the_log_likelihood_never_falls() -> None:
+def test_the_log_likelihood_never_falls_without_a_penalty() -> None:
     counts, _ = simulate()
-    model = FastPoissonPCA(N_PC, max_iter=50, tol=1e-12, accelerate=False)
+    model = FastPoissonPCA(N_PC, max_iter=50, tol=1e-12, accelerate=False, penalty=0.0)
 
     model.fit(torch.tensor(counts))
 
@@ -59,6 +61,16 @@ def test_the_log_likelihood_never_falls() -> None:
     steps = np.diff(model.log_likelihoods_)
     assert np.all(steps >= -noise(model)), float(np.min(steps))
     assert model.accelerated_ == 0
+
+
+def test_the_penalised_objective_never_falls() -> None:
+    counts, _ = simulate()
+    model = FastPoissonPCA(N_PC, max_iter=50, tol=1e-12, accelerate=False)
+
+    model.fit(torch.tensor(counts))
+
+    steps = np.diff(model.objectives_)
+    assert np.all(steps >= -noise(model)), float(np.min(steps))
 
 
 def test_an_accelerated_fit_stays_within_the_monotonicity_tolerance() -> None:
@@ -69,9 +81,48 @@ def test_an_accelerated_fit_stays_within_the_monotonicity_tolerance() -> None:
 
     # DAAREM may take a jump that loses up to mon_tol, and nothing worse than that.
     slack = DaaremAccelerator(4).mon_tol + noise(model)
-    steps = np.diff(model.log_likelihoods_)
+    steps = np.diff(model.objectives_)
     assert np.all(steps >= -slack), float(np.min(steps))
     assert model.accelerated_ > 0
+
+
+def separable_counts() -> torch.Tensor:
+    """Counts with a block of cells that no read reaches in a block of features.
+
+    A low-rank direction can match the empty block exactly, and without a penalty the
+    likelihood keeps improving as its fitted rates fall towards 0.
+    """
+    generator = torch.Generator().manual_seed(0)
+    counts = torch.poisson(torch.full((200, 60), 2.0), generator=generator)
+    counts[:40, :15] = 0.0
+    return counts
+
+
+def lowest_log_rate(model: FastPoissonPCA) -> float:
+    assert model.scores_ is not None
+    assert model.loadings_ is not None
+    assert model.size_factors_ is not None
+    assert model.intercept_ is not None
+    fitted = (
+        model.size_factors_[:, None]
+        + model.intercept_[None, :]
+        + model.scores_ @ model.loadings_.T
+    )
+    return float(fitted.min())
+
+
+def test_the_penalty_keeps_the_fitted_rates_finite() -> None:
+    lowest = {}
+    for penalty in (0.0, 1.0):
+        torch.manual_seed(0)
+        model = FastPoissonPCA(2, max_iter=200, tol=1e-12, penalty=penalty)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(separable_counts())
+        lowest[penalty] = lowest_log_rate(model)
+
+    assert lowest[1.0] > lowest[0.0], lowest
+    assert lowest[1.0] > -30.0, lowest
 
 
 def test_acceleration_reaches_the_plain_fit_in_fewer_passes() -> None:
@@ -97,8 +148,8 @@ def test_acceleration_reaches_the_plain_fit_in_fewer_passes() -> None:
 
 def test_both_fits_find_the_same_subspace() -> None:
     counts, _ = simulate()
-    plain = FastPoissonPCA(N_PC, max_iter=200, tol=1e-10, accelerate=False)
-    accelerated = FastPoissonPCA(N_PC, max_iter=200, tol=1e-10)
+    plain = FastPoissonPCA(N_PC, max_iter=200, tol=1e-10, accelerate=False, penalty=0.0)
+    accelerated = FastPoissonPCA(N_PC, max_iter=200, tol=1e-10, penalty=0.0)
 
     plain.fit(torch.tensor(counts))
     accelerated.fit(torch.tensor(counts))

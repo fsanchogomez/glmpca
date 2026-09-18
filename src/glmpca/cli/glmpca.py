@@ -17,7 +17,7 @@ import typer
 from matplotlib.figure import Figure
 
 from glmpca.ExponentialFamily import _n_workers
-from glmpca.fast_poisson import FastPoissonPCA
+from glmpca.fast_poisson import DEFAULT_PENALTY, FastPoissonPCA
 from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, GLMPCA
 
 DESCRIPTION = (
@@ -420,6 +420,20 @@ def main(
             ),
         ),
     ] = Optimizer.adagrad,
+    penalty: Annotated[
+        float,
+        typer.Option(
+            "--penalty",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Weight of the L2 penalty on the components of ``-gf fast_poisson``. "
+                "Without it the fit can diverge on sparse counts: components chase "
+                "patterns of zeros towards a rate of 0, the likelihood keeps rising, "
+                "and the embedding collapses onto a few cells. 0 turns it off. It "
+                "does not apply to the other families."
+            ),
+        ),
+    ] = DEFAULT_PENALTY,
     no_accelerate: Annotated[
         bool,
         typer.Option(
@@ -630,6 +644,7 @@ def main(
             no_depth_factor=no_depth_factor,
             tfidf=tfidf,
             no_accelerate=no_accelerate,
+            penalty=penalty,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
             cluster_resolution=cluster_resolution,
@@ -655,6 +670,7 @@ def main(
                 max_iter=max_iter,
                 device=device,
                 accelerate=not no_accelerate,
+                penalty=penalty,
             ),
             adata,
         )
@@ -697,6 +713,7 @@ def main(
             "tfidf": tfidf,
             "depth_factor": not no_depth_factor,
             "accelerate": not no_accelerate,
+            "penalty": penalty,
         },
     }
 

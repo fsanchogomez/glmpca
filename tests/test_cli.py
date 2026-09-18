@@ -450,6 +450,22 @@ def test_the_tfidf_flag_reaches_the_model(
     assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["tfidf"]
 
 
+def test_the_penalty_reaches_fast_poisson(tmp_path: Path) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(
+        write_input(tmp_path, poisson_counts()),
+        out_path,
+        "-gf",
+        "fast_poisson",
+        "--penalty",
+        "3.5",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["penalty"] == 3.5
+
+
 def test_no_accelerate_turns_the_acceleration_off(tmp_path: Path) -> None:
     counts = (
         np.random
