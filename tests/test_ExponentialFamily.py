@@ -308,6 +308,70 @@ def test_negative_binomial_mle_finds_little_overdispersion_in_poisson_data() -> 
     assert torch.all(X.mean(dim=0) / family.family_params["nu"] < 0.2)
 
 
+def test_the_negative_binomial_fits_the_dispersion_by_mle_by_default() -> None:
+    assert NegativeBinomial().family_params["method"] == "mle"
+
+
+def test_a_feature_that_no_cell_reaches_gets_the_largest_dispersion() -> None:
+    torch.manual_seed(0)
+    X = torch.distributions.NegativeBinomial(2.0, probs=torch.tensor(0.4)).sample((
+        500,
+        3,
+    ))
+    X[:, 1] = 0.0
+    family = NegativeBinomial()
+
+    family.initialize_family_parameters(X)
+
+    assert float(family.family_params["nu"][1]) == family.family_params["max_val"]
+
+
+def test_the_newton_search_takes_few_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(0)
+    X = torch.distributions.NegativeBinomial(3.0, probs=torch.tensor(0.5)).sample((
+        2000,
+        50,
+    ))
+    calls = {"count": 0}
+    original = torch.polygamma
+
+    def counting(order: int, value: torch.Tensor) -> torch.Tensor:
+        calls["count"] += 1
+        return original(order, value)
+
+    monkeypatch.setattr(torch, "polygamma", counting)
+    family = NegativeBinomial({"chunk_size": 10**9})
+
+    family.initialize_family_parameters(X)
+
+    passes = calls["count"] // 2 - 1
+    assert passes <= 8, passes
+
+
+def test_the_newton_search_recovers_from_a_far_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(0)
+    X = torch.distributions.NegativeBinomial(2.0, probs=torch.tensor(0.4)).sample((
+        3000,
+        4,
+    ))
+    reference = NegativeBinomial()
+    reference.initialize_family_parameters(X)
+    far = NegativeBinomial()
+    monkeypatch.setattr(
+        far,
+        "_dispersion_by_moments",
+        lambda data: torch.full((data.shape[1],), 5e3),
+    )
+
+    far.initialize_family_parameters(X)
+
+    torch.testing.assert_close(
+        far.family_params["nu"], reference.family_params["nu"], rtol=1e-5, atol=0
+    )
+
+
 def test_negative_binomial_rejects_an_unknown_method() -> None:
     family = NegativeBinomial({"method": "bayes"})
 

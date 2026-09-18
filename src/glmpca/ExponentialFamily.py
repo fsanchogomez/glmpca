@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -9,6 +10,16 @@ import numpy as np
 import scipy
 import torch
 from tqdm.auto import tqdm
+
+MIN_DISPERSION = 1e-3
+"""Lower end of the search for the dispersion of a feature."""
+
+NEWTON_ITERATIONS = 30
+"""Most passes the dispersion search makes. With the bisection fallback, 30 also
+bounds the error by what 30 halvings of the bracket would leave."""
+
+NEWTON_TOLERANCE = 1e-9
+"""A feature has converged when a Newton step moves `log nu` by less than this."""
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -309,9 +320,10 @@ class NegativeBinomial(ExponentialFamily):
         is infinite at 0. Defaults to 1e-6.
         - "max_val" (float): dispersion given to a feature that is not overdispersed.
         Defaults to 1e4.
-        - "method" (str): "moments" for the method of moments, or "mle" for the
-        profile-likelihood estimate. The MLE fits low counts with strong overdispersion
-        better, but it costs about 200 times more. Defaults to "moments".
+        - "method" (str): "mle" for the profile-likelihood estimate, by Newton
+        iterations, or "moments" for the method of moments. The MLE fits low counts
+        with strong overdispersion better, and costs a few passes over the matrix.
+        Defaults to "mle".
         - "chunk_size" (int): rows per pass of the MLE, which bounds its float64
         temporaries. Defaults to 8192, and GLMPCA replaces it with its own chunk_size.
 
@@ -325,7 +337,7 @@ class NegativeBinomial(ExponentialFamily):
             "m": 1.0,
             "eps": 1e-6,
             "max_val": 1e4,
-            "method": "moments",
+            "method": "mle",
             "chunk_size": 8192,
         }
         self.family_params = (
@@ -393,19 +405,35 @@ class NegativeBinomial(ExponentialFamily):
         )
 
     def _dispersion_by_mle(self, X: torch.Tensor) -> torch.Tensor:
-        """Profile-likelihood dispersion per feature, by bisection on `log nu`.
+        """Profile-likelihood dispersion per feature, by safeguarded Newton on `log nu`.
 
         With the mean of a feature fixed at its sample mean, the score of the
         log-likelihood in the dispersion `r` is
 
-            sum_i [digamma(x_i + r) - digamma(r)] - n log1p(mean / r),
+            S(r) = sum_i [digamma(x_i + r) - digamma(r)] - n log1p(mean / r),
 
-        which falls with `r` and crosses 0 at the maximum. Both terms are about
-        `n·mean/r` and cancel almost completely, so the sums run in float64: in float32
-        only the rounding error is left, and every feature looks Poisson-like.
+        which falls with `r` and crosses 0 at the maximum. Its derivative is
 
-        A feature whose score stays positive at "max_val" carries no evidence of
-        overdispersion and gets "max_val".
+            S'(r) = sum_i [trigamma(x_i + r) - trigamma(r)] + n mean / (r (r + mean)),
+
+        so a Newton step in `t = log r` is `t - S / (r S')`. It starts from the moments
+        estimate, which is already close, and converges in a few passes over the matrix
+        where bisection needs 30. A bracket on `t` is kept all along, narrowed by the
+        sign of `S` at every point tried, and a step that leaves it is replaced by the
+        midpoint. So the search can never do worse than bisection.
+
+        A feature stops as soon as its step falls under NEWTON_TOLERANCE, and later
+        passes read only the features still moving. Both matter: at the root the score
+        is rounding noise, so a feature that kept going would see its bracket close on
+        it from a random side and be thrown to the far midpoint.
+
+        Both terms of `S` are about `n·mean/r` and cancel almost completely, so the sums
+        run in float64: in float32 only the rounding error is left, and every feature
+        looks Poisson-like.
+
+        A feature whose score does not fall below 0 by "max_val" carries no evidence of
+        overdispersion and gets "max_val". That includes a feature that is 0 in every
+        cell, whose likelihood does not depend on `r` at all.
         """
         n = X.shape[0]
         chunk = int(self.family_params["chunk_size"])
@@ -417,26 +445,52 @@ class NegativeBinomial(ExponentialFamily):
             total += X[start : start + chunk].double().sum(dim=0)
         mean = total / n
 
-        def score(nu: torch.Tensor) -> torch.Tensor:
-            accumulated = torch.zeros_like(mean)
+        def score_and_slope(
+            nu: torch.Tensor, columns: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            part = mean[columns]
+            score = torch.zeros_like(nu)
+            slope = torch.zeros_like(nu)
             for start in blocks:
-                block = X[start : start + chunk].double()
-                accumulated += (torch.digamma(block + nu) - torch.digamma(nu)).sum(
+                block = X[start : start + chunk][:, columns].double()
+                score += (torch.digamma(block + nu) - torch.digamma(nu)).sum(dim=0)
+                slope += (torch.polygamma(1, block + nu) - torch.polygamma(1, nu)).sum(
                     dim=0
                 )
-            return accumulated - n * torch.log1p(mean / nu)
+            score -= n * torch.log1p(part / nu)
+            slope += n * part / (nu * (nu + part))
+            return score, slope
 
-        low = torch.full_like(mean, 1e-3)
-        high = torch.full_like(mean, max_val)
-        saturated = score(high) > 0
-        # 30 halvings of the interval [1e-3, max_val] in logs leave a relative error
-        # below 1e-7, which is far under the sampling error of the estimate itself.
-        for _ in range(30):
-            middle = ((low.log() + high.log()) / 2).exp()
-            positive = score(middle) > 0
-            low = torch.where(positive, middle, low)
-            high = torch.where(positive, high, middle)
-        nu = ((low.log() + high.log()) / 2).exp()
+        every = torch.arange(X.shape[1], device=X.device)
+        top, _ = score_and_slope(torch.full_like(mean, max_val), every)
+        saturated = top >= 0
+
+        low = torch.full_like(mean, math.log(MIN_DISPERSION))
+        high = torch.full_like(mean, math.log(max_val))
+        guess = self._dispersion_by_moments(X).to(mean)
+        position = guess.clip(min=MIN_DISPERSION, max=max_val).log()
+        done = saturated.clone()
+        for _ in range(NEWTON_ITERATIONS):
+            active = (~done).nonzero().flatten()
+            if active.numel() == 0:
+                break
+            here = position[active]
+            nu = here.exp()
+            score, slope = score_and_slope(nu, active)
+            above = score > 0
+            low[active] = torch.where(above, here, low[active])
+            high[active] = torch.where(above, high[active], here)
+            proposal = here - score / (nu * slope)
+            outside = (
+                ~torch.isfinite(proposal)
+                | (proposal < low[active])
+                | (proposal > high[active])
+            )
+            proposal = torch.where(outside, (low[active] + high[active]) / 2, proposal)
+            position[active] = proposal
+            done[active] = (proposal - here).abs() < NEWTON_TOLERANCE
+
+        nu = position.exp()
         return torch.where(saturated, torch.full_like(nu, max_val), nu)
 
     def log_distribution(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
