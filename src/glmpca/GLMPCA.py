@@ -816,7 +816,8 @@ class GLMPCA:
             })
             floors.append(LEARNING_RATE_LIMIT * DEPTH_RATE_SCALE)
 
-        tqdm.write(f"LEARNING RATE: {self.learning_rate_}")
+        tqdm.write(f"GLMPCA FAMILY: {self.family}")
+        tqdm.write(f"INITIAL LEARNING RATE: {self.learning_rate_}")
         algorithm = _OPTIMIZERS[self.optimizer]
         optimizer = algorithm(params=groups)
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
