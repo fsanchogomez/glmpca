@@ -75,6 +75,20 @@ def test_fit_and_transform_project_onto_n_pc_components(family: GLMFamily) -> No
 
 
 @pytest.mark.parametrize("family", list(GLMFamily))
+def test_a_single_cell_transforms_as_it_does_among_others(family: GLMFamily) -> None:
+    X = sample(family)
+    model = GLMPCA(
+        N_PC, family=family, max_iter=2, batch_size=16, chunk_size=N_CELLS - 1
+    )
+
+    model.fit(X)
+
+    torch.testing.assert_close(
+        model.transform(X[:1]), model.transform(X)[:1], rtol=1e-4, atol=1e-4
+    )
+
+
+@pytest.mark.parametrize("family", list(GLMFamily))
 def test_a_family_name_and_its_member_select_the_same_distribution(
     family: GLMFamily,
 ) -> None:
@@ -782,8 +796,39 @@ def test_transform_reproduces_the_fitted_scores_with_a_depth_factor() -> None:
 
     embedding = model.transform(X).detach()
 
-    # transform estimates the offset of a cell by least squares, so the scores it gives
-    # the cells of the fit track the fitted ones closely rather than exactly.
-    assert model.saturated_depth_ is not None
-    assert torch.all(torch.isfinite(embedding))
-    assert embedding.shape == (N_CELLS, N_PC)
+    depth, intercept = model.saturated_depth_, model.saturated_intercept_
+    assert depth is not None
+    assert intercept is not None
+    assert model.saturated_loadings_ is not None
+    fitted = (
+        model.exponential_family.invert_g(X)
+        - intercept.unsqueeze(0)
+        - depth.unsqueeze(1)
+    ) @ model.saturated_loadings_
+    torch.testing.assert_close(embedding, fitted, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("family", ["poisson", "negative_binomial", "gaussian"])
+def test_the_offset_of_a_cell_is_the_optimum_of_its_likelihood(family: str) -> None:
+    X = depth_gradient()
+    model = GLMPCA(N_PC, family=family, max_iter=10, batch_size=16)
+    model.fit(X)
+    depth, intercept = model.saturated_depth_, model.saturated_intercept_
+    loadings = model.saturated_loadings_
+    assert depth is not None
+    assert intercept is not None
+    assert loadings is not None
+    centred = model.exponential_family.invert_g(X) - intercept.unsqueeze(0)
+    projector = loadings @ loadings.T
+    outside = torch.ones(N_FEATURES) - projector.sum(dim=1)
+
+    def costs(offset: torch.Tensor) -> torch.Tensor:
+        theta = centred @ projector + intercept + offset.unsqueeze(1) * outside
+        return -(
+            model.exponential_family.exponential_term(X, theta)
+            - model.exponential_family.log_partition(theta)
+        ).sum(dim=1)
+
+    at_optimum = costs(depth)
+    for shift in (-1e-2, 1e-2):
+        assert torch.all(costs(depth + shift) >= at_optimum - 1e-3)

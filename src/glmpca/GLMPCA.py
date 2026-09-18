@@ -41,6 +41,9 @@ LEARNING_RATE_LIMIT = 1e-8
 PLATEAU_PATIENCE = 10
 PLATEAU_THRESHOLD = 1e-4
 DEFAULT_CHUNK_ROWS = 8192
+OFFSET_NEWTON_ITERATIONS = 50
+OFFSET_HALVINGS = 30
+OFFSET_TOLERANCE = 1e-6
 
 
 def _announce_device(device: torch.device) -> None:
@@ -54,16 +57,12 @@ def _announce_device(device: torch.device) -> None:
 def _depth_of(centred: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
     r"""The offset of every cell that least squares would give, once `1 mu.T` is out.
 
-    `fit` learns an offset for every cell it sees, and `transform` has to give
-    one to cells it has not seen. The value that leaves the least outside the subspace
-    is
+    The value that leaves the least outside the subspace is
 
         s = <w, centred> / <w, 1>,    w = (I - V V.T) 1,
 
     which is the least-squares solution of `min_s ||(centred - s 1) (I - V V.T)||`. It
-    matches what the fit learns only up to the difference between that objective and the
-    likelihood of the family, so `transform` reproduces the fitted scores closely rather
-    than exactly.
+    is the start of `_fitted_depth`, which moves it to the optimum of the likelihood.
     """
     ones = torch.ones(loadings.shape[0], device=loadings.device, dtype=loadings.dtype)
     outside = ones - loadings @ (loadings.T @ ones)
@@ -72,6 +71,76 @@ def _depth_of(centred: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
         # The all-ones direction lies in the subspace, which already carries the offset.
         return torch.zeros(centred.shape[0], device=centred.device, dtype=centred.dtype)
     return (centred @ outside) / scale
+
+
+def _row_costs(
+    family: ExponentialFamily, data: torch.Tensor, theta: torch.Tensor
+) -> torch.Tensor:
+    """The negative log-likelihood of every row, without `log h`."""
+    return -(family.exponential_term(data, theta) - family.log_partition(theta)).sum(
+        dim=1, dtype=torch.float64
+    )
+
+
+def _fitted_depth(
+    family: ExponentialFamily,
+    data: torch.Tensor,
+    centred: torch.Tensor,
+    intercept: torch.Tensor,
+    loadings: torch.Tensor,
+) -> torch.Tensor:
+    r"""The offset of every cell that the likelihood gives, the rest held fixed.
+
+    With `P = V V.T` and `w = (I - P) 1`, the fitted parameters of a cell are
+
+        theta_hat = centred P + mu + s w,
+
+    linear in its offset `s`, so every cell is a 1-D problem. Newton steps from the
+    least-squares offset solve it, with the step of a cell halved until its cost does
+    not rise. A cell leaves the loop once its offset stops moving. `fit` gives its own
+    cells their offsets this way after the fit, and `transform` gives new cells theirs,
+    so both use the same offset for the same cell.
+    """
+    depth = _depth_of(centred, loadings)
+    ones = torch.ones(loadings.shape[0], device=loadings.device, dtype=loadings.dtype)
+    outside = ones - loadings @ (loadings.T @ ones)
+    if abs(float(outside @ ones)) < 1e-8:
+        return depth
+    inside = centred @ loadings @ loadings.T + intercept.unsqueeze(0)
+    outside = outside.unsqueeze(0)
+    active = torch.arange(depth.shape[0], device=depth.device)
+    for _ in range(OFFSET_NEWTON_ITERATIONS):
+        rows, base, start = data[active], inside[active], depth[active]
+        with torch.enable_grad():
+            trial = start.clone().requires_grad_(True)
+            cost = _row_costs(family, rows, base + trial.unsqueeze(1) * outside)
+            (gradient,) = torch.autograd.grad(cost.sum(), trial, create_graph=True)
+            (curvature,) = torch.autograd.grad(gradient.sum(), trial)
+        cost, gradient = cost.detach(), gradient.detach()
+        step = torch.where(curvature > 0, gradient / curvature, gradient)
+        scale = torch.ones_like(step)
+        pending = torch.arange(step.shape[0], device=step.device)
+        for _ in range(OFFSET_HALVINGS):
+            moved = start[pending] - scale[pending] * step[pending]
+            worse = ~(
+                _row_costs(
+                    family, rows[pending], base[pending] + moved.unsqueeze(1) * outside
+                )
+                <= cost[pending]
+            )
+            pending = pending[worse]
+            if pending.numel() == 0:
+                break
+            scale[pending] = scale[pending] / 2
+        else:
+            scale[pending] = 0.0
+        change = scale * step
+        depth[active] = start - change
+        still = change.abs() > OFFSET_TOLERANCE * (1.0 + depth[active].abs())
+        active = active[still]
+        if active.numel() == 0:
+            break
+    return depth
 
 
 def _inverse_document_frequency(counts: torch.Tensor) -> torch.Tensor:
@@ -450,35 +519,55 @@ class GLMPCA:
                 self._full_cost(loadings, intercept, X_fit, saturated_parameters, depth)
                 for loadings, intercept, depth in runs
             ])
-        self.log_likelihood_ = float(-training_cost.min() + log_base_measure.sum())
         best_model_idx = int(torch.argmin(training_cost))
         best_loadings, best_intercept, best_depth = runs[best_model_idx]
+        best_loadings = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
-        self.saturated_depth_ = None if best_depth is None else best_depth.detach()
+        self.saturated_depth_ = None
+        if best_depth is not None:
+            self.saturated_depth_ = torch.cat([
+                _fitted_depth(
+                    self.exponential_family,
+                    X_fit[start : start + self.chunk_size],
+                    saturated_parameters[start : start + self.chunk_size]
+                    - self.saturated_intercept_.unsqueeze(0),
+                    self.saturated_intercept_,
+                    best_loadings,
+                )
+                for start in range(0, X_fit.shape[0], self.chunk_size)
+            ])
+            with torch.no_grad():
+                training_cost = self._full_cost(
+                    best_loadings,
+                    self.saturated_intercept_,
+                    X_fit,
+                    saturated_parameters,
+                    self.saturated_depth_,
+                )
+        self.log_likelihood_ = float(-training_cost.min() + log_base_measure.sum())
         self.saturated_loadings_ = canonical_basis(
-            best_loadings.detach(),
-            self._centred_chunks(saturated_parameters, best_loadings.detach()),
+            best_loadings, self._centred_chunks(saturated_parameters)
         )
 
         return True
 
     def _centred_chunks(
-        self, saturated_parameters: torch.Tensor, loadings: torch.Tensor
+        self, saturated_parameters: torch.Tensor
     ) -> Iterator[torch.Tensor]:
         """The rows that transform projects, in blocks of chunk_size.
 
-        They are centred the way transform centres them, with the least-squares offset
-        of a cell rather than the fitted one, so that the scores canonical_basis orders
-        are the scores that transform reports. That offset depends on the loadings only
-        through their span, so the rotation of canonical_basis leaves it alone.
+        They are centred with the offsets of `_fitted_depth`, which transform gives the
+        same cells, so the scores canonical_basis orders are the scores that transform
+        reports. Those offsets depend on the loadings only through their span, so the
+        rotation of canonical_basis leaves them alone.
         """
         intercept = self.saturated_intercept_
         assert intercept is not None
         for start in range(0, saturated_parameters.shape[0], self.chunk_size):
             stop = start + self.chunk_size
             block = saturated_parameters[start:stop] - intercept.unsqueeze(0)
-            if self.depth_factor:
-                block = block - _depth_of(block, loadings).unsqueeze(1)
+            if self.saturated_depth_ is not None:
+                block = block - self.saturated_depth_[start:stop].unsqueeze(1)
             yield block
 
     def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
@@ -517,9 +606,17 @@ class GLMPCA:
 
         projected_parameters = saturated_parameters - intercept_term
         if self.depth_factor:
-            projected_parameters = projected_parameters - _depth_of(
-                projected_parameters, loadings
-            ).unsqueeze(1)
+            depth = torch.cat([
+                _fitted_depth(
+                    self.exponential_family,
+                    X_transform[start : start + self.chunk_size],
+                    projected_parameters[start : start + self.chunk_size],
+                    intercept,
+                    loadings,
+                )
+                for start in range(0, X_transform.shape[0], self.chunk_size)
+            ])
+            projected_parameters = projected_parameters - depth.unsqueeze(1)
         projected_parameters = projected_parameters.matmul(loadings)
 
         return projected_parameters

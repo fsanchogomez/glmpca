@@ -602,8 +602,6 @@ class Beta(ExponentialFamily):
             theta * self.family_params["nu"],
             (1 - theta) * self.family_params["nu"],
         ])
-        if nat_params.shape[1] == 1:
-            nat_params = nat_params.flatten()
         return nat_params
 
     def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
@@ -711,8 +709,6 @@ class SigmoidBeta(Beta):
             torch.sigmoid(theta) * self.family_params["nu"],
             (1 - torch.sigmoid(theta)) * self.family_params["nu"],
         ])
-        if nat_params.shape[1] == 1:
-            nat_params = nat_params.flatten()
         return nat_params
 
     def _derivative_neg_log_likelihood(
@@ -794,8 +790,6 @@ class Gamma(ExponentialFamily):
             theta,
             -torch.ones_like(theta) * self.family_params["nu"],
         ])
-        if nat_params.shape[1] == 1:
-            nat_params = nat_params.flatten()
         return nat_params
 
     def log_partition(self, theta: torch.Tensor) -> torch.Tensor:
@@ -894,8 +888,6 @@ class LogNormal(ExponentialFamily):
             theta / torch.square(self.family_params["nu"]),
             -torch.ones_like(theta) / (2 * torch.square(self.family_params["nu"])),
         ])
-        if nat_params.shape[1] == 1:
-            nat_params = nat_params.flatten()
         return nat_params
 
     def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
