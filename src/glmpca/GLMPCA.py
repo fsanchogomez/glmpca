@@ -648,12 +648,14 @@ class GLMPCA:
         family.load_family_params_to_gpu(after)
 
         # Select best model
-        with torch.no_grad():
-            training_cost = torch.stack([
-                self._full_cost(loadings, intercept, rows, after, depth)
-                for loadings, intercept, depth in runs
-            ])
-        best_model_idx = int(torch.argmin(training_cost))
+        best_model_idx = 0
+        if len(runs) > 1:
+            with torch.no_grad():
+                training_cost = torch.stack([
+                    self._full_cost(loadings, intercept, rows, after, depth)
+                    for loadings, intercept, depth in runs
+                ])
+            best_model_idx = int(torch.argmin(training_cost))
         best_loadings, best_intercept, best_depth = runs[best_model_idx]
         best_loadings = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
@@ -672,15 +674,15 @@ class GLMPCA:
                     )
                 )
             self.saturated_depth_ = torch.cat(offsets)
-            with torch.no_grad():
-                training_cost = self._full_cost(
-                    best_loadings,
-                    self.saturated_intercept_,
-                    rows,
-                    after,
-                    self.saturated_depth_,
-                )
-        self.log_likelihood_ = float(training_cost.min().neg().cpu()) + float(
+        with torch.no_grad():
+            training_cost = self._full_cost(
+                best_loadings,
+                self.saturated_intercept_,
+                rows,
+                after,
+                self.saturated_depth_,
+            )
+        self.log_likelihood_ = float(training_cost.neg().cpu()) + float(
             log_base_measure.sum()
         )
         self.saturated_loadings_ = canonical_basis(
@@ -1078,8 +1080,7 @@ class GLMPCA:
         batch_parameters: torch.Tensor,
         batch_depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        n = batch_data.shape[0]
-        intercept_term = intercept.unsqueeze(0).repeat(n, 1)
+        intercept_term = intercept.unsqueeze(0)
         if batch_depth is not None:
             # The offset of a cell joins the offset of a feature, so the subspace
             # never has to carry either of them.
