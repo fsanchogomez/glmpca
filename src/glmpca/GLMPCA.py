@@ -44,6 +44,8 @@ DEFAULT_CHUNK_ROWS = 8192
 OFFSET_NEWTON_ITERATIONS = 50
 OFFSET_HALVINGS = 30
 OFFSET_TOLERANCE = 1e-6
+DEVICE_MEMORY_SHARE = 0.8
+WORKING_COPIES = 8
 
 
 def _announce_device(device: torch.device) -> None:
@@ -52,6 +54,12 @@ def _announce_device(device: torch.device) -> None:
         tqdm.write(f"DEVICE: {device} ({torch.cuda.get_device_name(device)})")
     else:
         tqdm.write(f"DEVICE: {device}")
+
+
+def _fits_in(free_bytes: int, tensors: tuple[torch.Tensor, ...], working: int) -> bool:
+    """Whether `tensors` and `working` more bytes fit in a share of `free_bytes`."""
+    needed = sum(tensor.nbytes for tensor in tensors) + working
+    return needed <= DEVICE_MEMORY_SHARE * free_bytes
 
 
 def _depth_of(centred: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
@@ -493,6 +501,23 @@ class GLMPCA:
                 .cpu()
             )
 
+        resident = device.type != "cuda" or _fits_in(
+            torch.cuda.mem_get_info(device)[0],
+            (X_fit, saturated_parameters),
+            WORKING_COPIES * min(self.chunk_size, X_fit.shape[0]) * X_fit[0].nbytes,
+        )
+        if device.type == "cuda":
+            tqdm.write(
+                f"DATA: {'held on the device' if resident else 'copied by chunks'}"
+            )
+        full_data, full_parameters = X_fit, saturated_parameters
+        if resident:
+            full_data, full_parameters = (
+                X_fit.to(device),
+                saturated_parameters.to(device),
+            )
+        after = device if resident else torch.device("cpu")
+
         # Initialize the learning procedure
         self.loadings_learning_scores_ = []
         self.loadings_learning_rates_ = []
@@ -503,20 +528,29 @@ class GLMPCA:
             self.learning_rate_ = self.initial_learning_rate_
             runs.append(
                 self._saturated_loading_iter(
-                    saturated_parameters, X_fit, batch_size, device, log_base_measure
+                    saturated_parameters,
+                    X_fit,
+                    batch_size,
+                    device,
+                    log_base_measure,
+                    (full_data, full_parameters),
                 )
             )
 
         runs = [
-            (loadings.cpu(), intercept.cpu(), None if depth is None else depth.cpu())
+            (
+                loadings.to(after),
+                intercept.to(after),
+                None if depth is None else depth.to(after),
+            )
             for loadings, intercept, depth in runs
         ]
-        self.exponential_family.load_family_params_to_gpu(torch.device("cpu"))
+        self.exponential_family.load_family_params_to_gpu(after)
 
         # Select best model
         with torch.no_grad():
             training_cost = torch.stack([
-                self._full_cost(loadings, intercept, X_fit, saturated_parameters, depth)
+                self._full_cost(loadings, intercept, full_data, full_parameters, depth)
                 for loadings, intercept, depth in runs
             ])
         best_model_idx = int(torch.argmin(training_cost))
@@ -528,8 +562,8 @@ class GLMPCA:
             self.saturated_depth_ = torch.cat([
                 _fitted_depth(
                     self.exponential_family,
-                    X_fit[start : start + self.chunk_size],
-                    saturated_parameters[start : start + self.chunk_size]
+                    full_data[start : start + self.chunk_size],
+                    full_parameters[start : start + self.chunk_size]
                     - self.saturated_intercept_.unsqueeze(0),
                     self.saturated_intercept_,
                     best_loadings,
@@ -540,14 +574,20 @@ class GLMPCA:
                 training_cost = self._full_cost(
                     best_loadings,
                     self.saturated_intercept_,
-                    X_fit,
-                    saturated_parameters,
+                    full_data,
+                    full_parameters,
                     self.saturated_depth_,
                 )
-        self.log_likelihood_ = float(-training_cost.min() + log_base_measure.sum())
-        self.saturated_loadings_ = canonical_basis(
-            best_loadings, self._centred_chunks(saturated_parameters)
+        self.log_likelihood_ = float(training_cost.min().neg().cpu()) + float(
+            log_base_measure.sum()
         )
+        self.saturated_loadings_ = canonical_basis(
+            best_loadings, self._centred_chunks(full_parameters)
+        ).cpu()
+        self.saturated_intercept_ = self.saturated_intercept_.cpu()
+        if self.saturated_depth_ is not None:
+            self.saturated_depth_ = self.saturated_depth_.cpu()
+        self.exponential_family.load_family_params_to_gpu(torch.device("cpu"))
 
         return True
 
@@ -628,6 +668,7 @@ class GLMPCA:
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
+        full: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         r"""Computes the loadings solution of the GLM-PCA optimisation problem.
 
@@ -643,6 +684,9 @@ class GLMPCA:
             Device used to train.
         log_base_measure : torch.Tensor
             `log h(x)` of every cell, summed over its features.
+        full : tuple[torch.Tensor, torch.Tensor]
+            X and its saturated parameters for the passes over the whole matrix: on
+            the device when they fit there, else on the host.
 
         Returns
         -------
@@ -676,25 +720,32 @@ class GLMPCA:
                 torch.arange(X.shape[0]),
             )
             train_loader = DataLoader(
-                dataset=train_data, batch_size=batch_size, shuffle=True, drop_last=True
+                dataset=train_data,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=True,
+                pin_memory=device.type == "cuda",
             )
 
         def closure() -> float:
             """The cost of the whole matrix, with the gradient summed over chunks."""
             _optimizer.zero_grad()
-            total = 0.0
+            data, parameters = full
+            total = torch.zeros((), device=device, dtype=torch.float64)
             for start in range(0, X.shape[0], self.chunk_size):
                 stop = start + self.chunk_size
                 cost = self._optim_cost(
                     loadings=_loadings,
                     intercept=_intercept,
-                    batch_data=X[start:stop].to(device),
-                    batch_parameters=saturated_parameters[start:stop].to(device),
+                    batch_data=data[start:stop].to(device, non_blocking=True),
+                    batch_parameters=parameters[start:stop].to(
+                        device, non_blocking=True
+                    ),
                     batch_depth=None if _depth is None else _depth[start:stop],
                 )
                 cost.backward()
-                total += float(cost)
-            return total
+                total += cost.detach()
+            return float(total)
 
         # Run epoch in a for loop
         with tqdm(total=self.max_iter, unit="epoch", dynamic_ncols=True) as epochs:
@@ -731,30 +782,35 @@ class GLMPCA:
                         warnings.warn(msg, UserWarning, stacklevel=2)
                         break
                 elif train_loader is not None:
+                    step_costs = []
+                    epoch_base = 0.0
                     for batch_data, batch_parameters, batch_base, rows in train_loader:
                         cost_step = self._optim_cost(
                             loadings=_loadings,
                             intercept=_intercept,
-                            batch_data=batch_data.to(device),
-                            batch_parameters=batch_parameters.to(device),
+                            batch_data=batch_data.to(device, non_blocking=True),
+                            batch_parameters=batch_parameters.to(
+                                device, non_blocking=True
+                            ),
                             batch_depth=(
-                                None if _depth is None else _depth[rows.to(device)]
+                                None
+                                if _depth is None
+                                else _depth[rows.to(device, non_blocking=True)]
                             ),
                         )
-
-                        cost_value = cost_step.detach().cpu().numpy()
-                        self.loadings_learning_scores_[-1].append(cost_value)
-                        # The cost leaves out log h, which the bar puts back.
-                        epoch_log_likelihood += float(batch_base.sum()) - float(
-                            cost_value
-                        )
-                        epoch_cost += float(cost_value)
+                        step_costs.append(cost_step.detach())
+                        epoch_base += float(batch_base.sum())
                         cost_step.backward()
                         _optimizer.step()
                         _optimizer.zero_grad()
                         self.loadings_learning_rates_[-1].append(
                             _lr_scheduler.get_last_lr()
                         )
+                    costs = torch.stack(step_costs).cpu().numpy()
+                    self.loadings_learning_scores_[-1].extend(costs)
+                    epoch_cost = float(costs.sum(dtype=np.float64))
+                    # The cost leaves out log h, which the bar puts back.
+                    epoch_log_likelihood = epoch_base - epoch_cost
                     learning_rate = _lr_scheduler.get_last_lr()[0]
                     if cost_anchor is None:
                         cost_anchor = max(abs(epoch_cost), 1e-12)
@@ -799,6 +855,7 @@ class GLMPCA:
                         batch_size=batch_size,
                         device=device,
                         log_base_measure=log_base_measure,
+                        full=full,
                     )
 
                 if (
@@ -938,7 +995,7 @@ class GLMPCA:
         depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Sums the cost over chunks of chunk_size rows, to never expand X."""
-        total = torch.zeros((), dtype=X.dtype)
+        total = torch.zeros((), dtype=X.dtype, device=X.device)
         for start in range(0, X.shape[0], self.chunk_size):
             stop = start + self.chunk_size
             total = total + self._optim_cost(

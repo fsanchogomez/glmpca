@@ -23,6 +23,7 @@ from glmpca.GLMPCA import (
     INTERCEPT_RATE_SCALE,
     LEARNING_RATE_LIMIT,
     PLATEAU_PATIENCE,
+    _fits_in,
     _inverse_document_frequency,
     _tf_idf,
     _to_tensor,
@@ -201,6 +202,7 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
+        full: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma
@@ -211,6 +213,15 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
 
     assert start_rates == [0.2, 0.2, 0.2]
     assert model.learning_rate_ == 0.1
+
+
+@pytest.mark.parametrize(
+    ("free", "fits"), [(20_000, True), (10_000, False), (0, False)]
+)
+def test_the_data_stays_on_the_device_only_when_it_fits(free: int, fits: bool) -> None:
+    data = torch.zeros(100, 10)
+
+    assert _fits_in(free, (data, data), working=1_000) is fits
 
 
 def test_the_fit_says_which_device_it_uses(capsys: pytest.CaptureFixture[str]) -> None:
