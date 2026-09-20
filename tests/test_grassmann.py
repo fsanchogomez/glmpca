@@ -152,7 +152,7 @@ def test_the_fitted_loadings_live_on_the_grassmann_manifold(
     monkeypatch.setattr(GLMPCA, "_create_saturated_loading_optim", recording)
     counts = torch.poisson(torch.full((40, 12), 3.0))
 
-    for init in ("spectral", "lsi", "random"):
+    for init in ("spectral", "random"):
         GLMPCA(2, family="poisson", init=init, max_iter=1, batch_size=16).fit(counts)
 
     assert all(isinstance(manifold, Grassmann) for manifold in manifolds)

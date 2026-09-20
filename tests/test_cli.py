@@ -346,30 +346,6 @@ def test_glmpca_runs_fast_poisson(tmp_path: Path) -> None:
     assert adata.uns["glmPCA"]["params"]["accelerate"]
 
 
-def test_the_lsi_start_reaches_the_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    models: list[GLMPCA] = []
-    original_fit = GLMPCA.fit
-
-    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
-        models.append(self)
-        return original_fit(self, X)
-
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
-
-    result = run(
-        write_input(tmp_path, poisson_counts()),
-        tmp_path / "out.h5ad",
-        "--init",
-        "lsi",
-    )
-
-    assert result.exit_code == 0, result.output
-    (model,) = models
-    assert model.init == "lsi"
-
-
 def test_the_depth_factor_is_written_to_obs(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 
@@ -427,27 +403,6 @@ def test_no_depth_factor_turns_the_cell_offset_off(
     assert not model.depth_factor
     assert model.saturated_depth_ is None
     assert not ad.read_h5ad(out_path).uns["glmPCA"]["params"]["depth_factor"]
-
-
-def test_the_tfidf_flag_reaches_the_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    models: list[GLMPCA] = []
-    original_fit = GLMPCA.fit
-
-    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
-        models.append(self)
-        return original_fit(self, X)
-
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
-    out_path = tmp_path / "out.h5ad"
-
-    result = run(write_input(tmp_path, poisson_counts()), out_path, "--tfidf")
-
-    assert result.exit_code == 0, result.output
-    (model,) = models
-    assert model.tfidf
-    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["tfidf"]
 
 
 def test_the_keep_sparse_flag_reaches_the_model(

@@ -60,7 +60,6 @@ CM_PER_INCH = 2.54
 class Init(str, Enum):
     spectral = "spectral"
     random = "random"
-    lsi = "lsi"
 
 
 class Optimizer(str, Enum):
@@ -391,13 +390,10 @@ def main(
             help=(
                 "Start values of the loadings. [bold yellow]spectral[/bold yellow] "
                 "uses the SVD of the saturated parameters of a random subset of "
-                "cells. [bold yellow]lsi[/bold yellow] uses the SVD of the TF-IDF "
-                "of the counts of that subset, the start that LSI uses for sparse "
-                "single-cell data, and it needs counts. "
-                "[bold yellow]random[/bold yellow] uses a random point on the "
+                "cells. [bold yellow]random[/bold yellow] uses a random point on the "
                 "Stiefel manifold.\n\n"
                 "One of: [bold yellow]spectral[/bold yellow], "
-                "[bold yellow]lsi[/bold yellow], [bold yellow]random[/bold yellow]."
+                "[bold yellow]random[/bold yellow]."
             ),
         ),
     ] = Init.spectral,
@@ -459,19 +455,6 @@ def main(
                 "term for every feature, as ``-gf fast_poisson`` does, so a component "
                 "does not have to carry the depth. It has its own learning rate, 1% of "
                 "``--learningRate``, the same as the per-feature intercept."
-            ),
-        ),
-    ] = False,
-    tfidf: Annotated[
-        bool,
-        typer.Option(
-            "--tfidf",
-            rich_help_panel=_GLMPCA,
-            help=(
-                "Fit the model to the TF-IDF of the counts rather than to the counts. "
-                "This is the weighting that ``--init lsi`` uses for its start, applied "
-                "to the matrix itself. It needs counts, and the families whose support "
-                "is bounded (bernoulli, beta, sigmoid_beta) refuse it."
             ),
         ),
     ] = False,
@@ -658,7 +641,6 @@ def main(
             chunk_size=chunk_size,
             keep_sparse=keep_sparse,
             no_depth_factor=no_depth_factor,
-            tfidf=tfidf,
             no_accelerate=no_accelerate,
             penalty=penalty,
             out_file_umap=out_file_umap,
@@ -706,7 +688,6 @@ def main(
                 device=device,
                 chunk_size=chunk_size,
                 keep_sparse=keep_sparse,
-                tfidf=tfidf,
                 depth_factor=not no_depth_factor,
             ),
             adata,
@@ -727,7 +708,6 @@ def main(
             "n_init": n_init,
             "init": init.value,
             "optimizer": optimizer.value,
-            "tfidf": tfidf,
             "keep_sparse": keep_sparse,
             "depth_factor": not no_depth_factor,
             "accelerate": not no_accelerate,
