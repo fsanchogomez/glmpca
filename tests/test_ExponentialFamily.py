@@ -170,17 +170,44 @@ def test_beta_log_pdf_matches_scipy(
 def test_gamma_pdf_matches_scipy() -> None:
     X = torch.logspace(-8, 5, 1000)
     for nu in torch.rand(20) * 10:
-        for theta in torch.logspace(-5, 3, 50):
+        # The family is parametrised by the log of the shape.
+        for shape in torch.logspace(-5, 3, 50):
             distribution = Gamma()
             distribution.family_params["nu"] = nu.expand_as(X)
+            theta = torch.log(shape)
             pdf = distribution.distribution(X, theta.expand_as(X))
-            np.testing.assert_array_almost_equal(
+            # A density of 1e4 at the low end of X leaves no absolute tolerance to
+            # compare against, so the check is relative.
+            np.testing.assert_allclose(
                 pdf.numpy(),
                 scipy.stats.gamma.pdf(
-                    X.numpy(), a=float(theta) + 1, loc=0, scale=1 / float(nu)
+                    X.numpy(), a=float(shape), loc=0, scale=1 / float(nu)
                 ),
-                decimal=2,
+                rtol=1e-4,
+                atol=1e-2,
             )
+
+
+def test_the_gamma_shape_stays_above_zero() -> None:
+    """`k = exp(theta)` is positive for every log shape, so no fit leaves the family."""
+    family = Gamma()
+    family.family_params["nu"] = torch.tensor(2.0)
+    theta = torch.tensor([-1e4, -100.0, -1.0, 0.0, 10.0, 100.0, 1e4])
+
+    shape = family._shape(theta)
+
+    # Even where float32 would round exp(theta) to 0 or to infinity.
+    assert torch.all(shape > 0.0)
+    assert torch.all(torch.isfinite(shape))
+    cost = family.log_partition(theta) - family.exponential_term(
+        torch.full_like(theta, 3.0), theta
+    )
+    assert torch.all(torch.isfinite(cost))
+    # The cost of this value is least near the middle and climbs either way, so no fit
+    # gains by driving the log shape out. It used to reach infinity instead.
+    assert float(cost.argmin()) not in (0.0, float(len(cost) - 1))
+    assert cost[0] > cost[3]
+    assert cost[-1] > cost[3]
 
 
 @pytest.mark.parametrize("n_jobs", [4, -1])

@@ -90,6 +90,14 @@ class GLMFamily(str, Enum):
 MIN_EXPECTED = 1e-4
 """Floor of the expected count of an entry, and so of the mean count of a feature."""
 
+LOG_SHAPE_LIMIT = 80.0
+"""Bound of the log shape of the Gamma family, both ways.
+
+Past it in float32 the shape overflows to infinity or falls to exactly 0, and `lgamma`
+is infinite at both. Inside it the shape runs from 1.8e-35 to 5.5e34, which covers every
+shape a fit can need, and the cost climbs steeply long before either end.
+"""
+
 
 def _column_sums(
     X: torch.Tensor | SparseRows, chunk: int, power: int = 1
@@ -790,9 +798,18 @@ class SigmoidBeta(Beta):
 
 
 class Gamma(ExponentialFamily):
-    r"""Gamma distribution using a standard formulation.
+    r"""Gamma distribution with a rate per feature.
 
-    Original formulation presented in [Mourragui et al, 2023].
+    The parameter that GLMPCA fits is the log shape `theta = log k`, not the shape
+    itself, so the shape `exp(theta)` stays above 0 and no fit can leave the support of
+    the family. Fitting `k - 1` directly lets the projection reach a shape of 0 or less,
+    where `lgamma` is infinite or returns `log |Gamma|`, which belongs to no
+    distribution. The log shape is clipped to `LOG_SHAPE_LIMIT`, to avoid float32
+    overflow.
+
+    With the rate `nu` fixed per feature, the mean is `k / nu`, so the log shape is the
+    log mean plus a constant of the feature, which the intercept carries. The offset of
+    a cell is then an exact size factor, as in Poisson and the negative binomial.
 
     family_params of interest:
         - "max_val" (int): max data value. Defaults to 1e7.
@@ -826,17 +843,21 @@ class Gamma(ExponentialFamily):
     def sufficient_statistics(self, X: torch.Tensor) -> torch.Tensor:
         return torch.stack([torch.log(X), X])
 
+    def _shape(self, theta: torch.Tensor) -> torch.Tensor:
+        """`exp(theta)`, held inside the range where the shape stays above 0."""
+        return torch.exp(theta.clip(min=-LOG_SHAPE_LIMIT, max=LOG_SHAPE_LIMIT))
+
     def natural_parametrization(self, theta: torch.Tensor) -> torch.Tensor:
-        nat_params = torch.stack([
-            theta,
+        """`[k - 1, -nu]` of the log shape `theta`, with `k = exp(theta)` above 0."""
+        return torch.stack([
+            self._shape(theta) - 1.0,
             -torch.ones_like(theta) * self.family_params["nu"],
         ])
-        return nat_params
 
     def log_partition(self, theta: torch.Tensor) -> torch.Tensor:
-        return torch.lgamma(theta + 1) - (theta + 1) * torch.log(
-            self.family_params["nu"]
-        )
+        """`lgamma(k) - k log nu` of the log shape `theta`."""
+        shape = self._shape(theta)
+        return torch.lgamma(shape) - shape * torch.log(self.family_params["nu"])
 
     def exponential_term(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         return torch.sum(
@@ -849,14 +870,21 @@ class Gamma(ExponentialFamily):
     def _digamma_implicit_function(
         self, X: torch.Tensor, theta: torch.Tensor
     ) -> torch.Tensor:
-        return torch.digamma(theta + 1) - torch.log(X * self.family_params["nu"])
+        """`digamma(k) - log(x nu)`, which the saturated log shape sets to zero."""
+        return torch.digamma(self._shape(theta)) - torch.log(
+            X * self.family_params["nu"]
+        )
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
-        """Dichotomy to compute inverse of digamma function."""
+        """The log shape that makes a value most probable, by bisection.
 
+        `digamma` climbs with the shape, so the bisection runs on the log shape and
+        reaches a shape below 1, which the old bracket of `[0, max_val]` on `k - 1`
+        could not: a low value was left at a shape of exactly 1.
+        """
         # Initialize dichotomy parameters.
-        min_val = torch.zeros_like(X)
-        max_val = torch.ones_like(X) * self.family_params["max_val"]
+        min_val = torch.full_like(X, -LOG_SHAPE_LIMIT)
+        max_val = torch.full_like(X, float(np.log(self.family_params["max_val"])))
         theta = (min_val + max_val) / 2
 
         llik = self._digamma_implicit_function(X, theta)
