@@ -513,10 +513,13 @@ class GLMPCA:
 
         # log h(x) of every cell, summed over its features. It turns the cost into
         # the real log-likelihood.
-        log_base_measure = torch.empty(X_fit.shape[0])
+        log_base_measure = torch.empty(X_fit.shape[0], dtype=torch.float64)
         for chunk in rows.slices(self.chunk_size):
             log_base_measure[chunk] = (
-                family.log_base_measure(X_fit[chunk].to(device)).sum(dim=1).cpu()
+                family
+                .log_base_measure(X_fit[chunk].to(device))
+                .sum(dim=1, dtype=torch.float64)
+                .cpu()
             )
 
         resident = False
@@ -952,8 +955,13 @@ class GLMPCA:
         device: torch.device,
         depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r"""Sums the cost over chunks of chunk_size rows, to never expand X."""
-        total = torch.zeros((), device=device)
+        r"""Sums the cost over chunks of chunk_size rows, to never expand X.
+
+        The total runs in float64. It is what `n_init` compares between runs and what
+        `log_likelihood_` reports, and it costs one scalar addition per chunk, unlike
+        the cost of a chunk itself, whose float32 sum the gradients never see.
+        """
+        total = torch.zeros((), device=device, dtype=torch.float64)
         for chunk in rows.slices(self.chunk_size):
             data, parameters = rows.block(chunk, device)
             total = total + self._optim_cost(

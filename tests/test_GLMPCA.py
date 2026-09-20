@@ -572,7 +572,9 @@ def test_the_chunked_cost_equals_the_cost_of_the_whole_matrix() -> None:
             torch.device("cpu"),
         )
 
-    torch.testing.assert_close(chunked, whole, rtol=1e-5, atol=1e-4)
+    # _full_cost totals its chunks in float64, for the value that n_init compares.
+    assert chunked.dtype is torch.float64
+    torch.testing.assert_close(chunked, whole.double(), rtol=1e-5, atol=1e-4)
 
 
 def test_a_float32_array_is_not_copied() -> None:
