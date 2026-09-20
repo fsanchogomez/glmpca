@@ -61,14 +61,14 @@ def _fits_in(free_bytes: int, tensors: tuple[torch.Tensor, ...], working: int) -
     return needed <= DEVICE_MEMORY_SHARE * free_bytes
 
 
-def _depth_of(centred: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
+def _depth_of(centered: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
     r"""The offset of every cell that least squares would give, once `1 mu.T` is out.
 
     The value that leaves the least outside the subspace is
 
-        s = <w, centred> / <w, 1>,    w = (I - V V.T) 1,
+        s = <w, centered> / <w, 1>,    w = (I - V V.T) 1,
 
-    which is the least-squares solution of `min_s ||(centred - s 1) (I - V V.T)||`. It
+    which is the least-squares solution of `min_s ||(centered - s 1) (I - V V.T)||`. It
     is the start of `_fitted_depth`, which moves it to the optimum of the likelihood.
     """
     ones = torch.ones(loadings.shape[0], device=loadings.device, dtype=loadings.dtype)
@@ -76,8 +76,10 @@ def _depth_of(centred: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
     scale = float(outside @ ones)
     if abs(scale) < 1e-8:
         # The all-ones direction lies in the subspace, which already carries the offset.
-        return torch.zeros(centred.shape[0], device=centred.device, dtype=centred.dtype)
-    return (centred @ outside) / scale
+        return torch.zeros(
+            centered.shape[0], device=centered.device, dtype=centered.dtype
+        )
+    return (centered @ outside) / scale
 
 
 def _row_costs(
@@ -92,7 +94,7 @@ def _row_costs(
 def _fitted_depth(
     family: ExponentialFamily,
     data: torch.Tensor,
-    centred: torch.Tensor,
+    centered: torch.Tensor,
     intercept: torch.Tensor,
     loadings: torch.Tensor,
 ) -> torch.Tensor:
@@ -100,7 +102,7 @@ def _fitted_depth(
 
     With `P = V V.T` and `w = (I - P) 1`, the fitted parameters of a cell are
 
-        theta_hat = centred P + mu + s w,
+        theta_hat = centered P + mu + s w,
 
     linear in its offset `s`, so every cell is a 1-D problem. Newton steps from the
     least-squares offset solve it, with the step of a cell halved until its cost does
@@ -108,12 +110,12 @@ def _fitted_depth(
     cells their offsets this way after the fit, and `transform` gives new cells theirs,
     so both use the same offset for the same cell.
     """
-    depth = _depth_of(centred, loadings)
+    depth = _depth_of(centered, loadings)
     ones = torch.ones(loadings.shape[0], device=loadings.device, dtype=loadings.dtype)
     outside = ones - loadings @ (loadings.T @ ones)
     if abs(float(outside @ ones)) < 1e-8:
         return depth
-    inside = centred @ loadings @ loadings.T + intercept.unsqueeze(0)
+    inside = centered @ loadings @ loadings.T + intercept.unsqueeze(0)
     outside = outside.unsqueeze(0)
     active = torch.arange(depth.shape[0], device=depth.device)
     for _ in range(OFFSET_NEWTON_ITERATIONS):
@@ -316,7 +318,7 @@ class GLMPCA:
 
     depth_factor: bool
         Whether to fit an offset for every cell beside the offset of every feature, as
-        `fast_poisson` does for its size factor. The saturated parameters are centred
+        `fast_poisson` does for its size factor. The saturated parameters are centered
         by both offsets before the projection, so a component never has to carry the
         depth of a cell. It has its own learning rate, DEPTH_RATE_SCALE of
         learning_rate, as the intercept does, and `transform` gives an unseen cell the
@@ -604,7 +606,7 @@ class GLMPCA:
             log_base_measure.sum()
         )
         self.saturated_loadings_ = canonical_basis(
-            best_loadings, self._centred_chunks(rows, after)
+            best_loadings, self._centered_chunks(rows, after)
         ).cpu()
         self.saturated_intercept_ = self.saturated_intercept_.cpu()
         if self.saturated_depth_ is not None:
@@ -613,12 +615,12 @@ class GLMPCA:
 
         return True
 
-    def _centred_chunks(
+    def _centered_chunks(
         self, rows: _Rows, device: torch.device
     ) -> Iterator[torch.Tensor]:
         """The rows that transform projects, in blocks of chunk_size.
 
-        They are centred with the offsets of `_fitted_depth`, which transform gives the
+        They are centered with the offsets of `_fitted_depth`, which transform gives the
         same cells, so the scores canonical_basis orders are the scores that transform
         reports. Those offsets depend on the loadings only through their span, so the
         rotation of canonical_basis leaves them alone.
