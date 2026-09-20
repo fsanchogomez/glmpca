@@ -320,7 +320,13 @@ class GLMPCA:
         by both offsets before the projection, so a component never has to carry the
         depth of a cell. It has its own learning rate, DEPTH_RATE_SCALE of
         learning_rate, as the intercept does, and `transform` gives an unseen cell the
-        offset that least squares would give it. Defaults to True.
+        offset that least squares would give it. Defaults to False.
+
+        The offset is an exact size factor only where the parameter is a log mean:
+        "poisson", "negative_binomial", "lognormal" and, for the fitted mean, "gamma".
+        For "gaussian" it shifts the mean rather than scaling it, and the families on
+        a bounded support have no multiplicative depth at all, so there it is a plain
+        offset of a cell rather than a size factor.
 
     n_jobs: int or None
         Number of jobs for the per-feature fits of the family parameters. If given,
@@ -374,7 +380,7 @@ class GLMPCA:
         gamma: float = 0.5,
         n_init: int = 1,
         init: Literal["spectral", "random"] = "spectral",
-        depth_factor: bool = True,
+        depth_factor: bool = False,
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
         chunk_size: int = DEFAULT_CHUNK_ROWS,

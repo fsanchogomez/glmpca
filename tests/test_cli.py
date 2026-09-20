@@ -349,7 +349,7 @@ def test_glmpca_runs_fast_poisson(tmp_path: Path) -> None:
 def test_the_depth_factor_is_written_to_obs(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 
-    result = run(write_input(tmp_path, poisson_counts()), out_path)
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--depthFactor")
 
     assert result.exit_code == 0, result.output
     adata = ad.read_h5ad(out_path)
@@ -374,16 +374,16 @@ def test_fast_poisson_writes_its_size_factor_to_the_same_column(
     assert adata.obs["glmPCA_depth"].shape == (N_CELLS,)
 
 
-def test_no_depth_factor_leaves_the_column_out(tmp_path: Path) -> None:
+def test_no_depth_factor_by_default_leaves_the_column_out(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 
-    result = run(write_input(tmp_path, poisson_counts()), out_path, "--noDepthFactor")
+    result = run(write_input(tmp_path, poisson_counts()), out_path)
 
     assert result.exit_code == 0, result.output
     assert "glmPCA_depth" not in ad.read_h5ad(out_path).obs
 
 
-def test_no_depth_factor_turns_the_cell_offset_off(
+def test_the_depth_factor_flag_turns_the_cell_offset_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models: list[GLMPCA] = []
@@ -396,13 +396,13 @@ def test_no_depth_factor_turns_the_cell_offset_off(
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     out_path = tmp_path / "out.h5ad"
 
-    result = run(write_input(tmp_path, poisson_counts()), out_path, "--noDepthFactor")
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--depthFactor")
 
     assert result.exit_code == 0, result.output
     (model,) = models
-    assert not model.depth_factor
-    assert model.saturated_depth_ is None
-    assert not ad.read_h5ad(out_path).uns["glmPCA"]["params"]["depth_factor"]
+    assert model.depth_factor
+    assert model.saturated_depth_ is not None
+    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["depth_factor"]
 
 
 def test_the_keep_sparse_flag_reaches_the_model(

@@ -28,8 +28,8 @@ DESCRIPTION = (
     '* ``obsm["X_glmPCA"]``: the coordinates of the cells.\n'
     '* ``varm["glmPCA_loadings"]``: the loadings of the features.\n'
     '* ``var["glmPCA_intercept"]``: the intercept of the features.\n'
-    '* ``obs["glmPCA_depth"]``: the depth factor of the cells, absent with '
-    "``--noDepthFactor``.\n"
+    '* ``obs["glmPCA_depth"]``: the depth factor of the cells, present with '
+    "``--depthFactor``.\n"
     '* ``uns["glmPCA"]``: the parameters of the fit.\n\n'
     "If ``--outFileUMAP`` is given, ``glmpca`` also computes a 2D projection (UMAP) "
     "and Leiden clusters of the cells from the reduction. It stores them in "
@@ -223,8 +223,8 @@ def run_fast_poisson(
     logging.info(
         "fast_poisson fits the counts directly, so the optimisation options "
         "(--learningRate, --batchSize, --gamma, --nInit, --init) do not apply. Its "
-        "model holds a size factor for every cell, which is what --noDepthFactor "
-        "turns off for the other families."
+        "model holds a size factor for every cell, which is what --depthFactor "
+        "turns on for the other families."
     )
     if not model.accelerate:
         logging.info("DAAREM acceleration is off, as --noDaarem was given.")
@@ -444,17 +444,20 @@ def main(
             ),
         ),
     ] = False,
-    no_depth_factor: Annotated[
+    depth_factor: Annotated[
         bool,
         typer.Option(
-            "--noDepthFactor",
+            "--depthFactor",
             rich_help_panel=_GLMPCA,
             help=(
-                "Do not fit an offset for every cell. With the offset, which is on by "
-                "default, the model holds a term for the depth of a cell beside the "
-                "term for every feature, as ``-gf fast_poisson`` does, so a component "
-                "does not have to carry the depth. It has its own learning rate, 1% of "
-                "``--learningRate``, the same as the per-feature intercept."
+                "Fit an offset for every cell, off by default. The model then holds a "
+                "term for the depth of a cell beside the term for every feature, as "
+                "``-gf fast_poisson`` always does, so a component does not have to "
+                "carry the depth. It has its own learning rate, 1% of "
+                "``--learningRate``, the same as the per-feature intercept. It is an "
+                "exact size factor for ``poisson``, ``negative_binomial``, "
+                "``lognormal`` and ``gamma``, whose parameter is a log mean; for the "
+                "other families it is a plain offset of a cell."
             ),
         ),
     ] = False,
@@ -640,7 +643,7 @@ def main(
             optimizer=optimizer,
             chunk_size=chunk_size,
             keep_sparse=keep_sparse,
-            no_depth_factor=no_depth_factor,
+            depth_factor=depth_factor,
             no_accelerate=no_accelerate,
             penalty=penalty,
             out_file_umap=out_file_umap,
@@ -688,7 +691,7 @@ def main(
                 device=device,
                 chunk_size=chunk_size,
                 keep_sparse=keep_sparse,
-                depth_factor=not no_depth_factor,
+                depth_factor=depth_factor,
             ),
             adata,
         )
@@ -709,7 +712,7 @@ def main(
             "init": init.value,
             "optimizer": optimizer.value,
             "keep_sparse": keep_sparse,
-            "depth_factor": not no_depth_factor,
+            "depth_factor": depth_factor,
             "accelerate": not no_accelerate,
             "penalty": penalty,
         },

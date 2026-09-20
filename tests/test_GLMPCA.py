@@ -642,7 +642,7 @@ def depth_gradient() -> torch.Tensor:
 
 
 def test_the_depth_factor_is_fitted_for_every_cell() -> None:
-    model = GLMPCA(N_PC, family="poisson", max_iter=5, batch_size=16)
+    model = GLMPCA(N_PC, family="poisson", max_iter=5, batch_size=16, depth_factor=True)
 
     model.fit(depth_gradient())
 
@@ -651,10 +651,8 @@ def test_the_depth_factor_is_fitted_for_every_cell() -> None:
     assert torch.all(torch.isfinite(model.saturated_depth_))
 
 
-def test_turning_the_depth_factor_off_leaves_no_offset() -> None:
-    model = GLMPCA(
-        N_PC, family="poisson", max_iter=5, batch_size=16, depth_factor=False
-    )
+def test_no_depth_factor_by_default_leaves_no_offset() -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=5, batch_size=16)
 
     model.fit(depth_gradient())
 
@@ -686,7 +684,7 @@ def test_the_depth_factor_keeps_the_components_off_the_depth() -> None:
 
 
 def test_the_depth_factor_has_its_own_learning_rate() -> None:
-    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16)
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16, depth_factor=True)
     saturated = torch.log(depth_gradient().clip(min=1.0))
 
     optimizer, _, _, depth, _ = model._create_saturated_loading_optim(
@@ -704,7 +702,9 @@ def test_the_depth_factor_has_its_own_learning_rate() -> None:
 
 def test_transform_reproduces_the_fitted_scores_with_a_depth_factor() -> None:
     X = depth_gradient()
-    model = GLMPCA(N_PC, family="poisson", max_iter=20, batch_size=16)
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=20, batch_size=16, depth_factor=True
+    )
     model.fit(X)
 
     embedding = model.transform(X).detach()
@@ -724,7 +724,7 @@ def test_transform_reproduces_the_fitted_scores_with_a_depth_factor() -> None:
 @pytest.mark.parametrize("family", ["poisson", "negative_binomial", "gaussian"])
 def test_the_offset_of_a_cell_is_the_optimum_of_its_likelihood(family: str) -> None:
     X = depth_gradient()
-    model = GLMPCA(N_PC, family=family, max_iter=10, batch_size=16)
+    model = GLMPCA(N_PC, family=family, max_iter=10, batch_size=16, depth_factor=True)
     model.fit(X)
     depth, intercept = model.saturated_depth_, model.saturated_intercept_
     loadings = model.saturated_loadings_
