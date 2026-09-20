@@ -234,7 +234,9 @@ def test_negative_binomial_log_pmf_matches_scipy() -> None:
     for nu in (2.0, 5.0, 20.0):
         family.family_params["nu"] = torch.tensor(nu)
         for probability in (0.2, 0.5, 0.8):
-            theta = torch.full_like(X, math.log(1 - probability))
+            # The family is parametrised by the log mean of the distribution.
+            mean = nu * (1 - probability) / probability
+            theta = torch.full_like(X, math.log(mean))
             np.testing.assert_array_almost_equal(
                 family.log_distribution(X, theta).numpy(),
                 scipy.stats.nbinom.logpmf(X.numpy(), nu, probability),
@@ -245,20 +247,30 @@ def test_negative_binomial_log_pmf_matches_scipy() -> None:
 def test_negative_binomial_places_a_zero_at_its_expected_count() -> None:
     family = NegativeBinomial()
     family.initialize_family_parameters(ZEROS_AND_COUNTS)
-    nu = family.family_params["nu"]
 
     theta = family.invert_g(ZEROS_AND_COUNTS)
 
     mu = expected_counts(ZEROS_AND_COUNTS)
     zeros = ZEROS_AND_COUNTS == 0
-    torch.testing.assert_close(
-        theta[zeros], torch.log(mu / (mu + nu))[zeros].clip(max=-1e-6)
-    )
-    counts = ZEROS_AND_COUNTS[~zeros]
-    nu_of_counts = nu.expand_as(ZEROS_AND_COUNTS)[~zeros]
-    torch.testing.assert_close(
-        theta[~zeros], torch.log(counts / (counts + nu_of_counts)).clip(max=-1e-6)
-    )
+    # The parameter is the log mean, so a count sits at its own log and a zero at the
+    # log of the count it was expected to hold.
+    torch.testing.assert_close(theta[zeros], torch.log(mu)[zeros])
+    torch.testing.assert_close(theta[~zeros], torch.log(ZEROS_AND_COUNTS[~zeros]))
+
+
+def test_the_negative_binomial_parameter_stays_inside_the_family() -> None:
+    """`log(mu / (mu + nu))` is below 0 for every log mean, however large."""
+    family = NegativeBinomial()
+    family.family_params["nu"] = torch.tensor(2.0)
+    theta = torch.tensor([-40.0, -1.0, 0.0, 10.0, 30.0, 88.0])
+
+    natural = family.natural_parametrization(theta)
+
+    assert torch.all(natural < 0.0)
+    assert torch.all(torch.isfinite(family.log_partition(theta)))
+    # The cost climbs with the log mean, so no fit gains by pushing it up.
+    costs = family.log_partition(theta) - torch.full_like(theta, 7.0) * natural
+    assert torch.all(costs[3:].diff() > 0)
 
 
 def test_negative_binomial_dispersion_is_estimated_per_feature() -> None:

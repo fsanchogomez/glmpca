@@ -375,19 +375,28 @@ class Poisson(ExponentialFamily):
 class NegativeBinomial(ExponentialFamily):
     r"""Negative binomial with a dispersion per feature.
 
-    Counts with more variance than the mean (overdispersion) are negative binomial
-    rather than Poisson. With the dispersion `nu` fixed per feature, the family is
-    exponential with natural parameter `theta = log(mu / (mu + nu))`, which is always
-    below 0.
+    Counts with more variance than the mean `mu` are overdispersed. The dispersion `nu`
+    is fixed per feature, found by fitting an MLE.
+
+    The natural parameter of the negative binomial is `theta = log(mu / (mu + nu))`.
+    We instead parametrize it in terms of the log mean `eta = log mu`, as in Poisson.
+    This has two advantages:
+
+    - `theta` must stay below 0, and `theta(eta) = -log(1 + nu exp(-eta))` does so for
+      every `eta`, avoiding numerical overflows.
+    - The depth factor of a cell multiplies its mean, so it is an offset of `eta` but
+      not of `theta`. Thus the offset of a cell is an exact size factor.
+
+    The fit is then linear in the log mean, as in Townes et al., rather than in the
+    natural parameter of Mourragui et al. The saturated parameter stays `log x`.
 
     family_params of interest:
         - "nu" (torch.Tensor): dispersion of each feature, computed by
         initialize_family_parameters. A large value gives a Poisson-like feature.
         - "feature_mean" (torch.Tensor) and "mean_depth" (float): the background of
-        the saturated parameter of a zero, as in Poisson. A zero is placed at
-        `log(mu / (mu + nu))` for its expected count `mu` under independence.
-        - "eps" (float): theta is clipped to at most -eps, because the log-partition
-        is infinite at 0. Defaults to 1e-6.
+        the saturated parameter of a zero, as in Poisson. A zero is placed at the log
+        of its expected count under independence.
+        - "eps" (float): floor of the dispersion of a feature. Defaults to 1e-6.
         - "max_val" (float): dispersion given to a feature that is not overdispersed.
         Defaults to 1e4.
         - "method" (str): "mle" for the profile-likelihood estimate, by Newton
@@ -420,12 +429,19 @@ class NegativeBinomial(ExponentialFamily):
         return X
 
     def natural_parametrization(self, theta: torch.Tensor) -> torch.Tensor:
-        return theta
+        """`log(mu / (mu + nu))` of the log mean `theta`, below 0 for every `theta`.
+
+        As `-log(1 + nu exp(-theta))` rather than `theta - log(exp(theta) + nu)`: the
+        difference of the second form loses every digit once the mean is far above the
+        dispersion, and rounds to 0, which is outside the family.
+        """
+        log_nu = torch.log(self.family_params["nu"])
+        return -torch.nn.functional.softplus(log_nu - theta)
 
     def log_partition(self, theta: torch.Tensor) -> torch.Tensor:
-        """`-nu log(1 - exp(theta))`, through `expm1` for the small values."""
-        theta = theta.clip(max=-self.family_params["eps"])
-        return -self.family_params["nu"] * torch.log(-torch.expm1(theta))
+        """`nu log((exp(theta) + nu) / nu)` of the log mean `theta`."""
+        nu = self.family_params["nu"]
+        return nu * torch.nn.functional.softplus(theta - torch.log(nu))
 
     def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
         nu = self.family_params["nu"]
@@ -436,7 +452,6 @@ class NegativeBinomial(ExponentialFamily):
         return torch.exp(torch.lgamma(X + nu) - torch.lgamma(nu) - torch.lgamma(X + 1))
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
-        nu = self.family_params["nu"]
         if "feature_mean" in self.family_params:
             background = (
                 self.family_params["feature_mean"],
@@ -445,9 +460,7 @@ class NegativeBinomial(ExponentialFamily):
         else:
             background = _zero_background(X)
         expected = _expected_counts(X, *background)
-        return torch.where(
-            X > 0, torch.log(X / (X + nu)), torch.log(expected / (expected + nu))
-        ).clip(max=-self.family_params["eps"])
+        return torch.where(X > 0, torch.log(X), torch.log(expected))
 
     def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
         """Dispersion per feature, by the method chosen in family_params["method"]."""
