@@ -731,12 +731,12 @@ def test_the_offset_of_a_cell_is_the_optimum_of_its_likelihood(family: str) -> N
     assert depth is not None
     assert intercept is not None
     assert loadings is not None
-    centred = model.exponential_family.invert_g(X) - intercept.unsqueeze(0)
+    centered = model.exponential_family.invert_g(X) - intercept.unsqueeze(0)
     projector = loadings @ loadings.T
     outside = torch.ones(N_FEATURES) - projector.sum(dim=1)
 
     def costs(offset: torch.Tensor) -> torch.Tensor:
-        theta = centred @ projector + intercept + offset.unsqueeze(1) * outside
+        theta = centered @ projector + intercept + offset.unsqueeze(1) * outside
         return -(
             model.exponential_family.exponential_term(X, theta)
             - model.exponential_family.log_partition(theta)

@@ -267,8 +267,8 @@ def test_glmpca_plots_the_umap_with_leiden_clusters(
 def test_umap_leiden_finds_separated_groups() -> None:
     rng = np.random.default_rng(0)
     labels = np.repeat(np.arange(3), 30)
-    centres = np.eye(3, 10)[labels] * 50
-    coordinates = (centres + rng.normal(size=(90, 10))).astype(np.float32)
+    centers = np.eye(3, 10)[labels] * 50
+    coordinates = (centers + rng.normal(size=(90, 10))).astype(np.float32)
 
     embedding, clusters = umap_leiden(coordinates, n_neighbors=10, resolution=1.0)
 
