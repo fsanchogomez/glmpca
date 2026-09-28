@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import typer
 from matplotlib.figure import Figure
+from scipy import sparse
 
 from glmpca.ExponentialFamily import _n_workers
 from glmpca.fast_poisson import DEFAULT_PENALTY, FastPoissonPCA
@@ -55,6 +56,7 @@ _OTHER = "Other options"
 
 AVAILABLE_PROCESSORS = _n_workers(-1)
 CM_PER_INCH = 2.54
+LOG_NORMALIZE_TOTAL = 10_000
 
 
 class Init(str, Enum):
@@ -120,6 +122,22 @@ def help_callback(ctx: typer.Context, value: bool) -> None:
     if value:
         typer.echo(ctx.get_help())
         raise typer.Exit()
+
+
+def log_normalized(
+    X: np.ndarray | sparse.spmatrix | sparse.sparray,
+) -> np.ndarray | sparse.csr_matrix:
+    """``log1p`` of every cell scaled to LOG_NORMALIZE_TOTAL counts.
+
+    A cell with no counts stays 0. A sparse matrix stays sparse.
+    """
+    totals = np.asarray(X.sum(axis=1), dtype=np.float64).ravel()
+    scale = np.divide(
+        LOG_NORMALIZE_TOTAL, totals, out=np.zeros_like(totals), where=totals > 0
+    )
+    if sparse.issparse(X):
+        return sparse.csr_matrix(sparse.diags(scale) @ X, dtype=np.float32).log1p()
+    return np.log1p(np.asarray(X, dtype=np.float64) * scale[:, None]).astype(np.float32)
 
 
 def log_parameters(**parameters: object) -> None:
@@ -461,6 +479,20 @@ def main(
             ),
         ),
     ] = False,
+    log_normalize: Annotated[
+        bool,
+        typer.Option(
+            "--logNormalize",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Scale every cell to 10,000 counts and take ``log1p`` of the result "
+                "before the fit, off by default. The fit uses the transformed "
+                "values, and the output file keeps the original matrix in ``.X``. "
+                "The values are then continuous, so a family for continuous data, "
+                "such as ``gaussian``, is the usual choice."
+            ),
+        ),
+    ] = False,
     chunk_size: Annotated[
         int,
         typer.Option(
@@ -644,6 +676,7 @@ def main(
             chunk_size=chunk_size,
             keep_sparse=keep_sparse,
             depth_factor=depth_factor,
+            log_normalize=log_normalize,
             no_accelerate=no_accelerate,
             penalty=penalty,
             out_file_umap=out_file_umap,
@@ -663,6 +696,7 @@ def main(
     if adata.X is None:
         msg = f"'{input}' has no matrix in .X."
         raise fail(msg)
+    fit_data = ad.AnnData(log_normalized(adata.X)) if log_normalize else adata
 
     if glmpca_family is FamilyChoice.fast_poisson:
         scores, loadings, intercept, depth = run_fast_poisson(
@@ -673,7 +707,7 @@ def main(
                 accelerate=not no_accelerate,
                 penalty=penalty,
             ),
-            adata,
+            fit_data,
         )
     else:
         scores, loadings, intercept, depth = run_glmpca(
@@ -693,7 +727,7 @@ def main(
                 keep_sparse=keep_sparse,
                 depth_factor=depth_factor,
             ),
-            adata,
+            fit_data,
         )
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
@@ -713,6 +747,7 @@ def main(
             "optimizer": optimizer.value,
             "keep_sparse": keep_sparse,
             "depth_factor": depth_factor,
+            "log_normalize": log_normalize,
             "accelerate": not no_accelerate,
             "penalty": penalty,
         },

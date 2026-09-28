@@ -13,6 +13,7 @@ from glmpca.cli.glmpca import (
     AVAILABLE_PROCESSORS,
     FamilyChoice,
     app,
+    log_normalized,
     normalize_processors,
     umap_leiden,
 )
@@ -424,6 +425,63 @@ def test_the_keep_sparse_flag_reaches_the_model(
     (model,) = models
     assert model.keep_sparse
     assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["keep_sparse"]
+
+
+@pytest.mark.parametrize(
+    "matrix_type",
+    [np.asarray, sparse.csr_matrix, sparse.csc_matrix],
+    ids=lambda matrix_type: matrix_type.__name__,
+)
+def test_log_normalized_scales_every_cell_to_10k_then_takes_log1p(
+    matrix_type: Callable[[np.ndarray], Any],
+) -> None:
+    counts = poisson_counts()
+    counts[0] = 0
+    expected = np.zeros_like(counts)
+    totals = counts[1:].sum(axis=1, keepdims=True)
+    expected[1:] = np.log1p(counts[1:] / totals * 10_000)
+
+    result = log_normalized(matrix_type(counts))
+
+    assert sparse.issparse(result) == sparse.issparse(matrix_type(counts))
+    dense = result.toarray() if sparse.issparse(result) else result
+    assert dense.dtype == np.float32
+    np.testing.assert_allclose(dense, expected, rtol=1e-6)
+
+
+def test_the_log_normalize_flag_fits_the_transformed_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fitted: list[np.ndarray] = []
+    original_fit = GLMPCA.fit
+
+    def recording_fit(self: GLMPCA, X: ad.AnnData) -> bool:
+        fitted.append(np.asarray(X.X))
+        return original_fit(self, X)
+
+    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    counts = poisson_counts()
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(
+        write_input(tmp_path, counts), out_path, "-gf", "gaussian", "--logNormalize"
+    )
+
+    assert result.exit_code == 0, result.output
+    (X,) = fitted
+    np.testing.assert_allclose(X, log_normalized(counts))
+    adata = ad.read_h5ad(out_path)
+    np.testing.assert_array_equal(adata.X, counts)
+    assert adata.uns["glmPCA"]["params"]["log_normalize"]
+
+
+def test_no_log_normalize_by_default(tmp_path: Path) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path)
+
+    assert result.exit_code == 0, result.output
+    assert not ad.read_h5ad(out_path).uns["glmPCA"]["params"]["log_normalize"]
 
 
 def test_the_penalty_reaches_fast_poisson(tmp_path: Path) -> None:
