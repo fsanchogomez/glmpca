@@ -20,7 +20,7 @@ from scipy import sparse
 
 from glmpca.ExponentialFamily import _n_workers
 from glmpca.fast_poisson import DEFAULT_PENALTY, FastPoissonPCA
-from glmpca.GLMPCA import DEFAULT_CHUNK_ROWS, GLMPCA
+from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA
 
 DESCRIPTION = (
     "Reduce the dimensionality of a cell-by-feature matrix with GLM-PCA.\n\n"
@@ -482,10 +482,13 @@ def main(
             rich_help_panel=_OPTIMISATION,
             help=(
                 "Number of cells in each mini-batch. If there are fewer cells, the "
-                "number of cells is used."
+                "number of cells is used. On the CPU it is also the number of cells "
+                "handled at a time in every pass over the whole matrix, which bounds "
+                "the memory of those passes. On a GPU those passes take as many cells "
+                "as the free memory of the device holds."
             ),
         ),
-    ] = 256,
+    ] = DEFAULT_BATCH_SIZE,
     gamma: Annotated[
         float,
         typer.Option(
@@ -599,19 +602,6 @@ def main(
             ),
         ),
     ] = False,
-    chunk_size: Annotated[
-        int,
-        typer.Option(
-            "--chunkSize",
-            rich_help_panel=_OPTIMISATION,
-            help=(
-                "Number of cells handled at a time when the saturated parameters are "
-                "computed and when a run is scored. It bounds the memory of those two "
-                "steps and does not change the result. Lower it for a large dataset on "
-                "a small machine."
-            ),
-        ),
-    ] = DEFAULT_CHUNK_ROWS,
     keep_sparse: Annotated[
         bool,
         typer.Option(
@@ -779,7 +769,6 @@ def main(
             n_init=n_init,
             init=init,
             optimizer=optimizer,
-            chunk_size=chunk_size,
             keep_sparse=keep_sparse,
             depth_factor=depth_factor,
             log_normalize=log_normalize,
@@ -829,7 +818,6 @@ def main(
                 optimizer=optimizer.value,
                 n_jobs=number_of_processors,
                 device=device,
-                chunk_size=chunk_size,
                 keep_sparse=keep_sparse,
                 depth_factor=depth_factor,
             ),

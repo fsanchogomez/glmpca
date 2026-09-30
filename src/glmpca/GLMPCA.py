@@ -39,7 +39,7 @@ DEPTH_RATE_SCALE = 0.01
 LEARNING_RATE_LIMIT = 1e-8
 PLATEAU_PATIENCE = 10
 PLATEAU_THRESHOLD = 1e-4
-DEFAULT_CHUNK_ROWS = 8192
+DEFAULT_BATCH_SIZE = 4096
 OFFSET_NEWTON_ITERATIONS = 50
 OFFSET_HALVINGS = 30
 OFFSET_TOLERANCE = 1e-6
@@ -297,8 +297,9 @@ class GLMPCA:
 
     batch_size : int
         Size of the batch in the SGD optimisation step. If the matrix to fit has
-        fewer rows, the number of rows is used instead and a warning is issued.
-        Defaults to 256.
+        fewer rows, the number of rows is used instead and a warning is issued. On the
+        CPU it is also the number of rows of every pass over the whole matrix, unless
+        chunk_size is given. Defaults to DEFAULT_BATCH_SIZE (4096).
 
     gamma: float
         Factor that multiplies the learning rate when the cost reaches a plateau, that
@@ -341,11 +342,12 @@ class GLMPCA:
         "cuda" if it is available, else "cpu". The "mps" device is not supported.
         Fitted attributes are always stored on the CPU. Defaults to None.
 
-    chunk_size: int
-        Number of rows handled at a time when fit computes the saturated parameters and
-        when it scores a run on the whole dataset. It bounds the memory of those two
-        steps and does not change the result. Lower it for a large dataset on a small
-        machine. Defaults to 8192.
+    chunk_size: int or None
+        Number of rows handled at a time in every pass over the whole matrix: the
+        saturated parameters, the cost that "cg" and n_init use, the offsets and the
+        transform. It bounds the memory of those passes and does not change the result.
+        None chooses it from the device: batch_size on the CPU, and on CUDA the rows
+        that a share of the free memory holds (`_chunk_rows`). Defaults to None.
 
     optimizer: str
         "adagrad" for the Riemannian Adagrad of this package, "adam" for its Riemannian
@@ -378,14 +380,14 @@ class GLMPCA:
         family_params: dict[str, Any] | None = None,
         max_iter: int = 100,
         learning_rate: float = DEFAULT_LEARNING_RATE,
-        batch_size: int = 256,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         gamma: float = 0.5,
         n_init: int = 1,
         init: Literal["spectral", "random"] = "spectral",
         depth_factor: bool = False,
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
-        chunk_size: int = DEFAULT_CHUNK_ROWS,
+        chunk_size: int | None = None,
         optimizer: Literal["adagrad", "adam", "cg"] = "adagrad",
         keep_sparse: bool = False,
     ) -> None:
@@ -403,6 +405,7 @@ class GLMPCA:
         self.init = init
         self.depth_factor = depth_factor
         self.chunk_size = chunk_size
+        self._chunk = batch_size if chunk_size is None else chunk_size
         self.optimizer = optimizer
         self.keep_sparse = keep_sparse
 
@@ -436,7 +439,7 @@ class GLMPCA:
             self.exponential_family.family_params = dict(family.family_params)
         if n_jobs is not None:
             self.exponential_family.family_params["n_jobs"] = n_jobs
-        self.exponential_family.family_params["chunk_size"] = chunk_size
+        self.exponential_family.family_params["chunk_size"] = self._chunk
 
     def fit(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
         r"""Fits a GLM-PCA to a specific dataset.
@@ -460,7 +463,7 @@ class GLMPCA:
             choices = ", ".join(repr(name) for name in _OPTIMIZERS)
             msg = f"optimizer={self.optimizer!r} is not valid. Use one of {choices}."
             raise ValueError(msg)
-        if self.chunk_size < 1:
+        if self.chunk_size is not None and self.chunk_size < 1:
             msg = f"chunk_size={self.chunk_size} is not valid. Use 1 or more."
             raise ValueError(msg)
         if (
@@ -503,6 +506,8 @@ class GLMPCA:
             batch_size = X_fit.shape[0]
 
         _announce_device(device)
+        n_rows, row_bytes = X_fit.shape[0], X_fit.shape[1] * X_fit.dtype.itemsize
+        self._chunk = self._chunk_rows(device, n_rows, row_bytes)
 
         # Fit exponential family params (e.g., dispersion for negative binomial)
         family.initialize_family_parameters(X_fit)
@@ -512,8 +517,8 @@ class GLMPCA:
         saturated_parameters = None
         if isinstance(X_fit, torch.Tensor):
             saturated_parameters = torch.empty_like(X_fit)
-            for start in range(0, X_fit.shape[0], self.chunk_size):
-                stop = start + self.chunk_size
+            for start in range(0, X_fit.shape[0], self._chunk):
+                stop = start + self._chunk
                 saturated_parameters[start:stop] = family.invert_g(
                     X_fit[start:stop].to(device)
                 ).cpu()
@@ -522,7 +527,7 @@ class GLMPCA:
         # log h(x) of every cell, summed over its features. It turns the cost into
         # the real log-likelihood.
         log_base_measure = torch.empty(X_fit.shape[0], dtype=torch.float64)
-        for chunk in rows.slices(self.chunk_size):
+        for chunk in rows.slices(self._chunk):
             log_base_measure[chunk] = (
                 family
                 .log_base_measure(X_fit[chunk].to(device))
@@ -535,10 +540,11 @@ class GLMPCA:
             resident = device.type != "cuda" or _fits_in(
                 torch.cuda.mem_get_info(device)[0],
                 (X_fit, saturated_parameters),
-                WORKING_COPIES * min(self.chunk_size, X_fit.shape[0]) * X_fit[0].nbytes,
+                WORKING_COPIES * min(batch_size, n_rows) * row_bytes,
             )
             if resident and device.type == "cuda":
                 rows = _Rows(X_fit.to(device), family, saturated_parameters.to(device))
+                self._chunk = self._chunk_rows(device, n_rows, row_bytes)
         if device.type == "cuda":
             tqdm.write(
                 f"DATA: {'held on the device' if resident else 'copied by chunks'}"
@@ -566,6 +572,7 @@ class GLMPCA:
             for loadings, intercept, depth in runs
         ]
         family.load_family_params_to_gpu(after)
+        self._chunk = self._chunk_rows(after, n_rows, row_bytes)
 
         # Select best model
         best_model_idx = 0
@@ -582,7 +589,7 @@ class GLMPCA:
         self.saturated_depth_ = None
         if best_depth is not None:
             offsets = []
-            for chunk in rows.slices(self.chunk_size):
+            for chunk in rows.slices(self._chunk):
                 data, theta = rows.block(chunk, after)
                 offsets.append(
                     _fitted_depth(
@@ -615,6 +622,21 @@ class GLMPCA:
 
         return True
 
+    def _chunk_rows(self, device: torch.device, n_rows: int, row_bytes: int) -> int:
+        """The rows of one pass over the matrix on `device`.
+
+        chunk_size when it is given. Otherwise batch_size on the CPU, and on CUDA the
+        rows whose WORKING_COPIES fit in DEVICE_MEMORY_SHARE of the free memory, so a
+        pass takes few, large chunks. Never more rows than the matrix has.
+        """
+        if self.chunk_size is not None:
+            return self.chunk_size
+        if device.type != "cuda":
+            return self.batch_size
+        free = torch.cuda.mem_get_info(device)[0]
+        rows = int(DEVICE_MEMORY_SHARE * free) // (WORKING_COPIES * max(row_bytes, 1))
+        return max(1, min(rows, n_rows))
+
     def _centered_chunks(
         self, rows: _Rows, device: torch.device
     ) -> Iterator[torch.Tensor]:
@@ -627,7 +649,7 @@ class GLMPCA:
         """
         intercept = self.saturated_intercept_
         assert intercept is not None
-        for chunk in rows.slices(self.chunk_size):
+        for chunk in rows.slices(self._chunk):
             _, theta = rows.block(chunk, device)
             block = theta - intercept.unsqueeze(0)
             if self.saturated_depth_ is not None:
@@ -661,7 +683,12 @@ class GLMPCA:
 
         rows = _Rows(X_transform, self.exponential_family, None)
         scores = [torch.empty(0, loadings.shape[1], device=device)]
-        for chunk in rows.slices(self.chunk_size):
+        chunk_rows = self._chunk_rows(
+            device,
+            X_transform.shape[0],
+            X_transform.shape[1] * X_transform.dtype.itemsize,
+        )
+        for chunk in rows.slices(chunk_rows):
             data, theta = rows.block(chunk, device)
             projected_parameters = theta - intercept.unsqueeze(0)
             if self.depth_factor:
@@ -722,7 +749,7 @@ class GLMPCA:
             """The cost of the whole matrix, with the gradient summed over chunks."""
             _optimizer.zero_grad()
             total = torch.zeros((), device=device, dtype=torch.float64)
-            for chunk in rows.slices(self.chunk_size):
+            for chunk in rows.slices(self._chunk):
                 data, parameters = rows.block(chunk, device)
                 cost = self._optim_cost(
                     loadings=_loadings,
@@ -929,7 +956,7 @@ class GLMPCA:
         floors = [LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE]
         if self.depth_factor:
             start = torch.empty(n)
-            for chunk in rows.slices(self.chunk_size):
+            for chunk in rows.slices(self._chunk):
                 _, theta = rows.block(chunk, device)
                 start[chunk] = (theta - intercept.detach()).mean(dim=1).cpu()
             depth = ManifoldParameter(start.to(device))
@@ -970,7 +997,7 @@ class GLMPCA:
         the cost of a chunk itself, whose float32 sum the gradients never see.
         """
         total = torch.zeros((), device=device, dtype=torch.float64)
-        for chunk in rows.slices(self.chunk_size):
+        for chunk in rows.slices(self._chunk):
             data, parameters = rows.block(chunk, device)
             total = total + self._optim_cost(
                 loadings,

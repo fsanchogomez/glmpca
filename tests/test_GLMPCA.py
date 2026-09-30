@@ -17,11 +17,14 @@ from glmpca.ExponentialFamily import (
     _n_workers,
 )
 from glmpca.GLMPCA import (
+    DEFAULT_BATCH_SIZE,
     DEPTH_RATE_SCALE,
+    DEVICE_MEMORY_SHARE,
     GLMPCA,
     INTERCEPT_RATE_SCALE,
     LEARNING_RATE_LIMIT,
     PLATEAU_PATIENCE,
+    WORKING_COPIES,
     _fits_in,
     _Rows,
     _to_tensor,
@@ -597,6 +600,42 @@ def test_fit_does_not_change_the_input() -> None:
     GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8).fit(X)
 
     torch.testing.assert_close(X, before)
+
+
+def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> None:
+    model = GLMPCA(N_PC, family="poisson")
+
+    assert model.batch_size == DEFAULT_BATCH_SIZE == 4096
+    assert model.chunk_size is None
+
+
+def test_on_the_cpu_a_pass_takes_the_batch_size_unless_a_chunk_size_is_given() -> None:
+    automatic = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8)
+    automatic.fit(sample(GLMFamily.poisson))
+    given = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8, chunk_size=5)
+    given.fit(sample(GLMFamily.poisson))
+
+    assert automatic._chunk == 8
+    assert automatic.exponential_family.family_params["chunk_size"] == 8
+    assert given._chunk == 5
+    assert given.exponential_family.family_params["chunk_size"] == 5
+
+
+def test_on_cuda_a_pass_takes_the_rows_that_the_free_memory_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    free = 10 * 2**30
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda device=None: (free, 2 * free)
+    )
+    model = GLMPCA(N_PC, family="poisson", batch_size=8)
+    cuda = torch.device("cuda")
+
+    rows = model._chunk_rows(cuda, n_rows=10**9, row_bytes=4 * 5000)
+
+    assert rows == int(DEVICE_MEMORY_SHARE * free) // (WORKING_COPIES * 4 * 5000)
+    assert model._chunk_rows(cuda, n_rows=100, row_bytes=4 * 5000) == 100
+    assert model._chunk_rows(torch.device("cpu"), n_rows=10**9, row_bytes=4) == 8
 
 
 @pytest.mark.parametrize("chunk_size", [0, -1])

@@ -169,8 +169,6 @@ def test_glmpca_passes_every_option_to_the_model(
             "random",
             "--device",
             "cpu",
-            "--chunkSize",
-            "16",
             "--optimizer",
             "adam",
             "-p",
@@ -189,7 +187,7 @@ def test_glmpca_passes_every_option_to_the_model(
     assert model.n_init == 2
     assert model.init == "random"
     assert model.device == "cpu"
-    assert model.chunk_size == 16
+    assert model.chunk_size is None
     assert model.optimizer == "adam"
     assert model.exponential_family.family_params["n_jobs"] == 1
 
