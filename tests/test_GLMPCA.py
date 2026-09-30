@@ -602,6 +602,39 @@ def test_fit_does_not_change_the_input() -> None:
     torch.testing.assert_close(X, before)
 
 
+@pytest.mark.parametrize(("batch_size", "rows"), [(4, 8), (16, 16), (4096, N_CELLS)])
+def test_the_spectral_start_takes_at_least_spectral_rows_cells(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int, rows: int
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.SPECTRAL_ROWS", 8)
+    shapes = []
+    svd = torch.linalg.svd
+
+    def recording_svd(
+        A: torch.Tensor, full_matrices: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        shapes.append(tuple(A.shape))
+        return svd(A, full_matrices=full_matrices)
+
+    monkeypatch.setattr(torch.linalg, "svd", recording_svd)
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=batch_size)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model.fit(sample(GLMFamily.poisson))
+
+    assert shapes == [(rows, N_FEATURES)]
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape == (N_FEATURES, N_PC)
+
+
+def test_fewer_cells_than_components_are_rejected() -> None:
+    model = GLMPCA(N_CELLS + 1, family="poisson", max_iter=1)
+
+    with pytest.raises(ValueError, match=rf"n_pc={N_CELLS + 1} .* has {N_CELLS}\."):
+        model.fit(sample(GLMFamily.poisson))
+
+
 def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> None:
     model = GLMPCA(N_PC, family="poisson")
 
@@ -727,7 +760,9 @@ def test_the_depth_factor_has_its_own_learning_rate() -> None:
     saturated = torch.log(depth_gradient().clip(min=1.0))
 
     optimizer, _, _, depth, _ = model._create_saturated_loading_optim(
-        _Rows(saturated, model.exponential_family, saturated), torch.device("cpu")
+        _Rows(saturated, model.exponential_family, saturated),
+        torch.device("cpu"),
+        batch_size=16,
     )
 
     assert depth is not None

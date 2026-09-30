@@ -40,6 +40,7 @@ LEARNING_RATE_LIMIT = 1e-8
 PLATEAU_PATIENCE = 10
 PLATEAU_THRESHOLD = 1e-4
 DEFAULT_BATCH_SIZE = 4096
+SPECTRAL_ROWS = 4096
 OFFSET_NEWTON_ITERATIONS = 50
 OFFSET_HALVINGS = 30
 OFFSET_TOLERANCE = 1e-6
@@ -313,9 +314,10 @@ class GLMPCA:
         random seeds and starting points. Defaults to 1.
 
     init: str
-        Method to initialize loadings. "spectral" performs SVD on the saturated
-        parameters from a small random batch of the dataset, and "random" performs a
-        random initialization on the Stiefel manifold. Defaults to "spectral".
+        Method to initialize loadings and intercepts. "spectral" performs SVD on
+        the saturated parameters of a batch (max of batch size and 4096) of
+        random cells and "random" performs a random initialization on the
+        Grassmann manifold. Defaults to "spectral".
 
     depth_factor: bool
         Whether to fit an offset for every cell beside the offset of every feature, as
@@ -493,6 +495,13 @@ class GLMPCA:
                 f"A fit needs at least 2 rows (cells), but the input has "
                 f"{X_fit.shape[0]}. Check that the data has cells in rows and "
                 f"features in columns."
+            )
+            raise ValueError(msg)
+        if X_fit.shape[0] < self.n_pc:
+            msg = (
+                f"n_pc={self.n_pc} components need at least {self.n_pc} rows (cells), "
+                f"but the input has {X_fit.shape[0]}. Use n_pc={X_fit.shape[0]} or "
+                f"fewer."
             )
             raise ValueError(msg)
 
@@ -741,7 +750,9 @@ class GLMPCA:
         self.loadings_learning_rates_.append([])
 
         _optimizer, _loadings, _intercept, _depth, _lr_scheduler = (
-            self._create_saturated_loading_optim(rows=rows, device=device)
+            self._init_saturated_loading_optim(
+                rows=rows, device=device, batch_size=batch_size
+            )
         )
         n = rows.shape[0]
 
@@ -882,8 +893,8 @@ class GLMPCA:
 
         return (_loadings, _intercept, _depth)
 
-    def _create_saturated_loading_optim(
-        self, rows: _Rows, device: torch.device
+    def _init_saturated_loading_optim(
+        self, rows: _Rows, device: torch.device, batch_size: int
     ) -> tuple[
         torch.optim.Optimizer,
         torch.Tensor,
@@ -900,6 +911,9 @@ class GLMPCA:
             parameters ($g^{-1}\left(X\right)$), read by blocks of rows.
         device : torch.device
             Device on which the loadings and the intercept are created.
+        batch_size : int
+            The spectral start and the intercept take
+            min(max(SPECTRAL_ROWS, batch_size), n) random cells.
 
         Returns
         -------
@@ -916,10 +930,8 @@ class GLMPCA:
             Scheduler instance.
 
         """
-        # Initialize loadings with spectrum (2**13 as maximum value for SVD to be
-        # relatively fast)
         n, p = rows.shape
-        random_batch_size = min(n, 2**13)
+        random_batch_size = min(max(SPECTRAL_ROWS, batch_size), n)
         random_idx = np.random.choice(
             np.arange(n), replace=False, size=random_batch_size
         )
