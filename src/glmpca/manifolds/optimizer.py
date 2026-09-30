@@ -172,11 +172,14 @@ class RiemannianConjugateGradient(torch.optim.Optimizer):
     to borrow a step size whose meaning does not carry from one problem to the next.
 
     The search needs the objective at trial points, so `step` takes a closure, as
-    `torch.optim.LBFGS` does, and calls it several times per step. **The closure must
-    zero the gradients, evaluate the objective at the current parameters, call
-    `backward()` and return the value.** It must be the whole objective, not a
-    mini-batch: a search along a mini-batch is a search on a different random function
-    at every step, and it tunes the step to that one batch.
+    `torch.optim.LBFGS` does, and calls it several times per step. When the search
+    accepts the last point it evaluated, the gradients of that point are still in
+    `.grad`, so the next `step` starts from them and its value instead of calling the
+    closure again. It does so only while no parameter and no gradient has changed since.
+    **The closure must zero the gradients, evaluate the objective at the current
+    parameters, call `backward()` and return the value.** It must be the whole
+    objective, not a mini-batch: a search along a mini-batch is a search on a different
+    random function at every step, and it tunes the step to that one batch.
 
     Two guards keep the direction usable, both standard for Polak-Ribière: `beta` is
     clipped at zero, and a direction that does not descend is replaced by `-g`.
@@ -214,6 +217,21 @@ class RiemannianConjugateGradient(torch.optim.Optimizer):
         self.previous_slope = 0.0
         self.restarts = 0
         self.evaluations = 0
+        self._probed: tuple[float, float] | None = None
+        self._kept: tuple[float, list[tuple[int, ...]]] | None = None
+
+    def _versions(self) -> list[tuple[int, ...]]:
+        """What identifies the values of every parameter and gradient."""
+        return [
+            (
+                id(point),
+                point._version,
+                id(point.grad),
+                -1 if point.grad is None else point.grad._version,
+            )
+            for group in self.param_groups
+            for point in group["params"]
+        ]
 
     @overload
     def step(self, closure: None = None) -> None: ...
@@ -233,9 +251,13 @@ class RiemannianConjugateGradient(torch.optim.Optimizer):
             )
             raise RuntimeError(msg)
         settings = self.param_groups[0]
-        with torch.enable_grad():
-            value = _as_float(closure())
-        self.evaluations += 1
+        if self._kept is not None and self._kept[1] == self._versions():
+            value = self._kept[0]
+        else:
+            with torch.enable_grad():
+                value = _as_float(closure())
+            self.evaluations += 1
+        self._kept = None
 
         points = [
             point
@@ -248,6 +270,7 @@ class RiemannianConjugateGradient(torch.optim.Optimizer):
 
         directions, slope = self._directions(points, settings["eps"])
         origin = [point.detach().clone() for point in points]
+        self._probed = None
         self.last_step = self._search(
             closure, points, origin, directions, value, slope, settings
         )
@@ -255,6 +278,8 @@ class RiemannianConjugateGradient(torch.optim.Optimizer):
         if self.last_step == 0.0:
             for point in points:
                 self.state[point].clear()
+        elif self._probed is not None and self._probed[0] == self.last_step:
+            self._kept = (self._probed[1], self._versions())
         return value
 
     def _directions(
@@ -320,6 +345,7 @@ class RiemannianConjugateGradient(torch.optim.Optimizer):
             with torch.enable_grad():
                 trial = _as_float(closure())
             self.evaluations += 1
+            self._probed = (step, trial)
             derivative = 0.0
             for point, direction in zip(points, directions, strict=True):
                 manifold = point.manifold

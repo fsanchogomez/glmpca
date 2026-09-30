@@ -312,6 +312,44 @@ def test_every_direction_descends() -> None:
     assert all(product < 0 for product in products), max(products)
 
 
+def test_reusing_the_last_evaluation_changes_nothing_but_the_count() -> None:
+    matrix, target = quadratic_problem()
+    runs = {}
+    for reuse in (True, False):
+        parameter = ManifoldParameter(torch.zeros(matrix.shape[0], 1))
+        optimizer = RiemannianConjugateGradient([parameter])
+        closure = closure_of(optimizer, parameter, matrix, target)
+        costs = []
+        for _ in range(20):
+            if not reuse:
+                with torch.no_grad():
+                    parameter.add_(0.0)
+            costs.append(float(optimizer.step(closure)))
+        runs[reuse] = (parameter.data.clone(), costs, optimizer.evaluations)
+
+    torch.testing.assert_close(runs[True][0], runs[False][0], atol=0, rtol=0)
+    assert runs[True][1] == runs[False][1]
+    assert runs[True][2] < runs[False][2], (runs[True][2], runs[False][2])
+
+
+def test_evaluations_count_every_call_of_the_closure() -> None:
+    matrix, target = quadratic_problem()
+    parameter = ManifoldParameter(torch.zeros(matrix.shape[0], 1))
+    optimizer = RiemannianConjugateGradient([parameter])
+    inner = closure_of(optimizer, parameter, matrix, target)
+    calls = 0
+
+    def closure() -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return inner()
+
+    for _ in range(20):
+        optimizer.step(closure)
+
+    assert optimizer.evaluations == calls
+
+
 def test_a_step_without_a_closure_is_refused() -> None:
     optimizer = RiemannianConjugateGradient([ManifoldParameter(torch.zeros(3))])
 
