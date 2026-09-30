@@ -14,6 +14,7 @@ from glmpca.cli.glmpca import (
     FamilyChoice,
     app,
     log_normalized,
+    nearest_neighbors,
     normalize_processors,
     umap_leiden,
 )
@@ -277,6 +278,62 @@ def test_umap_leiden_finds_separated_groups() -> None:
     assert len(np.unique(clusters)) == 3
     for label in range(3):
         assert len(np.unique(clusters[labels == label])) == 1
+
+
+def test_umap_leiden_gives_the_same_result_at_every_run() -> None:
+    rng = np.random.default_rng(0)
+    coordinates = np.vstack([
+        rng.normal(center, 0.1, size=(30, 2)) for center in (0.0, 5.0, 10.0)
+    ])
+
+    first = umap_leiden(coordinates, n_neighbors=10, resolution=1.0)
+    second = umap_leiden(coordinates, n_neighbors=10, resolution=1.0)
+
+    np.testing.assert_array_equal(first[0], second[0])
+    np.testing.assert_array_equal(first[1], second[1])
+
+
+def test_nearest_neighbors_are_the_brute_force_neighbors() -> None:
+    coordinates = np.random.default_rng(0).normal(size=(200, 5))
+
+    indices, distances = nearest_neighbors(coordinates, n_neighbors=15)
+
+    pairwise = np.linalg.norm(coordinates[:, None] - coordinates[None], axis=2)
+    np.testing.assert_array_equal(indices, np.argsort(pairwise, axis=1)[:, :15])
+    np.testing.assert_allclose(distances, np.sort(pairwise, axis=1)[:, :15], atol=1e-6)
+    np.testing.assert_array_equal(distances[:, 0], 0)
+
+
+def test_nearest_neighbors_search_approximately_above_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("glmpca.cli.glmpca.EXACT_NEIGHBORS_LIMIT", 100)
+    coordinates = np.random.default_rng(0).normal(size=(300, 5))
+
+    indices, distances = nearest_neighbors(coordinates, n_neighbors=15)
+
+    assert indices.shape == distances.shape == (300, 15)
+    np.testing.assert_array_equal(indices[:, 0], np.arange(300))
+    assert np.all(np.diff(distances, axis=1) >= 0)
+
+
+def test_umap_leiden_equals_scanpy() -> None:
+    sc = pytest.importorskip("scanpy")
+    rng = np.random.default_rng(0)
+    centers = rng.normal(0, 4, size=(4, 10))
+    coordinates = (
+        centers[rng.integers(0, 4, 500)] + rng.normal(size=(500, 10))
+    ).astype(np.float32)
+    adata = ad.AnnData(np.zeros((500, 1), dtype=np.float32))
+    adata.obsm["X_glmPCA"] = coordinates
+
+    sc.pp.neighbors(adata, use_rep="X_glmPCA", n_neighbors=15)
+    sc.tl.umap(adata)
+    sc.tl.leiden(adata, flavor="igraph", directed=False, n_iterations=-1)
+    embedding, clusters = umap_leiden(coordinates, n_neighbors=15, resolution=1.0)
+
+    np.testing.assert_array_equal(embedding, adata.obsm["X_umap"])
+    np.testing.assert_array_equal(clusters.astype(str), adata.obs["leiden"].to_numpy())
 
 
 @pytest.mark.parametrize(

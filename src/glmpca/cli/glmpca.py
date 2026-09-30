@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import sys
 import warnings
 from enum import Enum
@@ -57,6 +58,8 @@ _OTHER = "Other options"
 AVAILABLE_PROCESSORS = _n_workers(-1)
 CM_PER_INCH = 2.54
 LOG_NORMALIZE_TOTAL = 10_000
+SEED = 0
+EXACT_NEIGHBORS_LIMIT = 8192
 
 
 class Init(str, Enum):
@@ -159,27 +162,130 @@ def fail(message: str) -> typer.Exit:
     return typer.Exit(code=1)
 
 
+def nearest_neighbors(
+    coordinates: np.ndarray, n_neighbors: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """The indices and distances of the `n_neighbors` nearest cells, each cell first.
+
+    As `scanpy.pp.neighbors`: exact below EXACT_NEIGHBORS_LIMIT cells, and by
+    pynndescent, with the trees and iterations of umap-learn, above it. The distance
+    of a cell to itself is set to 0, as scanpy does, and not left at the rounding
+    error of the exact search, which UMAP would take for its nearest neighbor.
+    """
+    n_cells = coordinates.shape[0]
+    if n_neighbors > n_cells:
+        n_neighbors = 1 + int(0.5 * n_cells)
+    if n_cells < EXACT_NEIGHBORS_LIMIT:
+        from sklearn.neighbors import KNeighborsTransformer  # noqa: PLC0415
+
+        search = KNeighborsTransformer(
+            algorithm="brute", n_jobs=1, n_neighbors=min(n_cells - 1, n_neighbors)
+        )
+    else:
+        from pynndescent import PyNNDescentTransformer  # noqa: PLC0415
+
+        search = PyNNDescentTransformer(
+            n_neighbors=n_neighbors,
+            metric="euclidean",
+            random_state=SEED,
+            n_jobs=1,
+            n_trees=min(64, 5 + round(n_cells**0.5 / 20.0)),
+            n_iters=max(5, round(np.log2(n_cells))),
+        )
+    distances = sparse.csr_matrix(search.fit_transform(coordinates))
+    width = distances.getnnz(axis=1)
+    if not np.all(width == width[0]):
+        msg = "The neighbor search gave a different number of neighbors per cell."
+        raise ValueError(msg)
+    indices = distances.indices.reshape(n_cells, width[0])
+    values = distances.data.reshape(n_cells, width[0])
+    values[indices == np.arange(n_cells)[:, None]] = 0
+    if not (indices[:, 0] == np.arange(n_cells)).any():
+        indices = np.hstack([np.arange(n_cells)[:, None], indices])
+        values = np.hstack([np.zeros((n_cells, 1)), values])
+    return indices[:, :n_neighbors], values[:, :n_neighbors]
+
+
+def neighbor_graph(coordinates: np.ndarray, n_neighbors: int) -> sparse.csr_matrix:
+    """The UMAP connectivities of the cells, as `scanpy.pp.neighbors` computes them."""
+    from umap.umap_ import fuzzy_simplicial_set  # noqa: PLC0415
+
+    indices, distances = nearest_neighbors(coordinates, n_neighbors)
+    graph, _, _ = fuzzy_simplicial_set(
+        sparse.coo_matrix((coordinates.shape[0], 1)),
+        indices.shape[1],
+        None,
+        None,
+        knn_indices=indices,
+        knn_dists=distances,
+        set_op_mix_ratio=1.0,
+        local_connectivity=1.0,
+    )
+    return graph.tocsr()
+
+
+class _IgraphRandom:
+    """The random numbers that `scanpy.tl.leiden` gives igraph for a seed."""
+
+    def __init__(self, seed: int) -> None:
+        self._state = np.random.RandomState(seed)
+
+    def getrandbits(self, k: int) -> int:
+        return self._state.tomaxint() & ((1 << k) - 1)
+
+    def randint(self, a: int, b: int) -> int:
+        return self._state.randint(a, b + 1)
+
+    def __getattr__(self, attr: str) -> object:
+        return getattr(self._state, "normal" if attr == "gauss" else attr)
+
+
 def umap_leiden(
     coordinates: np.ndarray, n_neighbors: int, resolution: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    import umap  # noqa: PLC0415
+    """The UMAP and the Leiden clusters of `scanpy.tl.umap` and `scanpy.tl.leiden`.
 
-    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=0.1, spread=5)
-    embedding = reducer.fit_transform(coordinates)
+    Both read one neighbor graph, as in scanpy, and Leiden is its igraph flavor.
+    """
+    from umap.umap_ import find_ab_params, simplicial_set_embedding  # noqa: PLC0415
 
-    graph = reducer.graph_.tocoo()
-    upper = graph.row < graph.col
+    graph = neighbor_graph(coordinates, n_neighbors)
+    a, b = find_ab_params(1.0, 0.5)
+    embedding, _ = simplicial_set_embedding(
+        data=coordinates,
+        graph=graph.tocoo(copy=True),
+        n_components=2,
+        initial_alpha=1.0,
+        a=a,
+        b=b,
+        gamma=1.0,
+        negative_sample_rate=5,
+        n_epochs=500 if graph.shape[0] <= 10_000 else 200,
+        init="spectral",
+        random_state=np.random.RandomState(SEED),
+        metric="euclidean",
+        metric_kwds={},
+        densmap=False,
+        densmap_kwds={},
+        output_dens=False,
+    )
+
+    sources, targets = graph.nonzero()
     network = igraph.Graph(
         n=graph.shape[0],
-        edges=np.column_stack((graph.row[upper], graph.col[upper])).tolist(),
-        edge_attrs={"weight": graph.data[upper].tolist()},
+        edges=list(zip(sources, targets, strict=True)),
+        edge_attrs={"weight": np.asarray(graph[sources, targets]).ravel().tolist()},
     )
-    partition = network.community_leiden(
-        objective_function="modularity",
-        weights="weight",
-        resolution=resolution,
-        n_iterations=-1,
-    )
+    igraph.set_random_number_generator(_IgraphRandom(SEED))
+    try:
+        partition = network.community_leiden(
+            objective_function="modularity",
+            weights="weight",
+            resolution=resolution,
+            n_iterations=-1,
+        )
+    finally:
+        igraph.set_random_number_generator(random)
     return np.asarray(embedding), np.asarray(partition.membership)
 
 
@@ -535,7 +641,7 @@ def main(
                 "clusters. Only used with ``--outFileUMAP``."
             ),
         ),
-    ] = 30,
+    ] = 15,
     cluster_resolution: Annotated[
         float,
         typer.Option(
