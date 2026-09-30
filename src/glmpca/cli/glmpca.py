@@ -617,6 +617,20 @@ def main(
             ),
         ),
     ] = False,
+    torch_compile: Annotated[
+        bool,
+        typer.Option(
+            "--compile",
+            rich_help_panel=_OPTIMISATION,
+            help=(
+                "Compile the cost of the training loop with torch.compile. A pass "
+                "over the matrix takes about 30% less time, for about 10 s of "
+                "compilation at the start, so it pays only in a long fit. It needs a "
+                "C++ compiler on the CPU, and Triton on a GPU. It does not apply to "
+                "``-gf fast_poisson``."
+            ),
+        ),
+    ] = False,
     # Clustering options
     n_neighbors: Annotated[
         int,
@@ -770,6 +784,7 @@ def main(
             init=init,
             optimizer=optimizer,
             keep_sparse=keep_sparse,
+            torch_compile=torch_compile,
             depth_factor=depth_factor,
             log_normalize=log_normalize,
             no_accelerate=no_accelerate,
@@ -820,6 +835,7 @@ def main(
                 device=device,
                 keep_sparse=keep_sparse,
                 depth_factor=depth_factor,
+                compile=torch_compile,
             ),
             fit_data,
         )
@@ -840,6 +856,7 @@ def main(
             "init": init.value,
             "optimizer": optimizer.value,
             "keep_sparse": keep_sparse,
+            "compile": torch_compile,
             "depth_factor": depth_factor,
             "log_normalize": log_normalize,
             "accelerate": not no_accelerate,

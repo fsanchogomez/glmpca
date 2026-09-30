@@ -203,6 +203,7 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
+        cost: Callable[..., torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma
@@ -635,6 +636,48 @@ def test_fewer_cells_than_components_are_rejected() -> None:
         model.fit(sample(GLMFamily.poisson))
 
 
+@pytest.mark.parametrize("compile_cost", [False, True])
+def test_compile_compiles_the_cost_of_the_training_loop(
+    monkeypatch: pytest.MonkeyPatch, compile_cost: bool
+) -> None:
+    compiled = []
+
+    def recording_compile(
+        function: Callable[..., torch.Tensor], *, dynamic: bool
+    ) -> Callable[..., torch.Tensor]:
+        compiled.append((function, dynamic))
+        return function
+
+    monkeypatch.setattr(torch, "compile", recording_compile)
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=1, batch_size=16, compile=compile_cost
+    )
+    model.fit(sample(GLMFamily.poisson))
+
+    assert compiled == ([(model._optim_cost, False)] if compile_cost else [])
+
+
+def test_a_compiled_fit_equals_an_eager_fit() -> None:
+    likelihoods = []
+    for compile_cost in (False, True):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = GLMPCA(
+            N_PC,
+            family="poisson",
+            optimizer="cg",
+            depth_factor=True,
+            max_iter=3,
+            compile=compile_cost,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(sample(GLMFamily.poisson))
+        likelihoods.append(model.log_likelihood_)
+
+    assert likelihoods[1] == pytest.approx(likelihoods[0], rel=1e-6)
+
+
 def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> None:
     model = GLMPCA(N_PC, family="poisson")
 
@@ -759,7 +802,7 @@ def test_the_depth_factor_has_its_own_learning_rate() -> None:
     model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16, depth_factor=True)
     saturated = torch.log(depth_gradient().clip(min=1.0))
 
-    optimizer, _, _, depth, _ = model._create_saturated_loading_optim(
+    optimizer, _, _, depth, _ = model._init_saturated_loading_optim(
         _Rows(saturated, model.exponential_family, saturated),
         torch.device("cpu"),
         batch_size=16,

@@ -140,7 +140,7 @@ def test_the_fitted_loadings_live_on_the_grassmann_manifold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifolds: list[object] = []
-    original = GLMPCA._create_saturated_loading_optim
+    original = GLMPCA._init_saturated_loading_optim
 
     def recording(self: GLMPCA, *arguments: object, **keywords: object) -> object:
         result = original(self, *arguments, **keywords)  # ty: ignore[invalid-argument-type]
@@ -149,7 +149,7 @@ def test_the_fitted_loadings_live_on_the_grassmann_manifold(
         manifolds.append(loadings.manifold)
         return result
 
-    monkeypatch.setattr(GLMPCA, "_create_saturated_loading_optim", recording)
+    monkeypatch.setattr(GLMPCA, "_init_saturated_loading_optim", recording)
     counts = torch.poisson(torch.full((40, 12), 3.0))
 
     for init in ("spectral", "random"):

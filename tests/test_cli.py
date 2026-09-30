@@ -98,6 +98,7 @@ def test_glmpca_writes_the_results_to_the_output_file(
     assert params["max_iter"] == 2
     assert params["batch_size"] == 8
     assert params["init"] == "spectral"
+    assert not params["compile"]
     assert "X_umap" not in adata.obsm
     assert "leiden" not in adata.obs
     assert not list(tmp_path.glob("*.tsv"))
@@ -537,6 +538,28 @@ def test_no_log_normalize_by_default(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert not ad.read_h5ad(out_path).uns["glmPCA"]["params"]["log_normalize"]
+
+
+def test_the_compile_flag_reaches_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models: list[GLMPCA] = []
+    original_fit = GLMPCA.fit
+
+    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
+        models.append(self)
+        return original_fit(self, X)
+
+    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    monkeypatch.setattr(torch, "compile", lambda function, **_: function)
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--compile")
+
+    assert result.exit_code == 0, result.output
+    (model,) = models
+    assert model.compile
+    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["compile"]
 
 
 def test_the_penalty_reaches_fast_poisson(tmp_path: Path) -> None:

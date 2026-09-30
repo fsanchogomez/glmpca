@@ -24,7 +24,7 @@ from .manifolds import (
 from .sparse import SparseRows
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 _OPTIMIZERS = {
     "adagrad": RiemannianAdagrad,
@@ -373,6 +373,12 @@ class GLMPCA:
         whose data has zeros take it: "gaussian", "poisson", "negative_binomial" and
         "bernoulli". Defaults to False.
 
+    compile: bool
+        Whether to compile the cost of the training loop with `torch.compile`, which
+        joins its element-wise operations. This speeds up the training iterations in
+        for a fixed compilation time. Recommended for long fits (>100 iters).
+        It needs a C++ compiler on the CPU, and Triton on CUDA. Defaults to False.
+
     """
 
     def __init__(
@@ -392,6 +398,7 @@ class GLMPCA:
         chunk_size: int | None = None,
         optimizer: Literal["adagrad", "adam", "cg"] = "adagrad",
         keep_sparse: bool = False,
+        compile: bool = False,
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -410,6 +417,7 @@ class GLMPCA:
         self._chunk = batch_size if chunk_size is None else chunk_size
         self.optimizer = optimizer
         self.keep_sparse = keep_sparse
+        self.compile = compile
 
         self.saturated_loadings_: torch.Tensor | None = None
         # Log-likelihood of the fit, the real one, with the base measure
@@ -564,12 +572,20 @@ class GLMPCA:
         self.loadings_learning_scores_ = []
         self.loadings_learning_rates_ = []
 
+        cost = (
+            torch.compile(self._optim_cost, dynamic=False)
+            if self.compile
+            else self._optim_cost
+        )
+
         # Use saturated parameters to find loadings by projected gradient descent
         runs = []
         for _ in range(self.n_init):
             self.learning_rate_ = self.initial_learning_rate_
             runs.append(
-                self._saturated_loading_iter(rows, batch_size, device, log_base_measure)
+                self._saturated_loading_iter(
+                    rows, batch_size, device, log_base_measure, cost
+                )
             )
 
         runs = [
@@ -719,6 +735,7 @@ class GLMPCA:
         batch_size: int,
         device: torch.device,
         log_base_measure: torch.Tensor,
+        cost: Callable[..., torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         r"""Computes the loadings solution of the GLM-PCA optimisation problem.
 
@@ -733,6 +750,8 @@ class GLMPCA:
             Device used to train.
         log_base_measure : torch.Tensor
             `log h(x)` of every cell, summed over its features.
+        cost : Callable
+            `_optim_cost`, or its compiled form when compile is on.
 
         Returns
         -------
@@ -762,15 +781,15 @@ class GLMPCA:
             total = torch.zeros((), device=device, dtype=torch.float64)
             for chunk in rows.slices(self._chunk):
                 data, parameters = rows.block(chunk, device)
-                cost = self._optim_cost(
+                chunk_cost = cost(
                     loadings=_loadings,
                     intercept=_intercept,
                     batch_data=data,
                     batch_parameters=parameters,
                     batch_depth=None if _depth is None else _depth[chunk],
                 )
-                cost.backward()
-                total += cost.detach()
+                chunk_cost.backward()
+                total += chunk_cost.detach()
             return float(total)
 
         # Run epoch in a for loop
@@ -812,7 +831,7 @@ class GLMPCA:
                     order = torch.randperm(n)[: n - n % batch_size]
                     for batch in order.split(batch_size):
                         batch_data, batch_parameters = rows.block(batch, device)
-                        cost_step = self._optim_cost(
+                        cost_step = cost(
                             loadings=_loadings,
                             intercept=_intercept,
                             batch_data=batch_data,
@@ -876,6 +895,7 @@ class GLMPCA:
                         batch_size=batch_size,
                         device=device,
                         log_base_measure=log_base_measure,
+                        cost=cost,
                     )
 
                 if (
