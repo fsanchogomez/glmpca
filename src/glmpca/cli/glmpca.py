@@ -19,7 +19,6 @@ from matplotlib.figure import Figure
 from scipy import sparse
 
 from glmpca.ExponentialFamily import _n_workers
-from glmpca.fast_poisson import DEFAULT_PENALTY, FastPoissonPCA
 from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA, WEIGHTED_FAMILIES
 
 DESCRIPTION = (
@@ -76,9 +75,9 @@ class Optimizer(str, Enum):
 
 
 class FamilyChoice(str, Enum):
-    """Every family of GLMPCA, and the direct Poisson fit of fast_poisson.
+    """Every family of GLMPCA.
 
-    A test keeps this list equal to GLMFamily plus fast_poisson.
+    A test keeps this list equal to GLMFamily.
     """
 
     gaussian = "gaussian"
@@ -91,7 +90,6 @@ class FamilyChoice(str, Enum):
     sigmoid_beta = "sigmoid_beta"
     signac_lsi = "signac_lsi"
     gensim_lsi = "gensim_lsi"
-    fast_poisson = "fast_poisson"
 
 
 class PlotFileFormat(str, Enum):
@@ -344,43 +342,6 @@ def run_glmpca(
     )
 
 
-def run_fast_poisson(
-    model: FastPoissonPCA, adata: ad.AnnData
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-    """Fits the counts directly by Alternating Poisson Regression."""
-    logging.info(
-        "fast_poisson fits the counts directly, so the optimisation options "
-        "(--learningRate, --batchSize, --gamma, --nInit, --init) do not apply. Its "
-        "model holds a size factor for every cell, which is what --depthFactor "
-        "turns on for the other families."
-    )
-    if not model.accelerate:
-        logging.info("DAAREM acceleration is off, as --noDaarem was given.")
-    try:
-        model.fit(adata)
-    except ValueError as exc:
-        raise fail(str(exc)) from exc
-
-    scores, loadings, intercept = model.scores_, model.loadings_, model.intercept_
-    assert scores is not None
-    assert loadings is not None
-    assert intercept is not None
-    assert model.size_factors_ is not None
-    logging.info(
-        "fast_poisson converged in %d passes, log-likelihood %.1f.",
-        len(model.log_likelihoods_),
-        model.log_likelihoods_[-1],
-    )
-    # The size factor of a cell is the same quantity as the depth factor of the other
-    # families, so it goes to the same column.
-    return (
-        scores.numpy(),
-        loadings.numpy(),
-        intercept.numpy(),
-        model.size_factors_.numpy(),
-    )
-
-
 @app.callback(invoke_without_command=True)
 def main(
     # Input / Output options
@@ -452,10 +413,8 @@ def main(
                 "[bold yellow]lognormal[/bold yellow], "
                 "[bold yellow]sigmoid_beta[/bold yellow], "
                 "[bold yellow]negative_binomial[/bold yellow], "
-                "[bold yellow]fast_poisson[/bold yellow].\n\n"
-                "[bold yellow]fast_poisson[/bold yellow] fits the counts directly by "
-                "Alternating Poisson Regression (Weine et al. 2024) instead of the "
-                "saturated parameters, and ignores the optimisation options."
+                "[bold yellow]signac_lsi[/bold yellow], "
+                "[bold yellow]gensim_lsi[/bold yellow]."
             ),
         ),
     ] = FamilyChoice.poisson,
@@ -547,34 +506,6 @@ def main(
             ),
         ),
     ] = Optimizer.adagrad,
-    penalty: Annotated[
-        float,
-        typer.Option(
-            "--penalty",
-            rich_help_panel=_GLMPCA,
-            help=(
-                "Weight of the L2 penalty on the components of ``-gf fast_poisson``. "
-                "Without it the fit can diverge on sparse counts: components chase "
-                "patterns of zeros towards a rate of 0, the likelihood keeps rising, "
-                "and the embedding collapses onto a few cells. 0 turns it off. It "
-                "does not apply to the other families."
-            ),
-        ),
-    ] = DEFAULT_PENALTY,
-    no_accelerate: Annotated[
-        bool,
-        typer.Option(
-            "--noDaarem",
-            rich_help_panel=_GLMPCA,
-            help=(
-                "Turn off the DAAREM acceleration of ``-gf fast_poisson``, which runs "
-                "the plain algorithm of the paper. The acceleration reaches a given "
-                "log-likelihood in fewer passes, at the cost of one extra pass over an "
-                "n by p matrix and a history of 2 x 5 x (n + p) x (nPrinComps + 1) "
-                "numbers. It does not apply to the other families."
-            ),
-        ),
-    ] = False,
     depth_factor: Annotated[
         bool,
         typer.Option(
@@ -582,10 +513,10 @@ def main(
             rich_help_panel=_GLMPCA,
             help=(
                 "Fit an offset for every cell, off by default. The model then holds a "
-                "term for the depth of a cell beside the term for every feature, as "
-                "``-gf fast_poisson`` always does, so a component does not have to "
-                "carry the depth. It has its own learning rate, 1% of "
-                "``--learningRate``, the same as the per-feature intercept. It is an "
+                "term for the depth of a cell beside the term for every feature, so a "
+                "component does not have to carry the depth. It has its own learning "
+                "rate, 1% of ``--learningRate``, the same as the per-feature "
+                "intercept. It is an "
                 "exact size factor for ``poisson``, ``negative_binomial``, "
                 "``lognormal`` and ``gamma``, whose parameter is a log mean; for the "
                 "other families it is a plain offset of a cell. For ``signac_lsi`` and "
@@ -634,8 +565,7 @@ def main(
                 "Compile the cost of the training loop with torch.compile. A pass "
                 "over the matrix takes about 30% less time, for about 10 s of "
                 "compilation at the start, so it pays only in a long fit. It needs a "
-                "C++ compiler on the CPU, and Triton on a GPU. It does not apply to "
-                "``-gf fast_poisson``."
+                "C++ compiler on the CPU, and Triton on a GPU."
             ),
         ),
     ] = False,
@@ -795,8 +725,6 @@ def main(
             torch_compile=torch_compile,
             depth_factor=depth_factor,
             log_normalize=log_normalize,
-            no_accelerate=no_accelerate,
-            penalty=penalty,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
             cluster_resolution=cluster_resolution,
@@ -824,42 +752,30 @@ def main(
 
     dispersion = None
     depth_components = None
-    if glmpca_family is FamilyChoice.fast_poisson:
-        scores, loadings, intercept, depth = run_fast_poisson(
-            FastPoissonPCA(
-                n_pc=n_prin_comps,
-                max_iter=max_iter,
-                device=device,
-                accelerate=not no_accelerate,
-                penalty=penalty,
-            ),
-            fit_data,
-        )
-    else:
-        model = GLMPCA(
-            n_pc=n_prin_comps,
-            family=glmpca_family.value,
-            max_iter=max_iter,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            gamma=gamma,
-            n_init=n_init,
-            init=init.value,
-            optimizer=optimizer.value,
-            n_jobs=number_of_processors,
-            device=device,
-            keep_sparse=keep_sparse,
-            depth_factor=depth_factor,
-            compile=torch_compile,
-        )
-        scores, loadings, intercept, depth = run_glmpca(model, fit_data)
-        if glmpca_family is FamilyChoice.negative_binomial:
-            dispersion = model.exponential_family.family_params["nu"].cpu().numpy()
-        if model.depth_correlations_ is not None:
-            depth_components = {
-                "depth_correlations": model.depth_correlations_,
-                "n_dropped_components": model.n_dropped_components_,
-            }
+    model = GLMPCA(
+        n_pc=n_prin_comps,
+        family=glmpca_family.value,
+        max_iter=max_iter,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        gamma=gamma,
+        n_init=n_init,
+        init=init.value,
+        optimizer=optimizer.value,
+        n_jobs=number_of_processors,
+        device=device,
+        keep_sparse=keep_sparse,
+        depth_factor=depth_factor,
+        compile=torch_compile,
+    )
+    scores, loadings, intercept, depth = run_glmpca(model, fit_data)
+    if glmpca_family is FamilyChoice.negative_binomial:
+        dispersion = model.exponential_family.family_params["nu"].cpu().numpy()
+    if model.depth_correlations_ is not None:
+        depth_components = {
+            "depth_correlations": model.depth_correlations_,
+            "n_dropped_components": model.n_dropped_components_,
+        }
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
     adata.var["glmPCA_intercept"] = intercept
@@ -882,8 +798,6 @@ def main(
             "compile": torch_compile,
             "depth_factor": depth_factor,
             "log_normalize": log_normalize,
-            "accelerate": not no_accelerate,
-            "penalty": penalty,
         },
     }
     if depth_components is not None:

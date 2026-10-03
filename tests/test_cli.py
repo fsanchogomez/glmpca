@@ -370,37 +370,10 @@ def test_glmpca_prints_the_help() -> None:
     assert "--outFileUMAP" in result.output
 
 
-def test_the_family_choices_are_the_library_families_plus_fast_poisson() -> None:
+def test_the_family_choices_are_the_library_families() -> None:
     assert {choice.value for choice in FamilyChoice} == {
         family.value for family in GLMFamily
-    } | {"fast_poisson"}
-
-
-def test_glmpca_runs_fast_poisson(tmp_path: Path) -> None:
-    counts = (
-        np.random
-        .default_rng(0)
-        .poisson(3.0, size=(N_CELLS, N_FEATURES))
-        .astype(np.float32)
-    )
-    out_path = tmp_path / "out.h5ad"
-
-    result = run(
-        write_input(tmp_path, counts),
-        out_path,
-        "-gf",
-        "fast_poisson",
-        "--maxIter",
-        "20",
-    )
-
-    assert result.exit_code == 0, result.output
-    adata = ad.read_h5ad(out_path)
-    assert adata.obsm["X_glmPCA"].shape == (N_CELLS, N_PC)
-    assert adata.varm["glmPCA_loadings"].shape == (N_FEATURES, N_PC)
-    assert adata.var["glmPCA_intercept"].shape == (N_FEATURES,)
-    assert adata.uns["glmPCA"]["params"]["family"] == "fast_poisson"
-    assert adata.uns["glmPCA"]["params"]["accelerate"]
+    }
 
 
 def test_the_depth_factor_is_written_to_obs(tmp_path: Path) -> None:
@@ -412,23 +385,6 @@ def test_the_depth_factor_is_written_to_obs(tmp_path: Path) -> None:
     adata = ad.read_h5ad(out_path)
     assert adata.obs["glmPCA_depth"].shape == (N_CELLS,)
     assert np.all(np.isfinite(adata.obs["glmPCA_depth"].to_numpy()))
-
-
-def test_fast_poisson_writes_its_size_factor_to_the_same_column(
-    tmp_path: Path,
-) -> None:
-    out_path = tmp_path / "out.h5ad"
-
-    result = run(
-        write_input(tmp_path, poisson_counts()),
-        out_path,
-        "-gf",
-        "fast_poisson",
-    )
-
-    assert result.exit_code == 0, result.output
-    adata = ad.read_h5ad(out_path)
-    assert adata.obs["glmPCA_depth"].shape == (N_CELLS,)
 
 
 def test_no_depth_factor_by_default_leaves_the_column_out(tmp_path: Path) -> None:
@@ -642,44 +598,3 @@ def _lsi_idf(family: str, counts: np.ndarray) -> np.ndarray:
         return counts.shape[0] / np.maximum(counts.sum(axis=0), 1.0)
     holders = (counts > 0).sum(axis=0)
     return np.where(holders > 0, np.log2(counts.shape[0] / np.maximum(holders, 1)), 0)
-
-
-def test_the_penalty_reaches_fast_poisson(tmp_path: Path) -> None:
-    out_path = tmp_path / "out.h5ad"
-
-    result = run(
-        write_input(tmp_path, poisson_counts()),
-        out_path,
-        "-gf",
-        "fast_poisson",
-        "--penalty",
-        "3.5",
-    )
-
-    assert result.exit_code == 0, result.output
-    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["penalty"] == 3.5
-
-
-def test_no_accelerate_turns_the_acceleration_off(tmp_path: Path) -> None:
-    counts = (
-        np.random
-        .default_rng(0)
-        .poisson(3.0, size=(N_CELLS, N_FEATURES))
-        .astype(np.float32)
-    )
-    out_path = tmp_path / "out.h5ad"
-
-    result = run(
-        write_input(tmp_path, counts),
-        out_path,
-        "-gf",
-        "fast_poisson",
-        "--maxIter",
-        "20",
-        "--noDaarem",
-    )
-
-    assert result.exit_code == 0, result.output
-    adata = ad.read_h5ad(out_path)
-    assert adata.obsm["X_glmPCA"].shape == (N_CELLS, N_PC)
-    assert not adata.uns["glmPCA"]["params"]["accelerate"]

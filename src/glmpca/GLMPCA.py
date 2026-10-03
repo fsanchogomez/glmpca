@@ -332,8 +332,8 @@ class GLMPCA:
         Grassmann manifold. Defaults to "spectral".
 
     depth_factor: bool
-        Whether to fit an offset for every cell beside the offset of every feature, as
-        `fast_poisson` does for its size factor. The saturated parameters are centered
+        Whether to fit an offset for every cell beside the offset of every feature, a
+        size factor of the cell. The saturated parameters are centered
         by both offsets before the projection, so a component never has to carry the
         depth of a cell. It has its own learning rate, DEPTH_RATE_SCALE of
         learning_rate, as the intercept does, and `transform` gives an unseen cell the
