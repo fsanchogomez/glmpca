@@ -32,6 +32,8 @@ DESCRIPTION = (
     '* ``var["glmPCA_intercept"]``: the intercept of the features.\n'
     '* ``obs["glmPCA_depth"]``: the depth factor of the cells, present with '
     "``--depthFactor``.\n"
+    '* ``var["MLE_dispersion"]``: the dispersion of the features, fitted by maximum '
+    "likelihood, present with ``-gf negative_binomial``.\n"
     '* ``uns["glmPCA"]``: the parameters of the fit.\n\n'
     "If ``--outFileUMAP`` is given, ``glmpca`` also computes a 2D projection (UMAP) "
     "and Leiden clusters of the cells from the reduction. It stores them in "
@@ -808,6 +810,7 @@ def main(
         raise fail(msg)
     fit_data = ad.AnnData(log_normalized(adata.X)) if log_normalize else adata
 
+    dispersion = None
     if glmpca_family is FamilyChoice.fast_poisson:
         scores, loadings, intercept, depth = run_fast_poisson(
             FastPoissonPCA(
@@ -820,30 +823,32 @@ def main(
             fit_data,
         )
     else:
-        scores, loadings, intercept, depth = run_glmpca(
-            GLMPCA(
-                n_pc=n_prin_comps,
-                family=glmpca_family.value,
-                max_iter=max_iter,
-                learning_rate=learning_rate,
-                batch_size=batch_size,
-                gamma=gamma,
-                n_init=n_init,
-                init=init.value,
-                optimizer=optimizer.value,
-                n_jobs=number_of_processors,
-                device=device,
-                keep_sparse=keep_sparse,
-                depth_factor=depth_factor,
-                compile=torch_compile,
-            ),
-            fit_data,
+        model = GLMPCA(
+            n_pc=n_prin_comps,
+            family=glmpca_family.value,
+            max_iter=max_iter,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            gamma=gamma,
+            n_init=n_init,
+            init=init.value,
+            optimizer=optimizer.value,
+            n_jobs=number_of_processors,
+            device=device,
+            keep_sparse=keep_sparse,
+            depth_factor=depth_factor,
+            compile=torch_compile,
         )
+        scores, loadings, intercept, depth = run_glmpca(model, fit_data)
+        if glmpca_family is FamilyChoice.negative_binomial:
+            dispersion = model.exponential_family.family_params["nu"].cpu().numpy()
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
     adata.var["glmPCA_intercept"] = intercept
     if depth is not None:
         adata.obs["glmPCA_depth"] = depth
+    if dispersion is not None:
+        adata.var["MLE_dispersion"] = dispersion
     adata.uns["glmPCA"] = {
         "params": {
             "n_pc": n_prin_comps,

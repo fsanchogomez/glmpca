@@ -18,7 +18,7 @@ from glmpca.cli.glmpca import (
     normalize_processors,
     umap_leiden,
 )
-from glmpca.ExponentialFamily import Gaussian, GLMFamily
+from glmpca.ExponentialFamily import Gaussian, GLMFamily, NegativeBinomial
 from glmpca.GLMPCA import GLMPCA
 from scipy import sparse
 from typer.testing import CliRunner
@@ -560,6 +560,31 @@ def test_the_compile_flag_reaches_the_model(
     (model,) = models
     assert model.compile
     assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["compile"]
+
+
+def test_the_negative_binomial_writes_its_mle_dispersion_to_var(
+    tmp_path: Path,
+) -> None:
+    counts = poisson_counts()
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, counts), out_path, "-gf", "negative_binomial")
+
+    assert result.exit_code == 0, result.output
+    family = NegativeBinomial()
+    family.initialize_family_parameters(torch.from_numpy(counts))
+    np.testing.assert_allclose(
+        ad.read_h5ad(out_path).var["MLE_dispersion"], family.family_params["nu"]
+    )
+
+
+def test_other_families_write_no_dispersion(tmp_path: Path) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path)
+
+    assert result.exit_code == 0, result.output
+    assert "MLE_dispersion" not in ad.read_h5ad(out_path).var
 
 
 def test_the_penalty_reaches_fast_poisson(tmp_path: Path) -> None:
