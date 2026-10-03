@@ -11,7 +11,7 @@ import scipy
 import torch
 from tqdm.auto import tqdm
 
-MIN_DISPERSION = 1e-3
+MIN_DISPERSION = 1e-6
 """Lower end of the search for the dispersion of a feature."""
 
 NEWTON_ITERATIONS = 30
