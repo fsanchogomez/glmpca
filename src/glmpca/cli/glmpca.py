@@ -20,7 +20,7 @@ from scipy import sparse
 
 from glmpca.ExponentialFamily import _n_workers
 from glmpca.fast_poisson import DEFAULT_PENALTY, FastPoissonPCA
-from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA
+from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA, WEIGHTED_FAMILIES
 
 DESCRIPTION = (
     "Reduce the dimensionality of a cell-by-feature matrix with GLM-PCA.\n\n"
@@ -89,6 +89,8 @@ class FamilyChoice(str, Enum):
     gamma = "gamma"
     lognormal = "lognormal"
     sigmoid_beta = "sigmoid_beta"
+    signac_lsi = "signac_lsi"
+    gensim_lsi = "gensim_lsi"
     fast_poisson = "fast_poisson"
 
 
@@ -586,7 +588,11 @@ def main(
                 "``--learningRate``, the same as the per-feature intercept. It is an "
                 "exact size factor for ``poisson``, ``negative_binomial``, "
                 "``lognormal`` and ``gamma``, whose parameter is a log mean; for the "
-                "other families it is a plain offset of a cell."
+                "other families it is a plain offset of a cell. For ``signac_lsi`` and "
+                "``gensim_lsi`` it drops every component whose scores follow the depth "
+                "of the cells (|Spearman rho| above 0.75), so fewer than "
+                "``--nPrinComps`` components can be left; the number dropped is "
+                'reported at the end and stored in ``uns["glmPCA"]``.'
             ),
         ),
     ] = False,
@@ -808,9 +814,16 @@ def main(
     if adata.X is None:
         msg = f"'{input}' has no matrix in .X."
         raise fail(msg)
+    if log_normalize and glmpca_family.value in WEIGHTED_FAMILIES:
+        logging.warning(
+            "--logNormalize is ignored for -gf %s, which weighs the raw counts itself.",
+            glmpca_family.value,
+        )
+        log_normalize = False
     fit_data = ad.AnnData(log_normalized(adata.X)) if log_normalize else adata
 
     dispersion = None
+    depth_components = None
     if glmpca_family is FamilyChoice.fast_poisson:
         scores, loadings, intercept, depth = run_fast_poisson(
             FastPoissonPCA(
@@ -842,6 +855,11 @@ def main(
         scores, loadings, intercept, depth = run_glmpca(model, fit_data)
         if glmpca_family is FamilyChoice.negative_binomial:
             dispersion = model.exponential_family.family_params["nu"].cpu().numpy()
+        if model.depth_correlations_ is not None:
+            depth_components = {
+                "depth_correlations": model.depth_correlations_,
+                "n_dropped_components": model.n_dropped_components_,
+            }
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
     adata.var["glmPCA_intercept"] = intercept
@@ -868,6 +886,8 @@ def main(
             "penalty": penalty,
         },
     }
+    if depth_components is not None:
+        adata.uns["glmPCA"].update(depth_components)
 
     if out_file_umap is not None:
         embedding, clusters = umap_leiden(scores, n_neighbors, cluster_resolution)

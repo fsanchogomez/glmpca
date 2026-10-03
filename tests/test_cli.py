@@ -587,6 +587,63 @@ def test_other_families_write_no_dispersion(tmp_path: Path) -> None:
     assert "MLE_dispersion" not in ad.read_h5ad(out_path).var
 
 
+def test_an_lsi_depth_factor_reports_the_dropped_components_in_uns(
+    tmp_path: Path,
+) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(
+        write_input(tmp_path, poisson_counts()),
+        out_path,
+        "-gf",
+        "signac_lsi",
+        "--depthFactor",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "DEPTH:" in result.output
+    report = ad.read_h5ad(out_path).uns["glmPCA"]
+    assert len(report["depth_correlations"]) == N_PC
+    assert 0 <= report["n_dropped_components"] <= N_PC
+
+
+@pytest.mark.parametrize("family", ["signac_lsi", "gensim_lsi"])
+def test_log_normalize_is_ignored_for_an_lsi_family(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, family: str
+) -> None:
+    models: list[GLMPCA] = []
+    original_fit = GLMPCA.fit
+
+    def recording_fit(self: GLMPCA, X: ad.AnnData) -> bool:
+        models.append(self)
+        return original_fit(self, X)
+
+    counts = poisson_counts()
+    out_path = tmp_path / "out.h5ad"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(GLMPCA, "fit", recording_fit)
+        result = run(
+            write_input(tmp_path, counts), out_path, "-gf", family, "--logNormalize"
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "--logNormalize is ignored" in caplog.text
+    assert not ad.read_h5ad(out_path).uns["glmPCA"]["params"]["log_normalize"]
+    (model,) = models
+    np.testing.assert_allclose(
+        model.exponential_family.family_params["idf"].numpy(),
+        _lsi_idf(family, counts),
+        rtol=1e-6,
+    )
+
+
+def _lsi_idf(family: str, counts: np.ndarray) -> np.ndarray:
+    if family == "signac_lsi":
+        return counts.shape[0] / np.maximum(counts.sum(axis=0), 1.0)
+    holders = (counts > 0).sum(axis=0)
+    return np.where(holders > 0, np.log2(counts.shape[0] / np.maximum(holders, 1)), 0)
+
+
 def test_the_penalty_reaches_fast_poisson(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 

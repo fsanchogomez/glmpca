@@ -37,9 +37,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from glmpca.LSIfamilies import WeightedGaussian
+
 N_CELLS = 40
 N_FEATURES = 12
 N_PC = 2
+N_LSI_FEATURES = 40
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +56,7 @@ def sample(family: GLMFamily) -> torch.Tensor:
     shape = (N_CELLS, N_FEATURES)
     if family is GLMFamily.gaussian:
         return torch.randn(shape)
-    if family is GLMFamily.poisson:
+    if family in {GLMFamily.poisson, GLMFamily.signac_lsi, GLMFamily.gensim_lsi}:
         return torch.poisson(torch.full(shape, 3.0))
     if family is GLMFamily.negative_binomial:
         return torch.distributions.NegativeBinomial(
@@ -676,6 +679,162 @@ def test_a_compiled_fit_equals_an_eager_fit() -> None:
         likelihoods.append(model.log_likelihood_)
 
     assert likelihoods[1] == pytest.approx(likelihoods[0], rel=1e-6)
+
+
+def lsi_counts(n_cells: int = 300, n_features: int = 40) -> torch.Tensor:
+    """Counts of three groups of cells, with depths that vary between cells."""
+    generator = torch.Generator().manual_seed(0)
+    depth = torch.exp(5.0 + 0.6 * torch.randn(n_cells, 1, generator=generator))
+    profiles = torch.softmax(
+        1.5 * torch.randn(3, n_features, generator=generator), dim=1
+    )
+    groups = torch.randint(0, 3, (n_cells,), generator=generator)
+    return torch.poisson(depth * profiles[groups] / 4, generator=generator)
+
+
+def lsi_fit(family: str, *, depth_factor: bool = False) -> GLMPCA:
+    torch.manual_seed(0)
+    np.random.seed(0)
+    model = GLMPCA(
+        3, family=family, optimizer="cg", max_iter=100, depth_factor=depth_factor
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model.fit(lsi_counts())
+    return model
+
+
+@pytest.mark.parametrize("family", ["signac_lsi", "gensim_lsi"])
+def test_an_lsi_family_finds_the_svd_of_its_weighted_matrix(family: str) -> None:
+    model = lsi_fit(family)
+    weighted = model.exponential_family.weigh(lsi_counts())
+    _, _, vt = torch.linalg.svd(weighted, full_matrices=False)
+
+    assert model.saturated_loadings_ is not None
+    cosines = torch.linalg.svdvals(model.saturated_loadings_.T @ vt[:3].T)
+    assert float(cosines.min()) > 0.999
+
+
+@pytest.mark.parametrize("family", ["signac_lsi", "gensim_lsi"])
+def test_an_lsi_family_holds_no_intercept_and_no_additive_offset(family: str) -> None:
+    model = lsi_fit(family, depth_factor=True)
+
+    assert model.saturated_intercept_ is not None
+    assert not model.saturated_intercept_.any()
+    assert model.saturated_depth_ is None
+
+
+@pytest.mark.parametrize(("cutoff", "dropped", "kept"), [(2.0, 0, 3), (-1.0, 3, 0)])
+def test_the_depth_factor_of_an_lsi_family_drops_the_components_past_the_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cutoff: float,
+    dropped: int,
+    kept: int,
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.DEPTH_CORRELATION_CUTOFF", cutoff)
+
+    model = lsi_fit("signac_lsi", depth_factor=True)
+
+    assert model.depth_correlations_ is not None
+    assert model.depth_correlations_.shape == (3,)
+    assert model.n_dropped_components_ == dropped
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape == (N_LSI_FEATURES, kept)
+    assert f"DEPTH: {dropped} of 3 components dropped" in capsys.readouterr().out
+
+
+def test_the_lsi_depth_factor_drops_the_component_that_follows_the_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    whole = lsi_fit("gensim_lsi", depth_factor=True)
+    assert whole.depth_correlations_ is not None
+    deepest = int(np.argmax(np.abs(whole.depth_correlations_)))
+    monkeypatch.setattr(
+        "glmpca.GLMPCA.DEPTH_CORRELATION_CUTOFF",
+        float(np.abs(whole.depth_correlations_[deepest])) - 1e-6,
+    )
+
+    model = lsi_fit("gensim_lsi", depth_factor=True)
+
+    assert model.n_dropped_components_ == 1
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape == (N_LSI_FEATURES, 2)
+    scores = model.transform(lsi_counts()).numpy()
+    depth = lsi_counts().sum(dim=1).numpy()
+    for score in scores.T:
+        rho = scipy.stats.spearmanr(score, depth).statistic
+        assert abs(rho) < abs(whole.depth_correlations_[deepest])
+
+
+@pytest.mark.parametrize("family", ["signac_lsi", "gensim_lsi"])
+def test_an_lsi_fit_weighs_the_counts_once(
+    monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    family_type = GLMFamily(family).distribution()
+    calls = []
+    weigh = family_type.weigh
+
+    def counting_weigh(self: WeightedGaussian, X: torch.Tensor) -> torch.Tensor:
+        calls.append(X.shape[0])
+        return weigh(self, X)
+
+    monkeypatch.setattr(family_type, "weigh", counting_weigh)
+    torch.manual_seed(0)
+    np.random.seed(0)
+    model = GLMPCA(3, family=family, optimizer="cg", max_iter=5, batch_size=128)
+    model.fit(lsi_counts())
+
+    assert sum(calls) == lsi_counts().shape[0]
+
+
+@pytest.mark.parametrize("family", ["signac_lsi", "gensim_lsi"])
+def test_an_lsi_log_likelihood_is_the_gaussian_density_of_the_weighted_matrix(
+    family: str,
+) -> None:
+    model = lsi_fit(family)
+    weighted = model.exponential_family.weigh(lsi_counts()).double()
+    assert model.saturated_loadings_ is not None
+    loadings = model.saturated_loadings_.double()
+    fitted = weighted @ loadings @ loadings.T
+
+    expected = float(
+        -0.5 * (weighted - fitted).square().sum()
+        - weighted.numel() * 0.5 * np.log(2 * np.pi)
+    )
+    assert model.log_likelihood_ == pytest.approx(expected, rel=1e-5)
+
+
+@pytest.mark.parametrize("family", ["signac_lsi", "gensim_lsi"])
+def test_an_lsi_fit_is_the_same_with_sparse_storage(family: str) -> None:
+    fits = []
+    for keep_sparse in (False, True):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = GLMPCA(
+            3, family=family, optimizer="cg", max_iter=20, keep_sparse=keep_sparse
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(lsi_counts().numpy())
+        fits.append(model)
+
+    assert fits[1].log_likelihood_ == pytest.approx(fits[0].log_likelihood_, rel=1e-5)
+    projectors = [
+        model.saturated_loadings_ @ model.saturated_loadings_.T for model in fits
+    ]
+    torch.testing.assert_close(projectors[1], projectors[0], atol=1e-4, rtol=0)
+
+
+def test_signac_lsi_scales_its_scores_and_gensim_lsi_does_not() -> None:
+    signac = lsi_fit("signac_lsi")
+    gensim = lsi_fit("gensim_lsi")
+
+    scores = signac.transform(lsi_counts())
+    torch.testing.assert_close(scores.mean(dim=0), torch.zeros(3), atol=1e-4, rtol=0)
+    torch.testing.assert_close(scores.std(dim=0), torch.ones(3), atol=1e-4, rtol=0)
+    assert gensim.score_mean_ is None
+    assert gensim.score_sd_ is None
 
 
 def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> None:

@@ -10,9 +10,12 @@ import torch
 import torch.optim
 from anndata.abc import CSCDataset, CSRDataset
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
+from scipy.sparse import vstack as sparse_vstack
+from scipy.stats import spearmanr
 from tqdm.auto import tqdm
 
-from .ExponentialFamily import ExponentialFamily, GLMFamily
+from .ExponentialFamily import ExponentialFamily, Gaussian, GLMFamily
+from .LSIfamilies import WeightedGaussian
 from .manifolds import (
     Grassmann,
     ManifoldParameter,
@@ -33,7 +36,16 @@ _OPTIMIZERS = {
 }
 
 DEFAULT_LEARNING_RATE = 0.2
-SPARSE_FAMILIES = ("gaussian", "poisson", "negative_binomial", "bernoulli")
+SPARSE_FAMILIES = (
+    "gaussian",
+    "poisson",
+    "negative_binomial",
+    "bernoulli",
+    "signac_lsi",
+    "gensim_lsi",
+)
+WEIGHTED_FAMILIES = ("signac_lsi", "gensim_lsi")
+DEPTH_CORRELATION_CUTOFF = 0.75
 INTERCEPT_RATE_SCALE = 0.01
 DEPTH_RATE_SCALE = 0.01
 LEARNING_RATE_LIMIT = 1e-8
@@ -426,6 +438,10 @@ class GLMPCA:
         self.saturated_intercept_: torch.Tensor | None = None
         # saturated_depth_: before projecting
         self.saturated_depth_: torch.Tensor | None = None
+        self.depth_correlations_: np.ndarray | None = None
+        self.n_dropped_components_: int | None = None
+        self.score_mean_: torch.Tensor | None = None
+        self.score_sd_: torch.Tensor | None = None
         # reconstruction_intercept: after projecting
         self.reconstruction_intercept_ = None
 
@@ -450,6 +466,7 @@ class GLMPCA:
         if n_jobs is not None:
             self.exponential_family.family_params["n_jobs"] = n_jobs
         self.exponential_family.family_params["chunk_size"] = self._chunk
+        self._cost_family: ExponentialFamily = self.exponential_family
 
     def fit(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
         r"""Fits a GLM-PCA to a specific dataset.
@@ -530,23 +547,32 @@ class GLMPCA:
         family.initialize_family_parameters(X_fit)
         family.load_family_params_to_gpu(device)
 
+        self._cost_family = family
+        cell_depth = None
+        if self._weighted():
+            X_fit, cell_depth = self._weighted_matrix(X_fit, device)
+            self._cost_family = Gaussian()
+        cost_family = self._cost_family
+
         # Compute saturated parameters, alongside exponential family parameters
         saturated_parameters = None
-        if isinstance(X_fit, torch.Tensor):
+        if isinstance(X_fit, torch.Tensor) and self._weighted():
+            saturated_parameters = X_fit
+        elif isinstance(X_fit, torch.Tensor):
             saturated_parameters = torch.empty_like(X_fit)
             for start in range(0, X_fit.shape[0], self._chunk):
                 stop = start + self._chunk
                 saturated_parameters[start:stop] = family.invert_g(
                     X_fit[start:stop].to(device)
                 ).cpu()
-        rows = _Rows(X_fit, family, saturated_parameters)
+        rows = _Rows(X_fit, cost_family, saturated_parameters)
 
         # log h(x) of every cell, summed over its features. It turns the cost into
         # the real log-likelihood.
         log_base_measure = torch.empty(X_fit.shape[0], dtype=torch.float64)
         for chunk in rows.slices(self._chunk):
             log_base_measure[chunk] = (
-                family
+                cost_family
                 .log_base_measure(X_fit[chunk].to(device))
                 .sum(dim=1, dtype=torch.float64)
                 .cpu()
@@ -554,13 +580,16 @@ class GLMPCA:
 
         resident = False
         if isinstance(X_fit, torch.Tensor) and saturated_parameters is not None:
+            shared = saturated_parameters is X_fit
             resident = device.type != "cuda" or _fits_in(
                 torch.cuda.mem_get_info(device)[0],
-                (X_fit, saturated_parameters),
+                (X_fit,) if shared else (X_fit, saturated_parameters),
                 WORKING_COPIES * min(batch_size, n_rows) * row_bytes,
             )
             if resident and device.type == "cuda":
-                rows = _Rows(X_fit.to(device), family, saturated_parameters.to(device))
+                data = X_fit.to(device)
+                theta = data if shared else saturated_parameters.to(device)
+                rows = _Rows(data, cost_family, theta)
                 self._chunk = self._chunk_rows(device, n_rows, row_bytes)
         if device.type == "cuda":
             tqdm.write(
@@ -626,6 +655,8 @@ class GLMPCA:
                     )
                 )
             self.saturated_depth_ = torch.cat(offsets)
+        if self._weighted():
+            best_loadings = self._lsi_components(rows, after, best_loadings, cell_depth)
         with torch.no_grad():
             training_cost = self._full_cost(
                 best_loadings,
@@ -637,8 +668,10 @@ class GLMPCA:
         self.log_likelihood_ = float(training_cost.neg().cpu()) + float(
             log_base_measure.sum()
         )
-        self.saturated_loadings_ = canonical_basis(
-            best_loadings, self._centered_chunks(rows, after)
+        self.saturated_loadings_ = (
+            best_loadings
+            if self._weighted()
+            else canonical_basis(best_loadings, self._centered_chunks(rows, after))
         ).cpu()
         self.saturated_intercept_ = self.saturated_intercept_.cpu()
         if self.saturated_depth_ is not None:
@@ -646,6 +679,96 @@ class GLMPCA:
         family.load_family_params_to_gpu(torch.device("cpu"))
 
         return True
+
+    def _weighted(self) -> bool:
+        """Whether the family is an LSI family, in WEIGHTED_FAMILIES."""
+        return self.exponential_family.family_name in WEIGHTED_FAMILIES
+
+    def _weighted_matrix(
+        self, X: torch.Tensor | SparseRows, device: torch.device
+    ) -> tuple[torch.Tensor | SparseRows, torch.Tensor]:
+        """The weighted matrix of an LSI family, and the depth of every cell.
+
+        The weighting is done once, by blocks on `device`, and the fit then reads the
+        weighted matrix with the cost of the plain Gaussian, which is the cost of the
+        family on the counts. A sparse input stays sparse, since a zero weighs zero. The
+        depths come from the counts, which the fit no longer holds.
+        """
+        family = self.exponential_family
+        assert isinstance(family, WeightedGaussian)
+        depth = torch.empty(X.shape[0], dtype=torch.float64)
+        blocks = []
+        for start in range(0, X.shape[0], self._chunk):
+            block = X[start : start + self._chunk].to(device)
+            depth[start : start + self._chunk] = block.sum(dim=1, dtype=torch.float64)
+            weighted = family.weigh(block).cpu()
+            blocks.append(
+                csr_matrix(weighted.numpy()) if isinstance(X, SparseRows) else weighted
+            )
+        if isinstance(X, SparseRows):
+            return SparseRows(
+                csr_matrix(sparse_vstack(blocks), dtype=np.float32)
+            ), depth
+        return torch.cat(blocks), depth
+
+    def _lsi_components(
+        self,
+        rows: _Rows,
+        device: torch.device,
+        loadings: torch.Tensor,
+        cell_depth: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The components that an LSI family reports, in the order of the SVD.
+
+        The intercept is zero, so canonical_basis orders the components by the second
+        moment of the scores, not by their variance. With depth_factor, every component
+        whose scores follow the depth of the cells, |Spearman rho| above
+        DEPTH_CORRELATION_CUTOFF, goes, so fewer than n_pc components can stay. This is
+        the offset of a cell for these families: a cell term outside the embedding,
+        along a profile of the features that the fit learns. For signac_lsi it also
+        keeps the mean and the standard deviation of every score, which transform uses
+        to scale the scores as `RunSVD(scale.embeddings = TRUE)` does.
+        """
+        basis = canonical_basis(
+            loadings, self._centered_chunks(rows, device), center=False
+        )
+        self.depth_correlations_ = None
+        self.n_dropped_components_ = None
+        if self.depth_factor:
+            assert cell_depth is not None
+            scores = []
+            for chunk in rows.slices(self._chunk):
+                _, theta = rows.block(chunk, device)
+                scores.append((theta @ basis).double().cpu())
+            all_scores, all_depth = torch.cat(scores).numpy(), cell_depth.numpy()
+            correlations = np.nan_to_num([
+                spearmanr(score, all_depth).statistic for score in all_scores.T
+            ])
+            dropped = np.abs(correlations) > DEPTH_CORRELATION_CUTOFF
+            kept = np.flatnonzero(~dropped)
+            self.depth_correlations_ = correlations
+            self.n_dropped_components_ = int(dropped.sum())
+            tqdm.write(
+                f"DEPTH: {self.n_dropped_components_} of {basis.shape[1]} components "
+                f"dropped, |Spearman rho| with the depth above "
+                f"{DEPTH_CORRELATION_CUTOFF}"
+            )
+            basis = basis[:, torch.from_numpy(kept).to(basis.device)]
+        self.score_mean_ = self.score_sd_ = None
+        if self.exponential_family.family_name == "signac_lsi":
+            total = torch.zeros(basis.shape[1], dtype=torch.float64)
+            squares = torch.zeros(basis.shape[1], dtype=torch.float64)
+            for chunk in rows.slices(self._chunk):
+                _, theta = rows.block(chunk, device)
+                scores_block = (theta @ basis).double().cpu()
+                total += scores_block.sum(dim=0)
+                squares += scores_block.square().sum(dim=0)
+            n = rows.shape[0]
+            mean = total / n
+            variance = (squares - n * mean.square()) / max(n - 1, 1)
+            self.score_mean_ = mean.float()
+            self.score_sd_ = variance.clip(min=0).sqrt().clip(min=1e-12).float()
+        return basis
 
     def _chunk_rows(self, device: torch.device, n_rows: int, row_bytes: int) -> int:
         """The rows of one pass over the matrix on `device`.
@@ -716,7 +839,7 @@ class GLMPCA:
         for chunk in rows.slices(chunk_rows):
             data, theta = rows.block(chunk, device)
             projected_parameters = theta - intercept.unsqueeze(0)
-            if self.depth_factor:
+            if self.depth_factor and not self._weighted():
                 depth = _fitted_depth(
                     self.exponential_family,
                     data,
@@ -727,7 +850,12 @@ class GLMPCA:
                 projected_parameters = projected_parameters - depth.unsqueeze(1)
             scores.append(projected_parameters.matmul(loadings))
 
-        return torch.cat(scores)
+        scores_all = torch.cat(scores)
+        if self.score_mean_ is not None and self.score_sd_ is not None:
+            scores_all = (scores_all - self.score_mean_.to(device)) / self.score_sd_.to(
+                device
+            )
+        return scores_all
 
     def _saturated_loading_iter(
         self,
@@ -958,22 +1086,25 @@ class GLMPCA:
         _, subset = (
             part.cpu() for part in rows.block(torch.from_numpy(random_idx), device)
         )
+        components = self.n_pc
         if self.init == "spectral":
             _, _, v = torch.linalg.svd(
-                subset - torch.mean(subset, dim=0),
+                subset if self._weighted() else subset - torch.mean(subset, dim=0),
                 full_matrices=False,
             )
             loadings = ManifoldParameter(
-                v[: self.n_pc, :].T.to(device), manifold=Grassmann()
+                v[:components, :].T.to(device), manifold=Grassmann()
             )
         elif self.init == "random":
             loadings = ManifoldParameter(
-                Grassmann().random(p, self.n_pc, device=device),
+                Grassmann().random(p, components, device=device),
                 manifold=Grassmann(),
             )
 
         # Initialize intercept
-        if self.exponential_family.family_name in ["poisson"]:
+        if self._weighted():
+            intercept = torch.zeros(p, device=device)
+        elif self.exponential_family.family_name in ["poisson"]:
             intercept = ManifoldParameter(torch.median(subset, dim=0).values.to(device))
         else:
             intercept = ManifoldParameter(torch.mean(subset, dim=0).to(device))
@@ -981,12 +1112,15 @@ class GLMPCA:
         # The offset of every cell, started at the mean residual of that cell once the
         # offset of the feature is out, which is where least squares would put it.
         depth = None
-        groups = [
-            {"params": loadings, "lr": self.learning_rate_},
-            {"params": intercept, "lr": self.learning_rate_ * INTERCEPT_RATE_SCALE},
-        ]
-        floors = [LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE]
-        if self.depth_factor:
+        groups = [{"params": loadings, "lr": self.learning_rate_}]
+        floors = [LEARNING_RATE_LIMIT]
+        if not self._weighted():
+            groups.append({
+                "params": intercept,
+                "lr": self.learning_rate_ * INTERCEPT_RATE_SCALE,
+            })
+            floors.append(LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE)
+        if self.depth_factor and not self._weighted():
             start = torch.empty(n)
             for chunk in rows.slices(self._chunk):
                 _, theta = rows.block(chunk, device)
@@ -1058,6 +1192,4 @@ class GLMPCA:
         projected_parameters = projected_parameters.matmul(loadings).matmul(loadings.T)
         projected_parameters = projected_parameters + intercept_term
 
-        return self.exponential_family.neg_log_likelihood(
-            batch_data, projected_parameters
-        )
+        return self._cost_family.neg_log_likelihood(batch_data, projected_parameters)
