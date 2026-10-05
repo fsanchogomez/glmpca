@@ -33,7 +33,7 @@ from glmpca.GLMPCA import (
     _to_tensor,
 )
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
-from glmpca.sparse import BackedRows, SparseRows, densified
+from glmpca.sparse import BackedRows, SparseRows, binary, densified
 from scipy import sparse
 
 if TYPE_CHECKING:
@@ -1026,6 +1026,58 @@ def test_off_the_cpu_a_sparse_block_is_densified_on_the_device(
         dense = source.dense(block, torch.device("mps"))
         assert dense.device.type == "mps"
         torch.testing.assert_close(dense.cpu(), X[block])
+
+
+def test_binary_reads_every_non_zero_value_as_1_and_leaves_its_input() -> None:
+    X = sample(GLMFamily.poisson).numpy()
+    stored_zero = sparse.csr_matrix(
+        (np.array([0.0, 3.0]), np.array([0, 1]), np.array([0, 2])), shape=(1, 2)
+    )
+    csr = sparse.csr_matrix(X)
+
+    np.testing.assert_array_equal(binary(X), X != 0)
+    np.testing.assert_array_equal(binary(csr).toarray(), X != 0)
+    np.testing.assert_array_equal(binary(stored_zero).toarray(), [[0, 1]])
+    np.testing.assert_array_equal(csr.toarray(), X)
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_backed_rows_binarize_every_block(tmp_path: Path, dense: bool) -> None:
+    adata, X = backed_counts(tmp_path, dense=dense)
+    backed = BackedRows(adata.X, binarize=True)
+    rows = torch.tensor([7, 2, 30, 11])
+
+    torch.testing.assert_close(backed[3:9], (X[3:9] != 0).float())
+    torch.testing.assert_close(backed[rows], (X[rows] != 0).float())
+
+
+@pytest.mark.parametrize("keep_sparse", [False, True])
+def test_a_binarized_fit_equals_a_fit_on_the_binary_matrix(keep_sparse: bool) -> None:
+    X = sample(GLMFamily.poisson)
+    original = X.clone()
+    options = {"max_iter": 3, "batch_size": 8, "keep_sparse": keep_sparse}
+    binarized = GLMPCA(N_PC, family="poisson", binarize=True, **options)
+    binarized.fit(X)
+    expected = GLMPCA(N_PC, family="poisson", **options)
+    expected.fit((X != 0).float())
+
+    torch.testing.assert_close(X, original)
+    assert binarized.log_likelihood_ == pytest.approx(expected.log_likelihood_)
+    torch.testing.assert_close(binarized.transform(X), expected.transform(X != 0))
+
+
+def test_a_backed_binarized_fit_equals_one_in_memory(tmp_path: Path) -> None:
+    adata, X = backed_counts(tmp_path)
+    options = {"max_iter": 3, "batch_size": 8, "binarize": True}
+    backed = GLMPCA(N_PC, family="poisson", **options)
+    backed.fit(adata)
+    in_memory = GLMPCA(N_PC, family="poisson", keep_sparse=True, **options)
+    in_memory.fit(X)
+
+    assert backed.log_likelihood_ == pytest.approx(in_memory.log_likelihood_, rel=1e-6)
+    torch.testing.assert_close(
+        backed.transform(adata), in_memory.transform(X), atol=1e-4, rtol=1e-4
+    )
 
 
 def test_a_backed_fit_equals_a_sparse_fit_in_memory(tmp_path: Path) -> None:

@@ -4,12 +4,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from scipy.sparse import issparse
+from scipy.sparse import csr_matrix, issparse
 
 if TYPE_CHECKING:
     import h5py
     from anndata.abc import CSRDataset
-    from scipy.sparse import csr_matrix
 
 
 def densified(block: csr_matrix, device: torch.device) -> torch.Tensor:
@@ -22,6 +21,20 @@ def densified(block: csr_matrix, device: torch.device) -> torch.Tensor:
     dense = torch.zeros(n_rows * n_cols, device=device)
     dense.index_add_(0, flat, values.to(device))
     return dense.view(n_rows, n_cols)
+
+
+def binary(block: csr_matrix | np.ndarray) -> csr_matrix | np.ndarray:
+    """1 where `block` is not zero, else 0, as float32. A CSR block stays CSR.
+
+    The CSR block keeps its indices and gets new values, so the caller's matrix is
+    left as it was.
+    """
+    if issparse(block):
+        return csr_matrix(
+            ((block.data != 0).astype(np.float32), block.indices, block.indptr),
+            shape=block.shape,
+        )
+    return (np.asarray(block) != 0).astype(np.float32)
 
 
 class SparseRows:
@@ -90,11 +103,15 @@ class BackedRows(SparseRows):
     `GLMPCA` reads an AnnData opened with `backed="r"` this way, so the matrix stays in
     the file and only the rows of the block being read are in memory. The matrix is a
     CSR dataset or a dense HDF5 dataset. Rows asked in any order are read in increasing
-    order, as the file needs, and handed back in the order they were asked.
+    order, as the file needs, and handed back in the order they were asked. With
+    `binarize`, every value that is not zero is read as 1.
     """
 
-    def __init__(self, matrix: CSRDataset | h5py.Dataset) -> None:
+    def __init__(
+        self, matrix: CSRDataset | h5py.Dataset, *, binarize: bool = False
+    ) -> None:
         self.matrix = matrix
+        self.binarize = binarize
 
     @property
     def nbytes(self) -> int:
@@ -104,9 +121,11 @@ class BackedRows(SparseRows):
         self, rows: slice | torch.Tensor | np.ndarray
     ) -> csr_matrix | np.ndarray:
         if isinstance(rows, slice):
-            return self.matrix[rows]
-        if isinstance(rows, torch.Tensor):
-            rows = rows.cpu().numpy()
-        rows = np.asarray(rows)
-        order = np.argsort(rows, kind="stable")
-        return self.matrix[rows[order]][np.argsort(order)]
+            block = self.matrix[rows]
+        else:
+            if isinstance(rows, torch.Tensor):
+                rows = rows.cpu().numpy()
+            rows = np.asarray(rows)
+            order = np.argsort(rows, kind="stable")
+            block = self.matrix[rows[order]][np.argsort(order)]
+        return binary(block) if self.binarize else block

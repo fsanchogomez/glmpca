@@ -493,7 +493,52 @@ def test_no_log_normalize_by_default(tmp_path: Path) -> None:
     result = run(write_input(tmp_path, poisson_counts()), out_path)
 
     assert result.exit_code == 0, result.output
-    assert not ad.read_h5ad(out_path).uns["glmPCA"]["params"]["log_normalize"]
+    params = ad.read_h5ad(out_path).uns["glmPCA"]["params"]
+    assert not params["log_normalize"]
+    assert not params["binarize"]
+
+
+@pytest.mark.parametrize("backed", [False, True])
+def test_the_binarize_flag_gives_the_scores_of_the_binary_matrix(
+    tmp_path: Path, backed: bool
+) -> None:
+    counts = poisson_counts()
+    binary_path = tmp_path / "binary"
+    binary_path.mkdir()
+    expected_out = tmp_path / "expected.h5ad"
+    result = run(
+        write_input(binary_path, sparse.csr_matrix((counts != 0).astype(np.float32))),
+        expected_out,
+        "--keepSparse",
+    )
+    assert result.exit_code == 0, result.output
+    out_path = tmp_path / "out.h5ad"
+    options = ("--keepSparse", "--binarize") + (("--backed",) if backed else ())
+
+    result = run(write_input(tmp_path, sparse.csr_matrix(counts)), out_path, *options)
+
+    assert result.exit_code == 0, result.output
+    adata = ad.read_h5ad(out_path)
+    np.testing.assert_array_equal(adata.X.toarray(), counts)
+    assert adata.uns["glmPCA"]["params"]["binarize"]
+    np.testing.assert_allclose(
+        adata.obsm["X_glmPCA"],
+        ad.read_h5ad(expected_out).obsm["X_glmPCA"],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_binarize_cannot_be_used_with_log_normalize(tmp_path: Path) -> None:
+    result = run(
+        write_input(tmp_path, poisson_counts()),
+        tmp_path / "out.h5ad",
+        "--binarize",
+        "--logNormalize",
+    )
+
+    assert result.exit_code != 0
+    assert "--binarize and --logNormalize cannot be used together" in result.output
 
 
 def test_the_compile_flag_reaches_the_model(

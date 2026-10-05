@@ -562,6 +562,21 @@ def main(
             ),
         ),
     ] = False,
+    binarize: Annotated[
+        bool,
+        typer.Option(
+            "--binarize",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Read every value that is not zero as 1, off by default. The fit uses "
+                "the binary values, and the output file keeps the original matrix in "
+                "``.X``. It works with ``--backed``, block by block. It cannot be "
+                "used with "
+                "``--logNormalize``. ``-gf bernoulli`` already counts a value above 1 "
+                "as 1."
+            ),
+        ),
+    ] = False,
     keep_sparse: Annotated[
         bool,
         typer.Option(
@@ -766,6 +781,7 @@ def main(
             depth_factor=depth_factor,
             n_trials=n_trials,
             log_normalize=log_normalize,
+            binarize=binarize,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
             cluster_resolution=cluster_resolution,
@@ -784,6 +800,9 @@ def main(
             "--logNormalize needs the matrix in memory, so it cannot be used with "
             "--backed."
         )
+        raise fail(msg)
+    if binarize and log_normalize:
+        msg = "--binarize and --logNormalize cannot be used together."
         raise fail(msg)
     adata = ad.read_h5ad(input, backed="r") if backed else ad.read_h5ad(input)
     if adata.X is None:
@@ -814,6 +833,7 @@ def main(
         keep_sparse=True if keep_sparse else None,
         depth_factor=depth_factor,
         compile=torch_compile,
+        binarize=binarize,
         family_params=(
             {"n_trials": n_trials} if glmpca_family is FamilyChoice.binomial else None
         ),
@@ -855,6 +875,7 @@ def main(
             "backed": backed,
             "depth_factor": depth_factor,
             "log_normalize": log_normalize,
+            "binarize": binarize,
             "random_state": model.random_state,
         },
     }

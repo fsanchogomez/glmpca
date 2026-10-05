@@ -26,7 +26,7 @@ from .manifolds import (
     RiemannianConjugateGradient,
     canonical_basis,
 )
-from .sparse import BackedRows, SparseRows
+from .sparse import BackedRows, SparseRows, binary
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -425,6 +425,11 @@ class GLMPCA:
         the caller is left as it was. None does not seed, and two fits then differ.
         Defaults to DEFAULT_RANDOM_STATE (42).
 
+    binarize: bool
+        Whether fit and transform read every value that is not zero as 1. A backed
+        AnnData is binarized block by block as it is read, any other input once. The
+        input of the caller is left as it was. Defaults to False.
+
     """
 
     def __init__(
@@ -446,6 +451,7 @@ class GLMPCA:
         keep_sparse: bool | None = None,
         compile: bool = False,
         random_state: int | None = DEFAULT_RANDOM_STATE,
+        binarize: bool = False,
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -469,6 +475,7 @@ class GLMPCA:
         self.keep_sparse_: bool | None = None
         self.compile = compile
         self.random_state = random_state
+        self.binarize = binarize
         self._rng = np.random.default_rng(random_state)
 
         self.saturated_loadings_: torch.Tensor | None = None
@@ -783,7 +790,8 @@ class GLMPCA:
 
         An AnnData opened with `backed="r"` stays in its file and is read by blocks
         (`BackedRows`), unless keep_sparse is False, which loads it dense. Any other
-        input is held sparse or dense as `_use_sparse` chooses.
+        input is held sparse or dense as `_use_sparse` chooses. With binarize, the
+        values that are not zero are read as 1.
         """
         if isinstance(X, ad.AnnData) and X.isbacked and self.keep_sparse is not False:
             family = self.exponential_family.family_name
@@ -795,8 +803,13 @@ class GLMPCA:
                 )
                 raise ValueError(msg)
             tqdm.write("STORAGE: backed (read by blocks from the file)")
-            return BackedRows(X.X)
-        return _to_sparse(X) if self._use_sparse(X) else _to_tensor(X)
+            return BackedRows(X.X, binarize=self.binarize)
+        rows = _to_sparse(X) if self._use_sparse(X) else _to_tensor(X)
+        if not self.binarize:
+            return rows
+        if isinstance(rows, SparseRows):
+            return SparseRows(binary(rows.matrix))
+        return (rows != 0).to(rows.dtype)
 
     def _use_sparse(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
         """Whether to hold `X` as a CSR matrix: keep_sparse, or the automatic choice.
