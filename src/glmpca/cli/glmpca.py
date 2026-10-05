@@ -580,6 +580,21 @@ def main(
             ),
         ),
     ] = False,
+    backed: Annotated[
+        bool,
+        typer.Option(
+            "--backed",
+            rich_help_panel=_OPTIMISATION,
+            help=(
+                "Open the input in backed mode and read the matrix from the file by "
+                "blocks of cells, instead of loading it into memory. Only the rows of "
+                "the block being read are in memory, so the matrix can be larger "
+                "than the memory. Each pass reads the file again. Only gaussian, "
+                "poisson, negative_binomial, bernoulli, binomial, signac_lsi and "
+                "gensim_lsi take it, and it cannot be used with ``--logNormalize``."
+            ),
+        ),
+    ] = False,
     torch_compile: Annotated[
         bool,
         typer.Option(
@@ -747,6 +762,7 @@ def main(
             optimizer=optimizer,
             keep_sparse=keep_sparse,
             torch_compile=torch_compile,
+            backed=backed,
             depth_factor=depth_factor,
             n_trials=n_trials,
             log_normalize=log_normalize,
@@ -763,7 +779,13 @@ def main(
     else:
         warnings.filterwarnings("ignore")
 
-    adata = ad.read_h5ad(input)
+    if backed and log_normalize:
+        msg = (
+            "--logNormalize needs the matrix in memory, so it cannot be used with "
+            "--backed."
+        )
+        raise fail(msg)
+    adata = ad.read_h5ad(input, backed="r") if backed else ad.read_h5ad(input)
     if adata.X is None:
         msg = f"'{input}' has no matrix in .X."
         raise fail(msg)
@@ -830,6 +852,7 @@ def main(
             "optimizer": optimizer.value,
             "keep_sparse": model.keep_sparse_,
             "compile": torch_compile,
+            "backed": backed,
             "depth_factor": depth_factor,
             "log_normalize": log_normalize,
             "random_state": model.random_state,

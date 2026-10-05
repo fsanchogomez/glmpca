@@ -663,6 +663,33 @@ def test_the_fit_is_seeded_so_two_runs_give_the_same_scores(tmp_path: Path) -> N
     np.testing.assert_array_equal(scores[0], scores[1])
 
 
+def test_backed_gives_the_same_scores_as_a_fit_in_memory(tmp_path: Path) -> None:
+    input_path = write_input(tmp_path, sparse.csr_matrix(poisson_counts()))
+    scores = {}
+    for backed in (False, True):
+        out_path = tmp_path / f"out_{backed}.h5ad"
+        options = ("--keepSparse", "--backed") if backed else ("--keepSparse",)
+        result = run(input_path, out_path, *options)
+        assert result.exit_code == 0, result.output
+        adata = ad.read_h5ad(out_path)
+        assert bool(adata.uns["glmPCA"]["params"]["backed"]) is backed
+        scores[backed] = adata.obsm["X_glmPCA"]
+
+    np.testing.assert_allclose(scores[True], scores[False], atol=1e-4, rtol=1e-4)
+
+
+def test_backed_cannot_be_used_with_log_normalize(tmp_path: Path) -> None:
+    result = run(
+        write_input(tmp_path, poisson_counts()),
+        tmp_path / "out.h5ad",
+        "--backed",
+        "--logNormalize",
+    )
+
+    assert result.exit_code != 0
+    assert "--logNormalize needs the matrix in memory" in result.output
+
+
 def _lsi_idf(family: str, counts: np.ndarray) -> np.ndarray:
     if family == "signac_lsi":
         return counts.shape[0] / np.maximum(counts.sum(axis=0), 1.0)

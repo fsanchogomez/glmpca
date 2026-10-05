@@ -26,7 +26,7 @@ from .manifolds import (
     RiemannianConjugateGradient,
     canonical_basis,
 )
-from .sparse import SparseRows
+from .sparse import BackedRows, SparseRows
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -64,6 +64,7 @@ OFFSET_TOLERANCE = 1e-6
 DEVICE_MEMORY_SHARE = 0.8
 HOST_MEMORY_SHARE = 0.5
 WORKING_COPIES = 8
+HOST_STAGING_COPIES = 2
 
 
 def _announce_device(device: torch.device) -> None:
@@ -273,7 +274,10 @@ class _Rows:
         self, rows: slice | torch.Tensor, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The data and the saturated parameters of `rows`, on `device`."""
-        data = self.data[rows].to(device, non_blocking=True)
+        if isinstance(self.data, SparseRows):
+            data = self.data.dense(rows, device)
+        else:
+            data = self.data[rows].to(device, non_blocking=True)
         if self.theta is None:
             return data, self.family.invert_g(data)
         return data, self.theta[rows].to(device, non_blocking=True)
@@ -562,8 +566,8 @@ class GLMPCA:
             )
             raise ValueError(msg)
 
-        self.keep_sparse_ = self._use_sparse(X)
-        X_fit = _to_sparse(X) if self.keep_sparse_ else _to_tensor(X)
+        X_fit = self._rows_source(X)
+        self.keep_sparse_ = isinstance(X_fit, SparseRows)
         if X_fit.shape[0] < 2:
             msg = (
                 f"A fit needs at least 2 rows (cells), but the input has "
@@ -587,14 +591,12 @@ class GLMPCA:
             )
             warnings.warn(msg, UserWarning, stacklevel=2)
             batch_size = X_fit.shape[0]
-        self._rows_fit = self._rows_that_fit(X_fit)
+        self._rows_fit, memory = self._rows_that_fit(X_fit, device)
         if batch_size > self._rows_fit:
-            needed = WORKING_COPIES * batch_size * X_fit.shape[1] * 4
             msg = (
-                f"batch_size={batch_size} does not fit in memory: one batch of "
-                f"{X_fit.shape[1]} features takes {needed / 2**30:.1f} GiB, beside "
-                f"the data, and {HOST_MEMORY_SHARE * _host_memory() / 2**30:.1f} GiB "
-                f"are allowed. The largest batch that fits is {self._rows_fit}."
+                f"batch_size={batch_size} does not fit in {memory}, with "
+                f"{X_fit.shape[1]} features. The largest batch that fits is "
+                f"{self._rows_fit}."
             )
             raise ValueError(msg)
         self.batch_size_ = batch_size
@@ -743,16 +745,58 @@ class GLMPCA:
 
         return True
 
-    def _rows_that_fit(self, X: torch.Tensor | SparseRows) -> int:
-        """How many rows of `X` one block can hold in memory.
+    def _rows_that_fit(
+        self, X: torch.Tensor | SparseRows, device: torch.device
+    ) -> tuple[int, str]:
+        """How many rows of `X` one block can hold, and the memory that limits it.
 
-        A block takes WORKING_COPIES dense float32 copies of its rows, and the blocks
-        share HOST_MEMORY_SHARE of `_host_memory` with the stored data: the matrix and
-        its saturated parameters when dense, the CSR matrix when sparse.
+        The stored data stays in the host memory: the matrix and its saturated
+        parameters when dense, the CSR matrix when sparse, nothing when backed. The
+        blocks share HOST_MEMORY_SHARE of `_host_memory` with it. On the CPU, and on
+        MPS, whose memory is the host memory, a block takes WORKING_COPIES dense
+        float32 copies of its rows there. On CUDA the WORKING_COPIES are on the GPU, in
+        DEVICE_MEMORY_SHARE of its free memory, and the host only stages
+        HOST_STAGING_COPIES of the block before the copy. The block is then the
+        smaller of the two limits.
         """
+        row_bytes = X.shape[1] * 4
         stored = X.nbytes if isinstance(X, SparseRows) else 2 * X.nbytes
-        free = HOST_MEMORY_SHARE * _host_memory() - stored
-        return max(int(free // (WORKING_COPIES * X.shape[1] * 4)), 0)
+        host = HOST_MEMORY_SHARE * _host_memory() - stored
+        host_label = f"{host / 2**30:.1f} GiB of host memory beside the data"
+        if device.type != "cuda":
+            return max(int(host // (WORKING_COPIES * row_bytes)), 0), host_label
+        gpu = DEVICE_MEMORY_SHARE * torch.cuda.mem_get_info(device)[0]
+        limits = [
+            (int(host // (HOST_STAGING_COPIES * row_bytes)), host_label),
+            (
+                int(gpu // (WORKING_COPIES * row_bytes)),
+                f"{gpu / 2**30:.1f} GiB of GPU memory",
+            ),
+        ]
+        rows, label = min(limits)
+        return max(rows, 0), label
+
+    def _rows_source(
+        self, X: torch.Tensor | np.ndarray | ad.AnnData
+    ) -> torch.Tensor | SparseRows:
+        """How fit and transform hold `X`: in the file, sparse, or dense.
+
+        An AnnData opened with `backed="r"` stays in its file and is read by blocks
+        (`BackedRows`), unless keep_sparse is False, which loads it dense. Any other
+        input is held sparse or dense as `_use_sparse` chooses.
+        """
+        if isinstance(X, ad.AnnData) and X.isbacked and self.keep_sparse is not False:
+            family = self.exponential_family.family_name
+            if family not in SPARSE_FAMILIES:
+                msg = (
+                    f"A backed AnnData is read by blocks of rows, which family="
+                    f"{family!r} cannot take. Load it into memory, or use one of "
+                    f"{', '.join(repr(name) for name in SPARSE_FAMILIES)}."
+                )
+                raise ValueError(msg)
+            tqdm.write("STORAGE: backed (read by blocks from the file)")
+            return BackedRows(X.X)
+        return _to_sparse(X) if self._use_sparse(X) else _to_tensor(X)
 
     def _use_sparse(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
         """Whether to hold `X` as a CSR matrix: keep_sparse, or the automatic choice.
@@ -919,7 +963,7 @@ class GLMPCA:
             msg = "GLMPCA is not fitted. Call fit() before transform()."
             raise RuntimeError(msg)
 
-        X_transform = _to_sparse(X) if self._use_sparse(X) else _to_tensor(X)
+        X_transform = self._rows_source(X)
         device = X_transform.device
         loadings, intercept = loadings.to(device), intercept.to(device)
         self.exponential_family.load_family_params_to_gpu(device)

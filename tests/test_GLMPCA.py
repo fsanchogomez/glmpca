@@ -21,6 +21,8 @@ from glmpca.GLMPCA import (
     DEPTH_RATE_SCALE,
     DEVICE_MEMORY_SHARE,
     GLMPCA,
+    HOST_MEMORY_SHARE,
+    HOST_STAGING_COPIES,
     INTERCEPT_RATE_SCALE,
     LEARNING_RATE_LIMIT,
     PLATEAU_PATIENCE,
@@ -31,7 +33,7 @@ from glmpca.GLMPCA import (
     _to_tensor,
 )
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
-from glmpca.sparse import SparseRows
+from glmpca.sparse import BackedRows, SparseRows, densified
 from scipy import sparse
 
 if TYPE_CHECKING:
@@ -878,7 +880,9 @@ def test_keep_sparse_none_chooses_the_storage_from_the_memory(
     report: str,
 ) -> None:
     monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: memory)
-    monkeypatch.setattr(GLMPCA, "_rows_that_fit", lambda self, X: 10**9)
+    monkeypatch.setattr(
+        GLMPCA, "_rows_that_fit", lambda self, X, device: (10**9, "memory")
+    )
     model = GLMPCA(N_PC, family=family, max_iter=1, batch_size=16)
 
     model.fit(sample(family))
@@ -896,7 +900,9 @@ def test_an_explicit_keep_sparse_wins_over_the_memory(
     memory: int,
 ) -> None:
     monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: memory)
-    monkeypatch.setattr(GLMPCA, "_rows_that_fit", lambda self, X: 10**9)
+    monkeypatch.setattr(
+        GLMPCA, "_rows_that_fit", lambda self, X, device: (10**9, "memory")
+    )
     model = GLMPCA(
         N_PC, family="poisson", max_iter=1, batch_size=16, keep_sparse=keep_sparse
     )
@@ -977,6 +983,92 @@ def test_no_random_state_gives_fits_that_differ() -> None:
     assert not torch.equal(fits[0].saturated_loadings_, fits[1].saturated_loadings_)
 
 
+def backed_counts(
+    tmp_path: Path, *, dense: bool = False
+) -> tuple[ad.AnnData, torch.Tensor]:
+    X = sample(GLMFamily.poisson)
+    path = tmp_path / "counts.h5ad"
+    ad.AnnData(X.numpy() if dense else sparse.csr_matrix(X.numpy())).write_h5ad(path)
+    return ad.read_h5ad(path, backed="r"), X
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_backed_rows_read_what_sparse_rows_read(tmp_path: Path, dense: bool) -> None:
+    adata, X = backed_counts(tmp_path, dense=dense)
+    backed = BackedRows(adata.X)
+    in_memory = SparseRows(sparse.csr_matrix(X.numpy()))
+    rows = torch.tensor([7, 2, 30, 11])
+
+    assert backed.nbytes == 0
+    assert backed.shape == in_memory.shape
+    torch.testing.assert_close(backed[3:9], in_memory[3:9])
+    torch.testing.assert_close(backed[rows], in_memory[rows])
+
+
+def test_a_csr_block_is_densified_from_its_non_zeros() -> None:
+    X = sample(GLMFamily.poisson)
+
+    block = densified(sparse.csr_matrix(X.numpy()[[7, 2, 30]]), torch.device("cpu"))
+
+    torch.testing.assert_close(block, X[[7, 2, 30]])
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("backed", [False, True])
+def test_off_the_cpu_a_sparse_block_is_densified_on_the_device(
+    tmp_path: Path, backed: bool
+) -> None:
+    adata, X = backed_counts(tmp_path)
+    source = BackedRows(adata.X) if backed else SparseRows(sparse.csr_matrix(X.numpy()))
+    rows = torch.tensor([7, 2, 30, 11])
+
+    for block in (slice(3, 9), rows):
+        dense = source.dense(block, torch.device("mps"))
+        assert dense.device.type == "mps"
+        torch.testing.assert_close(dense.cpu(), X[block])
+
+
+def test_a_backed_fit_equals_a_sparse_fit_in_memory(tmp_path: Path) -> None:
+    adata, X = backed_counts(tmp_path)
+    backed = GLMPCA(N_PC, family="poisson", max_iter=3, batch_size=8)
+    backed.fit(adata)
+    in_memory = GLMPCA(
+        N_PC, family="poisson", max_iter=3, batch_size=8, keep_sparse=True
+    )
+    in_memory.fit(X)
+
+    assert backed.keep_sparse_ is True
+    assert backed.log_likelihood_ == pytest.approx(in_memory.log_likelihood_, rel=1e-6)
+    torch.testing.assert_close(
+        backed.saturated_loadings_, in_memory.saturated_loadings_, atol=1e-5, rtol=0
+    )
+    torch.testing.assert_close(
+        backed.transform(adata),
+        in_memory.transform(X),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_a_backed_fit_rejects_a_family_that_reads_whole_columns(
+    tmp_path: Path,
+) -> None:
+    adata, _ = backed_counts(tmp_path)
+    model = GLMPCA(N_PC, family="gamma", max_iter=1)
+
+    with pytest.raises(ValueError, match="cannot take"):
+        model.fit(adata)
+
+
+def test_keep_sparse_false_loads_a_backed_anndata(tmp_path: Path) -> None:
+    adata, _ = backed_counts(tmp_path)
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8, keep_sparse=False)
+
+    model.fit(adata)
+
+    assert model.keep_sparse_ is False
+
+
 def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> None:
     model = GLMPCA(N_PC, family="poisson")
 
@@ -1004,6 +1096,28 @@ def test_a_batch_that_fits_in_memory_is_used(
 
     assert model.keep_sparse_ is False
     assert model.batch_size_ == 8
+
+
+@pytest.mark.parametrize(
+    ("host", "gpu", "limit"),
+    [(2**40, 2**20, "GPU memory"), (2**20, 2**40, "host memory")],
+)
+def test_on_cuda_a_batch_fits_in_both_the_gpu_and_the_host_memory(
+    monkeypatch: pytest.MonkeyPatch, host: int, gpu: int, limit: str
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: host)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (gpu, gpu))
+    X = torch.zeros(10, 5000)
+    row_bytes = 4 * 5000
+    on_gpu = int(DEVICE_MEMORY_SHARE * gpu) // (WORKING_COPIES * row_bytes)
+    staged = int(HOST_MEMORY_SHARE * host - 2 * X.nbytes) // (
+        HOST_STAGING_COPIES * row_bytes
+    )
+
+    rows, memory = GLMPCA(N_PC)._rows_that_fit(X, torch.device("cuda"))
+
+    assert rows == min(on_gpu, staged)
+    assert limit in memory
 
 
 def test_on_the_cpu_a_pass_takes_the_batch_size_unless_a_chunk_size_is_given() -> None:

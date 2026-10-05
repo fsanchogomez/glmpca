@@ -11,6 +11,8 @@ import scipy
 import torch
 from tqdm.auto import tqdm
 
+from .sparse import BackedRows, SparseRows
+
 MIN_DISPERSION = 1e-6
 """Lower end of the search for the dispersion of a feature."""
 
@@ -22,9 +24,7 @@ NEWTON_TOLERANCE = 1e-9
 """A feature has converged when a Newton step moves `log nu` by less than this."""
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
-
-    from .sparse import SparseRows
+    from collections.abc import Callable, Iterable, Iterator
 
 saturation_eps = 10**-10
 
@@ -125,6 +125,19 @@ def _zero_background(
     feature_mean = (columns / X.shape[0]).to(X.dtype).clip(min=MIN_EXPECTED)
     mean_depth = max(float(columns.sum()) / X.shape[0], 1.0)
     return feature_mean, mean_depth
+
+
+def _stored_values(X: torch.Tensor | SparseRows, chunk: int) -> Iterator[torch.Tensor]:
+    """The values of `X` that a check of every entry must see, by blocks.
+
+    A CSR matrix in memory gives its non-zeros at once, since its zeros pass any check
+    that a zero passes. Any other matrix gives its blocks of `chunk` rows.
+    """
+    if isinstance(X, SparseRows) and not isinstance(X, BackedRows):
+        yield torch.from_numpy(np.asarray(X.matrix.data, dtype=np.float32))
+        return
+    for start in range(0, X.shape[0], chunk):
+        yield X[start : start + chunk]
 
 
 def _dense(X: torch.Tensor | SparseRows, family_name: str) -> torch.Tensor:
@@ -356,8 +369,7 @@ class Binomial(ExponentialFamily):
         n_trials = float(self.family_params["n_trials"])
         chunk = int(self.family_params.get("chunk_size", 8192))
         clipped = 0
-        for start in range(0, X.shape[0], chunk):
-            block = X[start : start + chunk]
+        for block in _stored_values(X, chunk):
             if bool((block < 0).any()):
                 msg = (
                     f"The {self.family_name} family takes counts, but the input has "

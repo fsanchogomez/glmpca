@@ -2,11 +2,26 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
+from scipy.sparse import issparse
 
 if TYPE_CHECKING:
-    import numpy as np
+    import h5py
+    from anndata.abc import CSRDataset
     from scipy.sparse import csr_matrix
+
+
+def densified(block: csr_matrix, device: torch.device) -> torch.Tensor:
+    """The CSR `block` as a dense float32 tensor, built on `device` from non-zeros."""
+    n_rows, n_cols = block.shape
+    counts = torch.from_numpy(np.diff(block.indptr)).to(device).long()
+    row_of = torch.repeat_interleave(torch.arange(n_rows, device=device), counts)
+    flat = row_of * n_cols + torch.from_numpy(block.indices).to(device).long()
+    values = torch.from_numpy(np.asarray(block.data, dtype=np.float32))
+    dense = torch.zeros(n_rows * n_cols, device=device)
+    dense.index_add_(0, flat, values.to(device))
+    return dense.view(n_rows, n_cols)
 
 
 class SparseRows:
@@ -42,6 +57,56 @@ class SparseRows:
         )
 
     def __getitem__(self, rows: slice | torch.Tensor | np.ndarray) -> torch.Tensor:
+        block = self._block(rows)
+        return torch.from_numpy(
+            np.asarray(block.toarray() if issparse(block) else block, dtype=np.float32)
+        )
+
+    def dense(
+        self, rows: slice | torch.Tensor | np.ndarray, device: torch.device
+    ) -> torch.Tensor:
+        """The rows `rows`, dense on `device`.
+
+        Off the CPU only the non-zeros are copied, and the block is densified on
+        `device`, so a copy takes the size of the CSR block, not of the dense block.
+        """
+        if device.type == "cpu":
+            return self[rows]
+        block = self._block(rows)
+        if not issparse(block):
+            return torch.from_numpy(np.asarray(block, dtype=np.float32)).to(device)
+        return densified(block, device)
+
+    def _block(self, rows: slice | torch.Tensor | np.ndarray) -> csr_matrix:
+        """The rows `rows` as they are stored, in the order asked."""
         if isinstance(rows, torch.Tensor):
             rows = rows.cpu().numpy()
-        return torch.from_numpy(self.matrix[rows].toarray())
+        return self.matrix[rows]
+
+
+class BackedRows(SparseRows):
+    """The matrix of a backed AnnData, read from its file by blocks of rows.
+
+    `GLMPCA` reads an AnnData opened with `backed="r"` this way, so the matrix stays in
+    the file and only the rows of the block being read are in memory. The matrix is a
+    CSR dataset or a dense HDF5 dataset. Rows asked in any order are read in increasing
+    order, as the file needs, and handed back in the order they were asked.
+    """
+
+    def __init__(self, matrix: CSRDataset | h5py.Dataset) -> None:
+        self.matrix = matrix
+
+    @property
+    def nbytes(self) -> int:
+        return 0
+
+    def _block(
+        self, rows: slice | torch.Tensor | np.ndarray
+    ) -> csr_matrix | np.ndarray:
+        if isinstance(rows, slice):
+            return self.matrix[rows]
+        if isinstance(rows, torch.Tensor):
+            rows = rows.cpu().numpy()
+        rows = np.asarray(rows)
+        order = np.argsort(rows, kind="stable")
+        return self.matrix[rows[order]][np.argsort(order)]
