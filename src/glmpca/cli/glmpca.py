@@ -17,6 +17,7 @@ import pandas as pd
 import typer
 from matplotlib.figure import Figure
 from scipy import sparse
+from tqdm.auto import tqdm
 
 from glmpca.ExponentialFamily import _n_workers
 from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA, WEIGHTED_FAMILIES
@@ -29,8 +30,9 @@ DESCRIPTION = (
     '* ``obsm["X_glmPCA"]``: the coordinates of the cells.\n'
     '* ``varm["glmPCA_loadings"]``: the loadings of the features.\n'
     '* ``var["glmPCA_intercept"]``: the intercept of the features.\n'
-    '* ``obs["glmPCA_depth"]``: the depth factor of the cells, present with '
-    "``--depthFactor``.\n"
+    '* ``obs["glmPCA_log_depth"]`` and ``var["glmPCA_depth_coef"]``: the depth '
+    "covariate of the cells and its coefficient for the features, present with "
+    "``--depthCovariate``.\n"
     '* ``var["MLE_dispersion"]``: the dispersion of the features, fitted by maximum '
     "likelihood, present with ``-gf negative_binomial``.\n"
     '* ``uns["glmPCA"]``: the parameters of the fit.\n\n'
@@ -248,11 +250,14 @@ def umap_leiden(
 ) -> tuple[np.ndarray, np.ndarray]:
     """The UMAP and the Leiden clusters of `scanpy.tl.umap` and `scanpy.tl.leiden`.
 
-    Both read one neighbor graph, as in scanpy, and Leiden is its igraph flavor.
+    Both read one neighbor graph, as in scanpy, and Leiden is its igraph flavor. It
+    names every stage as it starts, and the epochs of the UMAP layout have a bar.
     """
     from umap.umap_ import find_ab_params, simplicial_set_embedding  # noqa: PLC0415
 
+    tqdm.write(f"NEIGHBORS: graph of the {n_neighbors} nearest neighbors")
     graph = neighbor_graph(coordinates, n_neighbors)
+    tqdm.write("UMAP: spectral start")
     a, b = find_ab_params(1.0, 0.5)
     embedding, _ = simplicial_set_embedding(
         data=coordinates,
@@ -271,8 +276,15 @@ def umap_leiden(
         densmap=False,
         densmap_kwds={},
         output_dens=False,
+        tqdm_kwds={
+            "disable": False,
+            "desc": "UMAP",
+            "unit": "epoch",
+            "dynamic_ncols": True,
+        },
     )
 
+    tqdm.write(f"LEIDEN: clusters at resolution {resolution}")
     sources, targets = graph.nonzero()
     network = igraph.Graph(
         n=graph.shape[0],
@@ -324,7 +336,7 @@ def plot_umap(
 
 def run_glmpca(
     model: GLMPCA, adata: ad.AnnData
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Fits the saturated-parameter model and returns the arrays to store."""
     try:
         model.fit(adata)
@@ -334,13 +346,7 @@ def run_glmpca(
     loadings, intercept = model.saturated_loadings_, model.saturated_intercept_
     assert loadings is not None
     assert intercept is not None
-    depth = model.saturated_depth_
-    return (
-        model.transform(adata).numpy(),
-        loadings.numpy(),
-        intercept.numpy(),
-        None if depth is None else depth.numpy(),
-    )
+    return model.transform(adata).numpy(), loadings.numpy(), intercept.numpy()
 
 
 @app.callback(invoke_without_command=True)
@@ -527,20 +533,22 @@ def main(
             ),
         ),
     ] = 1,
-    depth_factor: Annotated[
+    depth_covariate: Annotated[
         bool,
         typer.Option(
-            "--depthFactor",
+            "--depthCovariate",
             rich_help_panel=_GLMPCA,
             help=(
-                "Fit an offset for every cell, off by default. The model then holds a "
-                "term for the depth of a cell beside the term for every feature, so a "
-                "component does not have to carry the depth. It has its own learning "
-                "rate, 1% of ``--learningRate``, the same as the per-feature "
-                "intercept. It is an "
-                "exact size factor for ``poisson``, ``negative_binomial``, "
-                "``lognormal`` and ``gamma``, whose parameter is a log mean; for the "
-                "other families it is a plain offset of a cell. For ``signac_lsi`` and "
+                "Model the depth of a cell as a covariate, off by default: the "
+                "centered log of its total counts, with a coefficient for every "
+                "feature that the fit learns, so a component does not have to carry "
+                "the depth. The covariate is stored in "
+                '``obs["glmPCA_log_depth"]`` and the coefficient in '
+                '``var["glmPCA_depth_coef"]``. The coefficient is near 1 for '
+                "``poisson`` and ``negative_binomial``, a size factor; for "
+                "``bernoulli`` and ``binomial`` it takes the slope of every feature. "
+                "With ``--binarize`` the total is the number of features that are not "
+                "zero. For ``signac_lsi`` and "
                 "``gensim_lsi`` it drops every component whose scores follow the depth "
                 "of the cells (|Spearman rho| above 0.75), so fewer than "
                 "``--nPrinComps`` components can be left; the number dropped is "
@@ -778,7 +786,7 @@ def main(
             keep_sparse=keep_sparse,
             torch_compile=torch_compile,
             backed=backed,
-            depth_factor=depth_factor,
+            depth_covariate=depth_covariate,
             n_trials=n_trials,
             log_normalize=log_normalize,
             binarize=binarize,
@@ -831,14 +839,14 @@ def main(
         n_jobs=number_of_processors,
         device=device,
         keep_sparse=True if keep_sparse else None,
-        depth_factor=depth_factor,
+        depth_covariate=depth_covariate,
         compile=torch_compile,
         binarize=binarize,
         family_params=(
             {"n_trials": n_trials} if glmpca_family is FamilyChoice.binomial else None
         ),
     )
-    scores, loadings, intercept, depth = run_glmpca(model, fit_data)
+    scores, loadings, intercept = run_glmpca(model, fit_data)
     if glmpca_family is FamilyChoice.negative_binomial:
         dispersion = model.exponential_family.family_params["nu"].cpu().numpy()
     if model.depth_correlations_ is not None:
@@ -849,8 +857,9 @@ def main(
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
     adata.var["glmPCA_intercept"] = intercept
-    if depth is not None:
-        adata.obs["glmPCA_depth"] = depth
+    if model.log_depth_ is not None and model.depth_coef_ is not None:
+        adata.obs["glmPCA_log_depth"] = model.log_depth_.numpy()
+        adata.var["glmPCA_depth_coef"] = model.depth_coef_.numpy()
     if dispersion is not None:
         adata.var["MLE_dispersion"] = dispersion
     binomial_report = None
@@ -873,12 +882,14 @@ def main(
             "keep_sparse": model.keep_sparse_,
             "compile": torch_compile,
             "backed": backed,
-            "depth_factor": depth_factor,
+            "depth_covariate": depth_covariate,
             "log_normalize": log_normalize,
             "binarize": binarize,
             "random_state": model.random_state,
         },
     }
+    if model.log_depth_mean_ is not None:
+        adata.uns["glmPCA"]["log_depth_mean"] = model.log_depth_mean_
     if depth_components is not None:
         adata.uns["glmPCA"].update(depth_components)
     if binomial_report is not None:

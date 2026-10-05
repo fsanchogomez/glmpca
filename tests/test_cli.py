@@ -376,27 +376,36 @@ def test_the_family_choices_are_the_library_families() -> None:
     }
 
 
-def test_the_depth_factor_is_written_to_obs(tmp_path: Path) -> None:
+def test_the_depth_covariate_is_written_to_obs_var_and_uns(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
+    counts = poisson_counts()
 
-    result = run(write_input(tmp_path, poisson_counts()), out_path, "--depthFactor")
+    result = run(write_input(tmp_path, counts), out_path, "--depthCovariate")
 
     assert result.exit_code == 0, result.output
     adata = ad.read_h5ad(out_path)
-    assert adata.obs["glmPCA_depth"].shape == (N_CELLS,)
-    assert np.all(np.isfinite(adata.obs["glmPCA_depth"].to_numpy()))
+    logs = np.log(counts.sum(axis=1, dtype=np.float64))
+    np.testing.assert_allclose(
+        adata.obs["glmPCA_log_depth"].to_numpy(), logs - logs.mean(), atol=1e-5
+    )
+    assert adata.var["glmPCA_depth_coef"].shape == (N_FEATURES,)
+    assert np.all(np.isfinite(adata.var["glmPCA_depth_coef"].to_numpy()))
+    assert adata.uns["glmPCA"]["log_depth_mean"] == pytest.approx(logs.mean())
 
 
-def test_no_depth_factor_by_default_leaves_the_column_out(tmp_path: Path) -> None:
+def test_no_depth_covariate_by_default_leaves_the_columns_out(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 
     result = run(write_input(tmp_path, poisson_counts()), out_path)
 
     assert result.exit_code == 0, result.output
-    assert "glmPCA_depth" not in ad.read_h5ad(out_path).obs
+    adata = ad.read_h5ad(out_path)
+    assert "glmPCA_log_depth" not in adata.obs
+    assert "glmPCA_depth_coef" not in adata.var
+    assert "log_depth_mean" not in adata.uns["glmPCA"]
 
 
-def test_the_depth_factor_flag_turns_the_cell_offset_on(
+def test_the_depth_covariate_flag_reaches_the_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models: list[GLMPCA] = []
@@ -409,13 +418,13 @@ def test_the_depth_factor_flag_turns_the_cell_offset_on(
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     out_path = tmp_path / "out.h5ad"
 
-    result = run(write_input(tmp_path, poisson_counts()), out_path, "--depthFactor")
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--depthCovariate")
 
     assert result.exit_code == 0, result.output
     (model,) = models
-    assert model.depth_factor
-    assert model.saturated_depth_ is not None
-    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["depth_factor"]
+    assert model.depth_covariate
+    assert model.depth_coef_ is not None
+    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["depth_covariate"]
 
 
 def test_the_keep_sparse_flag_reaches_the_model(
@@ -588,7 +597,7 @@ def test_other_families_write_no_dispersion(tmp_path: Path) -> None:
     assert "MLE_dispersion" not in ad.read_h5ad(out_path).var
 
 
-def test_an_lsi_depth_factor_reports_the_dropped_components_in_uns(
+def test_an_lsi_depth_covariate_reports_the_dropped_components_in_uns(
     tmp_path: Path,
 ) -> None:
     out_path = tmp_path / "out.h5ad"
@@ -598,7 +607,7 @@ def test_an_lsi_depth_factor_reports_the_dropped_components_in_uns(
         out_path,
         "-gf",
         "signac_lsi",
-        "--depthFactor",
+        "--depthCovariate",
     )
 
     assert result.exit_code == 0, result.output

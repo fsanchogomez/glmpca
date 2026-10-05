@@ -2,26 +2,23 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anndata as ad
-import glmpca.GLMPCA as glmpca_module
 import numpy as np
 import pytest
 import scipy.stats
 import torch
 from glmpca.ExponentialFamily import (
     Beta,
-    ExponentialFamily,
     GLMFamily,
     NegativeBinomial,
     _n_workers,
 )
 from glmpca.GLMPCA import (
     DEFAULT_BATCH_SIZE,
-    DEPTH_RATE_SCALE,
-    DEPTH_WORKING_COPIES,
     DEVICE_MEMORY_SHARE,
     GLMPCA,
     HOST_MEMORY_SHARE,
@@ -218,6 +215,7 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
         device: torch.device,
         log_base_measure: torch.Tensor,
         cost: Callable[..., torch.Tensor],
+        log_depth: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma
@@ -680,7 +678,7 @@ def test_a_compiled_fit_equals_an_eager_fit() -> None:
             N_PC,
             family="poisson",
             optimizer="cg",
-            depth_factor=True,
+            depth_covariate=True,
             max_iter=3,
             compile=compile_cost,
         )
@@ -703,11 +701,15 @@ def lsi_counts(n_cells: int = 300, n_features: int = 40) -> torch.Tensor:
     return torch.poisson(depth * profiles[groups] / 4, generator=generator)
 
 
-def lsi_fit(family: str, *, depth_factor: bool = False) -> GLMPCA:
+def lsi_fit(family: str, *, depth_covariate: bool = False) -> GLMPCA:
     torch.manual_seed(0)
     np.random.seed(0)
     model = GLMPCA(
-        3, family=family, optimizer="cg", max_iter=100, depth_factor=depth_factor
+        3,
+        family=family,
+        optimizer="cg",
+        max_iter=100,
+        depth_covariate=depth_covariate,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -728,15 +730,16 @@ def test_an_lsi_family_finds_the_svd_of_its_weighted_matrix(family: str) -> None
 
 @pytest.mark.parametrize("family", ["signac_lsi", "gensim_lsi"])
 def test_an_lsi_family_holds_no_intercept_and_no_additive_offset(family: str) -> None:
-    model = lsi_fit(family, depth_factor=True)
+    model = lsi_fit(family, depth_covariate=True)
 
     assert model.saturated_intercept_ is not None
     assert not model.saturated_intercept_.any()
-    assert model.saturated_depth_ is None
+    assert model.depth_coef_ is None
+    assert model.log_depth_ is None
 
 
 @pytest.mark.parametrize(("cutoff", "dropped", "kept"), [(2.0, 0, 3), (-1.0, 3, 0)])
-def test_the_depth_factor_of_an_lsi_family_drops_the_components_past_the_cutoff(
+def test_the_depth_covariate_of_an_lsi_family_drops_the_components_past_the_cutoff(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     cutoff: float,
@@ -745,7 +748,7 @@ def test_the_depth_factor_of_an_lsi_family_drops_the_components_past_the_cutoff(
 ) -> None:
     monkeypatch.setattr("glmpca.GLMPCA.DEPTH_CORRELATION_CUTOFF", cutoff)
 
-    model = lsi_fit("signac_lsi", depth_factor=True)
+    model = lsi_fit("signac_lsi", depth_covariate=True)
 
     assert model.depth_correlations_ is not None
     assert model.depth_correlations_.shape == (3,)
@@ -755,10 +758,10 @@ def test_the_depth_factor_of_an_lsi_family_drops_the_components_past_the_cutoff(
     assert f"DEPTH: {dropped} of 3 components dropped" in capsys.readouterr().out
 
 
-def test_the_lsi_depth_factor_drops_the_component_that_follows_the_depth(
+def test_the_lsi_depth_covariate_drops_the_component_that_follows_the_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    whole = lsi_fit("gensim_lsi", depth_factor=True)
+    whole = lsi_fit("gensim_lsi", depth_covariate=True)
     assert whole.depth_correlations_ is not None
     deepest = int(np.argmax(np.abs(whole.depth_correlations_)))
     monkeypatch.setattr(
@@ -766,7 +769,7 @@ def test_the_lsi_depth_factor_drops_the_component_that_follows_the_depth(
         float(np.abs(whole.depth_correlations_[deepest])) - 1e-6,
     )
 
-    model = lsi_fit("gensim_lsi", depth_factor=True)
+    model = lsi_fit("gensim_lsi", depth_covariate=True)
 
     assert model.n_dropped_components_ == 1
     assert model.saturated_loadings_ is not None
@@ -929,41 +932,6 @@ def test_the_free_gpu_memory_counts_what_the_process_caches(
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 20)
 
     assert _free_device_memory(torch.device("cuda")) == 150
-
-
-def test_the_depth_passes_take_smaller_chunks_and_give_the_same_offsets(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    X = sample(GLMFamily.poisson)
-    sizes: list[int] = []
-    original = glmpca_module._fitted_depth
-
-    def recording(
-        family: ExponentialFamily, data: torch.Tensor, *args: torch.Tensor
-    ) -> torch.Tensor:
-        sizes.append(data.shape[0])
-        return original(family, data, *args)
-
-    whole = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8, depth_factor=True)
-    whole.fit(X)
-    monkeypatch.setattr(glmpca_module, "_fitted_depth", recording)
-    chunked = GLMPCA(
-        N_PC,
-        family="poisson",
-        max_iter=2,
-        batch_size=8,
-        depth_factor=True,
-        chunk_size=12,
-    )
-    chunked.fit(X)
-    fitted = len(sizes)
-    chunked.transform(X)
-
-    assert max(sizes) == 12 * WORKING_COPIES // DEPTH_WORKING_COPIES
-    assert fitted < len(sizes)
-    torch.testing.assert_close(
-        chunked.saturated_depth_, whole.saturated_depth_, atol=1e-4, rtol=1e-4
-    )
 
 
 def test_transform_does_not_report_the_storage_again(
@@ -1330,29 +1298,40 @@ def depth_gradient() -> torch.Tensor:
     return torch.poisson(torch.exp(structure) * depth)
 
 
-def test_the_depth_factor_is_fitted_for_every_cell() -> None:
-    model = GLMPCA(N_PC, family="poisson", max_iter=5, batch_size=16, depth_factor=True)
+def test_the_depth_covariate_is_the_centered_log_total_of_every_cell() -> None:
+    X = depth_gradient()
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=5, batch_size=16, depth_covariate=True
+    )
 
-    model.fit(depth_gradient())
+    model.fit(X)
 
-    assert model.saturated_depth_ is not None
-    assert model.saturated_depth_.shape == (N_CELLS,)
-    assert torch.all(torch.isfinite(model.saturated_depth_))
+    logs = torch.log(X.sum(dim=1, dtype=torch.float64))
+    assert model.log_depth_mean_ == pytest.approx(float(logs.mean()))
+    assert model.log_depth_ is not None
+    torch.testing.assert_close(
+        model.log_depth_, (logs - logs.mean()).float(), rtol=1e-6, atol=1e-6
+    )
+    assert model.depth_coef_ is not None
+    assert model.depth_coef_.shape == (N_FEATURES,)
+    assert torch.all(torch.isfinite(model.depth_coef_))
 
 
-def test_no_depth_factor_by_default_leaves_no_offset() -> None:
+def test_no_depth_covariate_by_default() -> None:
     model = GLMPCA(N_PC, family="poisson", max_iter=5, batch_size=16)
 
     model.fit(depth_gradient())
 
-    assert model.saturated_depth_ is None
+    assert model.log_depth_ is None
+    assert model.depth_coef_ is None
+    assert model.log_depth_mean_ is None
 
 
-def test_the_depth_factor_keeps_the_components_off_the_depth() -> None:
+def test_the_depth_covariate_keeps_the_components_off_the_depth() -> None:
     X = depth_gradient()
     totals = X.sum(dim=1).numpy()
     worst = {}
-    for depth_factor in (True, False):
+    for depth_covariate in (True, False):
         torch.manual_seed(0)
         np.random.seed(0)
         model = GLMPCA(
@@ -1360,11 +1339,11 @@ def test_the_depth_factor_keeps_the_components_off_the_depth() -> None:
             family="poisson",
             max_iter=40,
             batch_size=16,
-            depth_factor=depth_factor,
+            depth_covariate=depth_covariate,
         )
         model.fit(X)
         embedding = model.transform(X).detach().numpy()
-        worst[depth_factor] = max(
+        worst[depth_covariate] = max(
             abs(float(scipy.stats.spearmanr(embedding[:, pc], totals).statistic))
             for pc in range(N_PC)
         )
@@ -1372,70 +1351,125 @@ def test_the_depth_factor_keeps_the_components_off_the_depth() -> None:
     assert worst[True] < worst[False], worst
 
 
-def test_the_depth_factor_has_its_own_learning_rate() -> None:
-    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16, depth_factor=True)
-    saturated = torch.log(depth_gradient().clip(min=1.0))
+def test_the_poisson_depth_coefficient_is_a_size_factor() -> None:
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=40, batch_size=16, depth_covariate=True
+    )
 
-    optimizer, _, _, depth, _ = model._init_saturated_loading_optim(
+    model.fit(depth_gradient())
+
+    assert model.depth_coef_ is not None
+    assert float(model.depth_coef_.median()) == pytest.approx(1.0, abs=0.2)
+
+
+def test_the_depth_coefficient_has_the_learning_rate_of_the_intercept() -> None:
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=2, batch_size=16, depth_covariate=True
+    )
+    saturated = torch.log(depth_gradient().clip(min=1.0))
+    log_depth = torch.randn(N_CELLS)
+
+    optimizer, _, _, coef, _ = model._init_saturated_loading_optim(
         _Rows(saturated, model.exponential_family, saturated),
         torch.device("cpu"),
         batch_size=16,
+        log_depth=log_depth,
     )
 
-    assert depth is not None
+    assert coef is not None
+    assert coef.shape == (N_FEATURES,)
     rates = [group["lr"] for group in optimizer.param_groups]
     assert rates == [
         model.learning_rate_,
         model.learning_rate_ * INTERCEPT_RATE_SCALE,
-        model.learning_rate_ * DEPTH_RATE_SCALE,
+        model.learning_rate_ * INTERCEPT_RATE_SCALE,
     ]
 
 
-def test_transform_reproduces_the_fitted_scores_with_a_depth_factor() -> None:
+def test_transform_reproduces_the_fitted_scores_with_the_depth_covariate() -> None:
     X = depth_gradient()
     model = GLMPCA(
-        N_PC, family="poisson", max_iter=20, batch_size=16, depth_factor=True
+        N_PC, family="poisson", max_iter=20, batch_size=16, depth_covariate=True
     )
     model.fit(X)
 
     embedding = model.transform(X).detach()
 
-    depth, intercept = model.saturated_depth_, model.saturated_intercept_
-    assert depth is not None
+    coef, intercept = model.depth_coef_, model.saturated_intercept_
+    assert coef is not None
     assert intercept is not None
+    assert model.log_depth_ is not None
     assert model.saturated_loadings_ is not None
     fitted = (
         model.exponential_family.invert_g(X)
         - intercept.unsqueeze(0)
-        - depth.unsqueeze(1)
+        - model.log_depth_.unsqueeze(1) * coef
     ) @ model.saturated_loadings_
     torch.testing.assert_close(embedding, fitted, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("family", ["poisson", "negative_binomial", "gaussian"])
-def test_the_offset_of_a_cell_is_the_optimum_of_its_likelihood(family: str) -> None:
+def test_a_cell_without_counts_takes_the_smallest_total_of_the_fit() -> None:
     X = depth_gradient()
-    model = GLMPCA(N_PC, family=family, max_iter=10, batch_size=16, depth_factor=True)
+    X[0] = 0
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=2, batch_size=16, depth_covariate=True
+    )
+
     model.fit(X)
-    depth, intercept = model.saturated_depth_, model.saturated_intercept_
-    loadings = model.saturated_loadings_
-    assert depth is not None
-    assert intercept is not None
-    assert loadings is not None
-    centered = model.exponential_family.invert_g(X) - intercept.unsqueeze(0)
-    projector = loadings @ loadings.T
-    outside = torch.ones(N_FEATURES) - projector.sum(dim=1)
 
-    def costs(offset: torch.Tensor) -> torch.Tensor:
-        theta = centered @ projector + intercept + offset.unsqueeze(1) * outside
-        return -(
-            model.exponential_family.exponential_term(X, theta)
-            - model.exponential_family.log_partition(theta)
-        ).sum(dim=1)
+    assert model.log_depth_ is not None
+    assert model.log_depth_mean_ is not None
+    smallest = float(X[1:].sum(dim=1).min())
+    assert float(model.log_depth_[0]) == pytest.approx(
+        math.log(smallest) - model.log_depth_mean_, abs=1e-5
+    )
+    assert torch.all(torch.isfinite(model.transform(X)))
 
-    at_optimum = costs(depth)
-    for shift in (-1e-2, 1e-2):
-        assert torch.all(costs(depth + shift) >= at_optimum - 1e-3)
+
+def test_the_depth_covariate_rejects_a_row_with_a_negative_sum() -> None:
+    X = depth_gradient()
+    X[3] = -1.0
+    model = GLMPCA(
+        N_PC, family="gaussian", max_iter=2, batch_size=16, depth_covariate=True
+    )
+
+    with pytest.raises(ValueError, match="row 3 sums to"):
+        model.fit(X)
+
+
+def test_a_binarized_depth_covariate_counts_the_features_that_are_not_zero() -> None:
+    X = depth_gradient()
+    model = GLMPCA(
+        N_PC,
+        family="bernoulli",
+        max_iter=2,
+        batch_size=16,
+        depth_covariate=True,
+        binarize=True,
+    )
+
+    model.fit(X)
+
+    logs = torch.log((X != 0).sum(dim=1, dtype=torch.float64))
+    assert model.log_depth_mean_ == pytest.approx(float(logs.mean()))
+
+
+def test_a_backed_depth_covariate_equals_one_in_memory(tmp_path: Path) -> None:
+    X = depth_gradient()
+    path = tmp_path / "depth.h5ad"
+    ad.AnnData(sparse.csr_matrix(X.numpy())).write_h5ad(path)
+    options = {"max_iter": 3, "batch_size": 8, "depth_covariate": True}
+    backed = GLMPCA(N_PC, family="poisson", **options)
+    backed.fit(ad.read_h5ad(path, backed="r"))
+    in_memory = GLMPCA(N_PC, family="poisson", keep_sparse=True, **options)
+    in_memory.fit(X)
+
+    assert backed.log_depth_mean_ == pytest.approx(in_memory.log_depth_mean_)
+    assert backed.depth_coef_ is not None
+    assert in_memory.depth_coef_ is not None
+    torch.testing.assert_close(
+        backed.depth_coef_, in_memory.depth_coef_, atol=1e-5, rtol=1e-5
+    )
 
 
 @pytest.mark.parametrize(
@@ -1469,7 +1503,6 @@ def test_keep_sparse_fits_what_the_dense_matrix_fits(
     assert kept.saturated_loadings_ is not None
     torch.testing.assert_close(kept.saturated_loadings_, dense.saturated_loadings_)
     torch.testing.assert_close(kept.saturated_intercept_, dense.saturated_intercept_)
-    torch.testing.assert_close(kept.saturated_depth_, dense.saturated_depth_)
     assert kept.log_likelihood_ == pytest.approx(dense.log_likelihood_, rel=1e-6)
     torch.testing.assert_close(kept.transform(X), dense.transform(X))
 
