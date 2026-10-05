@@ -6,12 +6,14 @@ import warnings
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anndata as ad
+import glmpca.GLMPCA as glmpca_module
 import numpy as np
 import pytest
 import scipy.stats
 import torch
 from glmpca.ExponentialFamily import (
     Beta,
+    ExponentialFamily,
     GLMFamily,
     NegativeBinomial,
     _n_workers,
@@ -19,6 +21,7 @@ from glmpca.ExponentialFamily import (
 from glmpca.GLMPCA import (
     DEFAULT_BATCH_SIZE,
     DEPTH_RATE_SCALE,
+    DEPTH_WORKING_COPIES,
     DEVICE_MEMORY_SHARE,
     GLMPCA,
     HOST_MEMORY_SHARE,
@@ -28,6 +31,7 @@ from glmpca.GLMPCA import (
     PLATEAU_PATIENCE,
     WORKING_COPIES,
     _fits_in,
+    _free_device_memory,
     _host_memory,
     _Rows,
     _to_tensor,
@@ -890,6 +894,89 @@ def test_keep_sparse_none_chooses_the_storage_from_the_memory(
     assert model.keep_sparse is None
     assert model.keep_sparse_ is chosen
     assert report in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("gpu", "chosen", "report"),
+    [
+        (10**15, False, "allowed (host memory))"),
+        (10**3, True, "allowed (GPU memory))"),
+    ],
+)
+def test_on_cuda_the_storage_is_dense_only_if_it_also_fits_on_the_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    gpu: int,
+    chosen: bool,
+    report: str,
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: 10**12)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (gpu, gpu))
+    model = GLMPCA(N_PC, family="poisson", batch_size=16)
+
+    sparse = model._use_sparse(sample(GLMFamily.poisson), torch.device("cuda"))
+
+    assert sparse is chosen
+    assert report in capsys.readouterr().out
+
+
+def test_the_free_gpu_memory_counts_what_the_process_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (100, 1000))
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 70)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 20)
+
+    assert _free_device_memory(torch.device("cuda")) == 150
+
+
+def test_the_depth_passes_take_smaller_chunks_and_give_the_same_offsets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    X = sample(GLMFamily.poisson)
+    sizes: list[int] = []
+    original = glmpca_module._fitted_depth
+
+    def recording(
+        family: ExponentialFamily, data: torch.Tensor, *args: torch.Tensor
+    ) -> torch.Tensor:
+        sizes.append(data.shape[0])
+        return original(family, data, *args)
+
+    whole = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8, depth_factor=True)
+    whole.fit(X)
+    monkeypatch.setattr(glmpca_module, "_fitted_depth", recording)
+    chunked = GLMPCA(
+        N_PC,
+        family="poisson",
+        max_iter=2,
+        batch_size=8,
+        depth_factor=True,
+        chunk_size=12,
+    )
+    chunked.fit(X)
+    fitted = len(sizes)
+    chunked.transform(X)
+
+    assert max(sizes) == 12 * WORKING_COPIES // DEPTH_WORKING_COPIES
+    assert fitted < len(sizes)
+    torch.testing.assert_close(
+        chunked.saturated_depth_, whole.saturated_depth_, atol=1e-4, rtol=1e-4
+    )
+
+
+def test_transform_does_not_report_the_storage_again(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    X = sample(GLMFamily.poisson)
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=16)
+    model.fit(X)
+    assert "STORAGE:" in capsys.readouterr().out
+
+    model.transform(X)
+
+    assert "STORAGE:" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(("keep_sparse", "memory"), [(True, 10**15), (False, 10)])

@@ -64,6 +64,7 @@ OFFSET_TOLERANCE = 1e-6
 DEVICE_MEMORY_SHARE = 0.8
 HOST_MEMORY_SHARE = 0.5
 WORKING_COPIES = 8
+DEPTH_WORKING_COPIES = 12
 HOST_STAGING_COPIES = 2
 
 
@@ -79,6 +80,19 @@ def _fits_in(free_bytes: int, tensors: tuple[torch.Tensor, ...], working: int) -
     """Whether `tensors` and `working` more bytes fit in a share of `free_bytes`."""
     needed = sum(tensor.nbytes for tensor in tensors) + working
     return needed <= DEVICE_MEMORY_SHARE * free_bytes
+
+
+def _free_device_memory(device: torch.device) -> int:
+    """The free memory of a CUDA device, with what this process holds but does not use.
+
+    `torch.cuda.mem_get_info` counts the blocks that the caching allocator of this
+    process keeps after the passes that freed them as used, although this process can
+    use them again.
+    """
+    free = torch.cuda.mem_get_info(device)[0]
+    if torch.cuda.is_initialized():
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return free
 
 
 def _host_memory() -> int:
@@ -190,6 +204,17 @@ def _fitted_depth(
         if active.numel() == 0:
             break
     return depth
+
+
+def _depth_chunk(chunk: int) -> int:
+    """The rows of a `_fitted_depth` pass, from the rows of a pass of WORKING_COPIES.
+
+    Its Newton steps hold DEPTH_WORKING_COPIES copies of a block at their peak: about 9
+    measured, one for the centered block of the caller, and two for the float64 copy
+    that `_row_costs` sums on CUDA. The offset of a cell does not depend on the others,
+    so the size of the chunk does not change it.
+    """
+    return max(1, chunk * WORKING_COPIES // DEPTH_WORKING_COPIES)
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -573,7 +598,7 @@ class GLMPCA:
             )
             raise ValueError(msg)
 
-        X_fit = self._rows_source(X)
+        X_fit = self._rows_source(X, device)
         self.keep_sparse_ = isinstance(X_fit, SparseRows)
         if X_fit.shape[0] < 2:
             msg = (
@@ -654,11 +679,12 @@ class GLMPCA:
         if isinstance(X_fit, torch.Tensor) and saturated_parameters is not None:
             shared = saturated_parameters is X_fit
             resident = device.type != "cuda" or _fits_in(
-                torch.cuda.mem_get_info(device)[0],
+                _free_device_memory(device),
                 (X_fit,) if shared else (X_fit, saturated_parameters),
                 WORKING_COPIES * min(batch_size, n_rows) * row_bytes,
             )
             if resident and device.type == "cuda":
+                torch.cuda.empty_cache()
                 data = X_fit.to(device)
                 theta = data if shared else saturated_parameters.to(device)
                 rows = _Rows(data, cost_family, theta)
@@ -715,7 +741,7 @@ class GLMPCA:
         self.saturated_depth_ = None
         if best_depth is not None:
             offsets = []
-            for chunk in rows.slices(self._chunk):
+            for chunk in rows.slices(_depth_chunk(self._chunk)):
                 data, theta = rows.block(chunk, after)
                 offsets.append(
                     _fitted_depth(
@@ -772,7 +798,7 @@ class GLMPCA:
         host_label = f"{host / 2**30:.1f} GiB of host memory beside the data"
         if device.type != "cuda":
             return max(int(host // (WORKING_COPIES * row_bytes)), 0), host_label
-        gpu = DEVICE_MEMORY_SHARE * torch.cuda.mem_get_info(device)[0]
+        gpu = DEVICE_MEMORY_SHARE * _free_device_memory(device)
         limits = [
             (int(host // (HOST_STAGING_COPIES * row_bytes)), host_label),
             (
@@ -784,14 +810,19 @@ class GLMPCA:
         return max(rows, 0), label
 
     def _rows_source(
-        self, X: torch.Tensor | np.ndarray | ad.AnnData
+        self,
+        X: torch.Tensor | np.ndarray | ad.AnnData,
+        device: torch.device,
+        *,
+        announce: bool = True,
     ) -> torch.Tensor | SparseRows:
         """How fit and transform hold `X`: in the file, sparse, or dense.
 
         An AnnData opened with `backed="r"` stays in its file and is read by blocks
         (`BackedRows`), unless keep_sparse is False, which loads it dense. Any other
-        input is held sparse or dense as `_use_sparse` chooses. With binarize, the
-        values that are not zero are read as 1.
+        input is held sparse or dense as `_use_sparse` chooses for `device`. With
+        binarize, the values that are not zero are read as 1. With announce, it says
+        what it chose.
         """
         if isinstance(X, ad.AnnData) and X.isbacked and self.keep_sparse is not False:
             family = self.exponential_family.family_name
@@ -802,21 +833,32 @@ class GLMPCA:
                     f"{', '.join(repr(name) for name in SPARSE_FAMILIES)}."
                 )
                 raise ValueError(msg)
-            tqdm.write("STORAGE: backed (read by blocks from the file)")
+            if announce:
+                tqdm.write("STORAGE: backed (read by blocks from the file)")
             return BackedRows(X.X, binarize=self.binarize)
-        rows = _to_sparse(X) if self._use_sparse(X) else _to_tensor(X)
+        sparse = self._use_sparse(X, device, announce=announce)
+        rows = _to_sparse(X) if sparse else _to_tensor(X)
         if not self.binarize:
             return rows
         if isinstance(rows, SparseRows):
             return SparseRows(binary(rows.matrix))
         return (rows != 0).to(rows.dtype)
 
-    def _use_sparse(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
+    def _use_sparse(
+        self,
+        X: torch.Tensor | np.ndarray | ad.AnnData,
+        device: torch.device,
+        *,
+        announce: bool = True,
+    ) -> bool:
         """Whether to hold `X` as a CSR matrix: keep_sparse, or the automatic choice.
 
         The automatic choice is dense when the family cannot be sparse, or when the
         data and its saturated parameters fit densely in HOST_MEMORY_SHARE of
-        `_host_memory`. It says what it chose, and why.
+        `_host_memory` and, on CUDA, beside the WORKING_COPIES of one batch in
+        DEVICE_MEMORY_SHARE of the free GPU memory, where the fit then holds them. Off
+        the GPU, a sparse block copies only its non-zeros. With announce, it says what
+        it chose, and the memory that limits it.
         """
         if self.keep_sparse is not None:
             return self.keep_sparse
@@ -824,12 +866,19 @@ class GLMPCA:
         if shape is None or self.exponential_family.family_name not in SPARSE_FAMILIES:
             return False
         dense = 2 * shape[0] * shape[1] * 4
-        allowed = HOST_MEMORY_SHARE * _host_memory()
+        allowed, memory = HOST_MEMORY_SHARE * _host_memory(), "host memory"
+        if device.type == "cuda":
+            batch = WORKING_COPIES * min(self.batch_size, shape[0]) * shape[1] * 4
+            gpu = DEVICE_MEMORY_SHARE * _free_device_memory(device) - batch
+            if gpu < allowed:
+                allowed, memory = gpu, "GPU memory"
         sparse = dense > allowed
-        tqdm.write(
-            f"STORAGE: {'sparse' if sparse else 'dense'} (dense would take "
-            f"{dense / 2**30:.1f} GiB of the {allowed / 2**30:.1f} GiB allowed)"
-        )
+        if announce:
+            tqdm.write(
+                f"STORAGE: {'sparse' if sparse else 'dense'} (dense would take "
+                f"{dense / 2**30:.1f} GiB of the {max(allowed, 0) / 2**30:.1f} GiB "
+                f"allowed ({memory}))"
+            )
         return sparse
 
     def _weighted(self) -> bool:
@@ -933,7 +982,7 @@ class GLMPCA:
             return self.chunk_size
         if device.type != "cuda":
             return self.batch_size_ or self.batch_size
-        free = torch.cuda.mem_get_info(device)[0]
+        free = _free_device_memory(device)
         rows = int(DEVICE_MEMORY_SHARE * free) // (WORKING_COPIES * max(row_bytes, 1))
         return max(1, min(rows, n_rows))
 
@@ -976,7 +1025,7 @@ class GLMPCA:
             msg = "GLMPCA is not fitted. Call fit() before transform()."
             raise RuntimeError(msg)
 
-        X_transform = self._rows_source(X)
+        X_transform = self._rows_source(X, torch.device("cpu"), announce=False)
         device = X_transform.device
         loadings, intercept = loadings.to(device), intercept.to(device)
         self.exponential_family.load_family_params_to_gpu(device)
@@ -988,6 +1037,8 @@ class GLMPCA:
             X_transform.shape[0],
             X_transform.shape[1] * X_transform.dtype.itemsize,
         )
+        if self.depth_factor and not self._weighted():
+            chunk_rows = _depth_chunk(chunk_rows)
         for chunk in rows.slices(chunk_rows):
             data, theta = rows.block(chunk, device)
             projected_parameters = theta - intercept.unsqueeze(0)
