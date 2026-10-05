@@ -444,13 +444,16 @@ def main(
         int,
         typer.Option(
             "--batchSize",
+            min=1,
             rich_help_panel=_OPTIMISATION,
             help=(
                 "Number of cells in each mini-batch. If there are fewer cells, the "
                 "number of cells is used. On the CPU it is also the number of cells "
-                "handled at a time in every pass over the whole matrix, which bounds "
-                "the memory of those passes. On a GPU those passes take as many cells "
-                "as the free memory of the device holds."
+                "handled at a time in every pass over the whole matrix. If one batch "
+                "does not fit in half of the memory (of the machine, or of the job on "
+                "a cluster), the fit stops and gives the largest batch that fits. On "
+                "a GPU the passes take as many cells as the free memory of the device "
+                "holds."
             ),
         ),
     ] = DEFAULT_BATCH_SIZE,
@@ -565,12 +568,15 @@ def main(
             "--keepSparse",
             rich_help_panel=_OPTIMISATION,
             help=(
-                "Hold a sparse matrix as sparse for the whole fit, and densify it one "
+                "Hold the matrix as sparse for the whole fit, and densify it one "
                 "chunk of cells at a time, instead of holding it dense beside a dense "
-                "copy of its saturated parameters. It cuts the memory of the data to "
-                "its non-zero entries, and a fit takes longer, by about half on a "
-                "count matrix with 7% non-zeros. Only gaussian, poisson, "
-                "negative_binomial and bernoulli take it."
+                "copy of its saturated parameters. Without this flag the choice is "
+                "automatic: dense when both dense matrices fit in half of the memory "
+                "(of the machine, or of the job on a cluster), else sparse; the fit "
+                "says what it chose. Sparse cuts the memory of the data to its "
+                "non-zero entries, and a fit takes longer: +14% (adagrad) to +42% "
+                "(cg) on a count matrix with 15% non-zeros. The families beta, "
+                "sigmoid_beta, gamma and lognormal cannot take it."
             ),
         ),
     ] = False,
@@ -783,7 +789,7 @@ def main(
         optimizer=optimizer.value,
         n_jobs=number_of_processors,
         device=device,
-        keep_sparse=keep_sparse,
+        keep_sparse=True if keep_sparse else None,
         depth_factor=depth_factor,
         compile=torch_compile,
         family_params=(
@@ -817,15 +823,16 @@ def main(
             "family": glmpca_family.value,
             "max_iter": max_iter,
             "learning_rate": learning_rate,
-            "batch_size": batch_size,
+            "batch_size": model.batch_size_,
             "gamma": gamma,
             "n_init": n_init,
             "init": init.value,
             "optimizer": optimizer.value,
-            "keep_sparse": keep_sparse,
+            "keep_sparse": model.keep_sparse_,
             "compile": torch_compile,
             "depth_factor": depth_factor,
             "log_normalize": log_normalize,
+            "random_state": model.random_state,
         },
     }
     if depth_components is not None:

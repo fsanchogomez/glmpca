@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import os
 import warnings
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import anndata as ad
@@ -53,11 +55,14 @@ LEARNING_RATE_LIMIT = 1e-8
 PLATEAU_PATIENCE = 10
 PLATEAU_THRESHOLD = 1e-4
 DEFAULT_BATCH_SIZE = 4096
+DEFAULT_RANDOM_STATE = 42
 SPECTRAL_ROWS = 4096
+SPECTRAL_ITERATIONS = 16
 OFFSET_NEWTON_ITERATIONS = 50
 OFFSET_HALVINGS = 30
 OFFSET_TOLERANCE = 1e-6
 DEVICE_MEMORY_SHARE = 0.8
+HOST_MEMORY_SHARE = 0.5
 WORKING_COPIES = 8
 
 
@@ -73,6 +78,26 @@ def _fits_in(free_bytes: int, tensors: tuple[torch.Tensor, ...], working: int) -
     """Whether `tensors` and `working` more bytes fit in a share of `free_bytes`."""
     needed = sum(tensor.nbytes for tensor in tensors) + working
     return needed <= DEVICE_MEMORY_SHARE * free_bytes
+
+
+def _host_memory() -> int:
+    """The memory this process may use: the RAM, or the limit of its cgroup.
+
+    On a cluster the cgroup limit is the memory of the job, which is lower than the
+    RAM of the node.
+    """
+    memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    for limit in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            value = Path(limit).read_text().strip()
+        except OSError:
+            continue
+        if value.isdigit():
+            memory = min(memory, int(value))
+    return memory
 
 
 def _depth_of(centered: torch.Tensor, loadings: torch.Tensor) -> torch.Tensor:
@@ -311,9 +336,10 @@ class GLMPCA:
 
     batch_size : int
         Size of the batch in the SGD optimisation step. If the matrix to fit has
-        fewer rows, the number of rows is used instead and a warning is issued. On the
-        CPU it is also the number of rows of every pass over the whole matrix, unless
-        chunk_size is given. Defaults to DEFAULT_BATCH_SIZE (4096).
+        fewer rows, the number of rows is used instead. On the CPU it is also the
+        number of rows of every pass over the whole matrix. If one batch does not fit
+        in memory (`_rows_that_fit`), fit stops and gives the largest batch that does.
+        Defaults to 4096.
 
     gamma: float
         Factor that multiplies the learning rate when the cost reaches a plateau, that
@@ -377,21 +403,23 @@ class GLMPCA:
         batch_size does not either. One of its steps costs several passes over the
         matrix, and it lowers the cost at every one of them.
 
-    keep_sparse: bool
+    keep_sparse: bool or None
         Whether to hold the input as a CSR matrix for the whole fit, instead of as a
         dense matrix beside a dense copy of its saturated parameters. Every block of
-        rows is densified, and its saturated parameters computed, when it is read. The
-        memory of the data falls from two dense matrices to the non-zero entries, and a
-        pass over the matrix takes longer, by about half on a count matrix with 7%
-        non-zeros. transform then reads its input the same way. Only the families
-        whose data has zeros take it: "gaussian", "poisson", "negative_binomial" and
-        "bernoulli". Defaults to False.
+        rows is densified, and its saturated parameters computed, when it is read.
 
     compile: bool
         Whether to compile the cost of the training loop with `torch.compile`, which
         joins its element-wise operations. This speeds up the training iterations in
         for a fixed compilation time. Recommended for long fits (>100 iters).
         It needs a C++ compiler on the CPU, and Triton on CUDA. Defaults to False.
+
+    random_state: int or None
+        Seed of the fit: the cells of the spectral start, the randomized SVD of that
+        start and the order of the minibatches. fit seeds a numpy generator of its
+        own, and torch inside `torch.random.fork_rng`, so the global random state of
+        the caller is left as it was. None does not seed, and two fits then differ.
+        Defaults to DEFAULT_RANDOM_STATE (42).
 
     """
 
@@ -411,8 +439,9 @@ class GLMPCA:
         device: str | torch.device | None = None,
         chunk_size: int | None = None,
         optimizer: Literal["adagrad", "adam", "cg"] = "adagrad",
-        keep_sparse: bool = False,
+        keep_sparse: bool | None = None,
         compile: bool = False,
+        random_state: int | None = DEFAULT_RANDOM_STATE,
     ) -> None:
         self.n_pc = n_pc
         self.family = family
@@ -423,15 +452,20 @@ class GLMPCA:
         self.initial_learning_rate_ = learning_rate
         self.n_jobs = n_jobs
         self.batch_size = batch_size
+        self.batch_size_: int | None = None
+        self._rows_fit = 2**62
         self.n_init = n_init
         self.gamma = gamma
         self.init = init
         self.depth_factor = depth_factor
         self.chunk_size = chunk_size
-        self._chunk = batch_size if chunk_size is None else chunk_size
+        self._chunk = chunk_size or batch_size
         self.optimizer = optimizer
         self.keep_sparse = keep_sparse
+        self.keep_sparse_: bool | None = None
         self.compile = compile
+        self.random_state = random_state
+        self._rng = np.random.default_rng(random_state)
 
         self.saturated_loadings_: torch.Tensor | None = None
         # Log-likelihood of the fit, the real one, with the base measure
@@ -485,6 +519,18 @@ class GLMPCA:
 
         """
         device = _resolve_device(self.device)
+        seeded = self.random_state is not None
+        with torch.random.fork_rng(
+            devices=[device] if device.type == "cuda" else [], enabled=seeded
+        ):
+            if seeded:
+                torch.manual_seed(self.random_state)
+            self._rng = np.random.default_rng(self.random_state)
+            return self._fit(X)
+
+    def _fit(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
+        """The fit itself, which fit runs with the random state of the model."""
+        device = _resolve_device(self.device)
         if self.init not in ("spectral", "random"):
             msg = f"init={self.init!r} is not valid. Use 'spectral' or 'random'."
             raise ValueError(msg)
@@ -516,7 +562,8 @@ class GLMPCA:
             )
             raise ValueError(msg)
 
-        X_fit = _to_sparse(X) if self.keep_sparse else _to_tensor(X)
+        self.keep_sparse_ = self._use_sparse(X)
+        X_fit = _to_sparse(X) if self.keep_sparse_ else _to_tensor(X)
         if X_fit.shape[0] < 2:
             msg = (
                 f"A fit needs at least 2 rows (cells), but the input has "
@@ -540,10 +587,24 @@ class GLMPCA:
             )
             warnings.warn(msg, UserWarning, stacklevel=2)
             batch_size = X_fit.shape[0]
+        self._rows_fit = self._rows_that_fit(X_fit)
+        if batch_size > self._rows_fit:
+            needed = WORKING_COPIES * batch_size * X_fit.shape[1] * 4
+            msg = (
+                f"batch_size={batch_size} does not fit in memory: one batch of "
+                f"{X_fit.shape[1]} features takes {needed / 2**30:.1f} GiB, beside "
+                f"the data, and {HOST_MEMORY_SHARE * _host_memory() / 2**30:.1f} GiB "
+                f"are allowed. The largest batch that fits is {self._rows_fit}."
+            )
+            raise ValueError(msg)
+        self.batch_size_ = batch_size
 
         _announce_device(device)
         n_rows, row_bytes = X_fit.shape[0], X_fit.shape[1] * X_fit.dtype.itemsize
         self._chunk = self._chunk_rows(device, n_rows, row_bytes)
+        family.family_params["chunk_size"] = self._chunk_rows(
+            torch.device("cpu"), n_rows, row_bytes
+        )
 
         # Fit exponential family params (e.g., dispersion for negative binomial)
         family.initialize_family_parameters(X_fit)
@@ -682,6 +743,38 @@ class GLMPCA:
 
         return True
 
+    def _rows_that_fit(self, X: torch.Tensor | SparseRows) -> int:
+        """How many rows of `X` one block can hold in memory.
+
+        A block takes WORKING_COPIES dense float32 copies of its rows, and the blocks
+        share HOST_MEMORY_SHARE of `_host_memory` with the stored data: the matrix and
+        its saturated parameters when dense, the CSR matrix when sparse.
+        """
+        stored = X.nbytes if isinstance(X, SparseRows) else 2 * X.nbytes
+        free = HOST_MEMORY_SHARE * _host_memory() - stored
+        return max(int(free // (WORKING_COPIES * X.shape[1] * 4)), 0)
+
+    def _use_sparse(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
+        """Whether to hold `X` as a CSR matrix: keep_sparse, or the automatic choice.
+
+        The automatic choice is dense when the family cannot be sparse, or when the
+        data and its saturated parameters fit densely in HOST_MEMORY_SHARE of
+        `_host_memory`. It says what it chose, and why.
+        """
+        if self.keep_sparse is not None:
+            return self.keep_sparse
+        shape = getattr(X, "shape", None)
+        if shape is None or self.exponential_family.family_name not in SPARSE_FAMILIES:
+            return False
+        dense = 2 * shape[0] * shape[1] * 4
+        allowed = HOST_MEMORY_SHARE * _host_memory()
+        sparse = dense > allowed
+        tqdm.write(
+            f"STORAGE: {'sparse' if sparse else 'dense'} (dense would take "
+            f"{dense / 2**30:.1f} GiB of the {allowed / 2**30:.1f} GiB allowed)"
+        )
+        return sparse
+
     def _weighted(self) -> bool:
         """Whether the family is an LSI family, in WEIGHTED_FAMILIES."""
         return self.exponential_family.family_name in WEIGHTED_FAMILIES
@@ -782,7 +875,7 @@ class GLMPCA:
         if self.chunk_size is not None:
             return self.chunk_size
         if device.type != "cuda":
-            return self.batch_size
+            return self.batch_size_ or self.batch_size
         free = torch.cuda.mem_get_info(device)[0]
         rows = int(DEVICE_MEMORY_SHARE * free) // (WORKING_COPIES * max(row_bytes, 1))
         return max(1, min(rows, n_rows))
@@ -826,7 +919,7 @@ class GLMPCA:
             msg = "GLMPCA is not fitted. Call fit() before transform()."
             raise RuntimeError(msg)
 
-        X_transform = _to_sparse(X) if self.keep_sparse else _to_tensor(X)
+        X_transform = _to_sparse(X) if self._use_sparse(X) else _to_tensor(X)
         device = X_transform.device
         loadings, intercept = loadings.to(device), intercept.to(device)
         self.exponential_family.load_family_params_to_gpu(device)
@@ -1063,7 +1156,8 @@ class GLMPCA:
             Device on which the loadings and the intercept are created.
         batch_size : int
             The spectral start and the intercept take
-            min(max(SPECTRAL_ROWS, batch_size), n) random cells.
+            min(max(SPECTRAL_ROWS, batch_size), n) random cells, and no more than
+            fit in memory, but at least n_pc.
 
         Returns
         -------
@@ -1081,21 +1175,23 @@ class GLMPCA:
 
         """
         n, p = rows.shape
-        random_batch_size = min(max(SPECTRAL_ROWS, batch_size), n)
-        random_idx = np.random.choice(
-            np.arange(n), replace=False, size=random_batch_size
+        random_batch_size = max(
+            min(max(SPECTRAL_ROWS, batch_size), n, self._rows_fit), self.n_pc
         )
+        random_idx = self._rng.choice(n, replace=False, size=random_batch_size)
         _, subset = (
             part.cpu() for part in rows.block(torch.from_numpy(random_idx), device)
         )
         components = self.n_pc
         if self.init == "spectral":
-            _, _, v = torch.linalg.svd(
-                subset if self._weighted() else subset - torch.mean(subset, dim=0),
-                full_matrices=False,
+            centered = subset if self._weighted() else subset - subset.mean(dim=0)
+            _, _, v = torch.svd_lowrank(
+                centered,
+                q=min(2 * components, *centered.shape),
+                niter=SPECTRAL_ITERATIONS,
             )
             loadings = ManifoldParameter(
-                v[:components, :].T.to(device), manifold=Grassmann()
+                v[:, :components].to(device), manifold=Grassmann()
             )
         elif self.init == "random":
             loadings = ManifoldParameter(
@@ -1136,6 +1232,7 @@ class GLMPCA:
 
         tqdm.write(f"GLMPCA FAMILY: {self.family}")
         tqdm.write(f"INITIAL LEARNING RATE: {self.learning_rate_}")
+        tqdm.write(f"BATCH SIZE: {batch_size}")
         algorithm = _OPTIMIZERS[self.optimizer]
         optimizer = algorithm(params=groups)
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

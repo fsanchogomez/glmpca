@@ -26,6 +26,7 @@ from glmpca.GLMPCA import (
     PLATEAU_PATIENCE,
     WORKING_COPIES,
     _fits_in,
+    _host_memory,
     _Rows,
     _to_tensor,
 )
@@ -616,15 +617,15 @@ def test_the_spectral_start_takes_at_least_spectral_rows_cells(
 ) -> None:
     monkeypatch.setattr("glmpca.GLMPCA.SPECTRAL_ROWS", 8)
     shapes = []
-    svd = torch.linalg.svd
+    svd_lowrank = torch.svd_lowrank
 
     def recording_svd(
-        A: torch.Tensor, full_matrices: bool = True
+        A: torch.Tensor, q: int, niter: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         shapes.append(tuple(A.shape))
-        return svd(A, full_matrices=full_matrices)
+        return svd_lowrank(A, q=q, niter=niter)
 
-    monkeypatch.setattr(torch.linalg, "svd", recording_svd)
+    monkeypatch.setattr(torch, "svd_lowrank", recording_svd)
     model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=batch_size)
 
     with warnings.catch_warnings():
@@ -860,11 +861,149 @@ def test_a_binomial_fit_takes_its_number_of_trials(keep_sparse: bool) -> None:
     assert np.isfinite(model.log_likelihood_)
 
 
+@pytest.mark.parametrize(
+    ("family", "memory", "chosen", "report"),
+    [
+        (GLMFamily.poisson, 10**15, False, "STORAGE: dense"),
+        (GLMFamily.poisson, 10, True, "STORAGE: sparse"),
+        (GLMFamily.gamma, 10, False, ""),
+    ],
+)
+def test_keep_sparse_none_chooses_the_storage_from_the_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    family: GLMFamily,
+    memory: int,
+    chosen: bool,
+    report: str,
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: memory)
+    monkeypatch.setattr(GLMPCA, "_rows_that_fit", lambda self, X: 10**9)
+    model = GLMPCA(N_PC, family=family, max_iter=1, batch_size=16)
+
+    model.fit(sample(family))
+
+    assert model.keep_sparse is None
+    assert model.keep_sparse_ is chosen
+    assert report in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("keep_sparse", "memory"), [(True, 10**15), (False, 10)])
+def test_an_explicit_keep_sparse_wins_over_the_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    keep_sparse: bool,
+    memory: int,
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: memory)
+    monkeypatch.setattr(GLMPCA, "_rows_that_fit", lambda self, X: 10**9)
+    model = GLMPCA(
+        N_PC, family="poisson", max_iter=1, batch_size=16, keep_sparse=keep_sparse
+    )
+
+    model.fit(sample(GLMFamily.poisson))
+
+    assert model.keep_sparse_ is keep_sparse
+    assert "STORAGE:" not in capsys.readouterr().out
+
+
+def test_the_host_memory_is_the_lower_of_the_ram_and_the_cgroup_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "glmpca.GLMPCA.os.sysconf",
+        lambda name: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 10**6}[name],
+    )
+
+    def read_text(path: Path) -> str:
+        if str(path) == "/sys/fs/cgroup/memory.max":
+            return "1000000\n"
+        raise OSError
+
+    monkeypatch.setattr("glmpca.GLMPCA.Path.read_text", read_text)
+
+    assert _host_memory() == 1_000_000
+
+
+def test_a_given_batch_size_is_used_and_reported(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=16)
+
+    model.fit(sample(GLMFamily.poisson))
+
+    assert model.batch_size_ == 16
+    output = capsys.readouterr().out
+    assert "BATCH SIZE: 16\n" in output
+    assert "as many cells as fit" not in output
+
+
+def test_the_default_random_state_makes_two_fits_equal() -> None:
+    X = sample(GLMFamily.poisson)
+    loadings = []
+    for outside_seed in (1, 2):
+        torch.manual_seed(outside_seed)
+        np.random.seed(outside_seed)
+        model = GLMPCA(N_PC, family="poisson", max_iter=3, batch_size=8)
+        model.fit(X)
+        assert model.random_state == 42
+        loadings.append(model.saturated_loadings_)
+
+    torch.testing.assert_close(loadings[0], loadings[1], atol=0, rtol=0)
+
+
+def test_fit_leaves_the_global_random_state_of_the_caller_alone() -> None:
+    X = sample(GLMFamily.poisson)
+    torch_state = torch.random.get_rng_state()
+    numpy_state = np.random.get_state()
+
+    GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=8).fit(X)
+
+    torch.testing.assert_close(torch.random.get_rng_state(), torch_state)
+    after = np.random.get_state()
+    assert after[0] == numpy_state[0]
+    np.testing.assert_array_equal(after[1], numpy_state[1])
+
+
+def test_no_random_state_gives_fits_that_differ() -> None:
+    X = sample(GLMFamily.poisson)
+    fits = [
+        GLMPCA(N_PC, family="poisson", max_iter=3, batch_size=8, random_state=None)
+        for _ in range(2)
+    ]
+    for model in fits:
+        model.fit(X)
+
+    assert not torch.equal(fits[0].saturated_loadings_, fits[1].saturated_loadings_)
+
+
 def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> None:
     model = GLMPCA(N_PC, family="poisson")
 
     assert model.batch_size == DEFAULT_BATCH_SIZE == 4096
     assert model.chunk_size is None
+
+
+def test_a_batch_that_does_not_fit_in_memory_stops_with_the_largest_that_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: 15_360)
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=16)
+
+    with pytest.raises(ValueError, match="The largest batch that fits is 10"):
+        model.fit(sample(GLMFamily.poisson))
+
+
+def test_a_batch_that_fits_in_memory_is_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: 15_360)
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8)
+
+    model.fit(sample(GLMFamily.poisson))
+
+    assert model.keep_sparse_ is False
+    assert model.batch_size_ == 8
 
 
 def test_on_the_cpu_a_pass_takes_the_batch_size_unless_a_chunk_size_is_given() -> None:

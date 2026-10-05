@@ -609,6 +609,60 @@ def test_the_binomial_stores_its_trials_and_clipped_entries_in_uns(
     assert report["n_clipped"] == int((counts > 3).sum())
 
 
+def test_without_keep_sparse_the_storage_is_chosen_and_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models: list[GLMPCA] = []
+    original_fit = GLMPCA.fit
+
+    def recording_fit(self: GLMPCA, X: ad.AnnData) -> bool:
+        models.append(self)
+        return original_fit(self, X)
+
+    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path)
+
+    assert result.exit_code == 0, result.output
+    (model,) = models
+    assert model.keep_sparse is None
+    assert "STORAGE: dense" in result.output
+    params = ad.read_h5ad(out_path).uns["glmPCA"]["params"]
+    assert not params["keep_sparse"]
+    assert params["batch_size"] == model.batch_size_
+
+
+def test_the_fit_is_seeded_so_two_runs_give_the_same_scores(tmp_path: Path) -> None:
+    input_path = write_input(tmp_path, poisson_counts())
+    scores = []
+    for outside_seed in (1, 2):
+        torch.manual_seed(outside_seed)
+        np.random.seed(outside_seed)
+        out_path = tmp_path / f"out{outside_seed}.h5ad"
+        result = runner.invoke(
+            app,
+            [
+                "-i",
+                str(input_path),
+                "-o",
+                str(out_path),
+                "-n",
+                str(N_PC),
+                "--maxIter",
+                "3",
+                "--batchSize",
+                "8",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        adata = ad.read_h5ad(out_path)
+        assert adata.uns["glmPCA"]["params"]["random_state"] == 42
+        scores.append(adata.obsm["X_glmPCA"])
+
+    np.testing.assert_array_equal(scores[0], scores[1])
+
+
 def _lsi_idf(family: str, counts: np.ndarray) -> np.ndarray:
     if family == "signac_lsi":
         return counts.shape[0] / np.maximum(counts.sum(axis=0), 1.0)
