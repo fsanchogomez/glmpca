@@ -218,7 +218,7 @@ def test_glmpca_reports_errors_without_a_traceback(
 def test_glmpca_rejects_an_unknown_family(tmp_path: Path) -> None:
     input_path = write_input(tmp_path, poisson_counts())
 
-    result = run(input_path, tmp_path / "out.h5ad", "-gf", "binomial")
+    result = run(input_path, tmp_path / "out.h5ad", "-gf", "dirichlet")
 
     assert result.exit_code == 2
 
@@ -591,6 +591,22 @@ def test_log_normalize_is_ignored_for_an_lsi_family(
         _lsi_idf(family, counts),
         rtol=1e-6,
     )
+
+
+def test_the_binomial_stores_its_trials_and_clipped_entries_in_uns(
+    tmp_path: Path,
+) -> None:
+    counts = poisson_counts()
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(
+        write_input(tmp_path, counts), out_path, "-gf", "binomial", "--nTrials", "3"
+    )
+
+    assert result.exit_code == 0, result.output
+    report = ad.read_h5ad(out_path).uns["glmPCA"]
+    assert report["n_trials"] == 3
+    assert report["n_clipped"] == int((counts > 3).sum())
 
 
 def _lsi_idf(family: str, counts: np.ndarray) -> np.ndarray:

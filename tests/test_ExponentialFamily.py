@@ -16,6 +16,7 @@ import torch
 from glmpca.ExponentialFamily import (
     Bernoulli,
     Beta,
+    Binomial,
     Gamma,
     Gaussian,
     GLMFamily,
@@ -524,4 +525,76 @@ def test_the_log_base_measure_completes_the_density(family: GLMFamily) -> None:
         distribution.log_base_measure(X),
         rtol=1e-5,
         atol=1e-5,
+    )
+
+
+def test_binomial_log_density_matches_scipy_after_clipping() -> None:
+    X = torch.tensor([[0.0, 3.0, 12.0, 15.0], [1.0, 0.0, 7.0, 2.0]])
+    theta = torch.randn(2, 4)
+    family = Binomial({"n_trials": 12})
+    family.initialize_family_parameters(X)
+
+    expected = scipy.stats.binom.logpmf(
+        np.minimum(X.numpy(), 12), 12, torch.sigmoid(theta.double()).numpy()
+    )
+    np.testing.assert_allclose(
+        family.log_distribution(X, theta).double().numpy(), expected, atol=1e-5
+    )
+
+
+def test_binomial_with_one_trial_is_bernoulli() -> None:
+    X = torch.bernoulli(torch.full((5, 6), 0.4))
+    theta = torch.randn(5, 6)
+
+    torch.testing.assert_close(
+        Binomial().neg_log_likelihood(X, theta),
+        Bernoulli().neg_log_likelihood(X, theta),
+    )
+    torch.testing.assert_close(Binomial().invert_g(X), Bernoulli().invert_g(X))
+
+
+def test_binomial_counts_and_reports_the_clipped_entries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    X = torch.tensor([[0.0, 3.0, 12.0, 15.0], [1.0, 13.0, 7.0, 2.0]])
+    family = Binomial({"n_trials": 12})
+
+    family.initialize_family_parameters(X)
+
+    assert family.family_params["n_clipped"] == 2
+    assert "CLIPPED: 2 of 8 entries" in capsys.readouterr().out
+    torch.testing.assert_close(
+        family.invert_g(X)[0, 3], family.invert_g(torch.tensor([[12.0]]))[0, 0]
+    )
+
+
+def test_binomial_rejects_negative_values_and_no_trials() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        Binomial({"n_trials": 3}).initialize_family_parameters(torch.tensor([[-1.0]]))
+    with pytest.raises(ValueError, match="n_trials=0"):
+        Binomial({"n_trials": 0})
+
+
+def test_bernoulli_is_the_binomial_with_one_trial() -> None:
+    family = Bernoulli()
+
+    assert isinstance(family, Binomial)
+    assert family.family_name == "bernoulli"
+    assert family.family_params["n_trials"] == 1
+    with pytest.raises(ValueError, match="one trial"):
+        Bernoulli({"n_trials": 3})
+
+
+def test_bernoulli_counts_a_value_above_one_as_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    X = torch.tensor([[0.0, 1.0, 4.0]])
+    family = Bernoulli()
+
+    family.initialize_family_parameters(X)
+
+    assert family.family_params["n_clipped"] == 1
+    assert "CLIPPED: 1 of 3 entries" in capsys.readouterr().out
+    torch.testing.assert_close(
+        family.invert_g(X), family.invert_g(torch.tensor([[0.0, 1.0, 1.0]]))
     )

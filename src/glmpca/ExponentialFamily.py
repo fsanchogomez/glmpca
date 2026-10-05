@@ -68,6 +68,7 @@ class GLMFamily(str, Enum):
     gaussian = "gaussian"
     poisson = "poisson"
     bernoulli = "bernoulli"
+    binomial = "binomial"
     beta = "beta"
     gamma = "gamma"
     lognormal = "lognormal"
@@ -83,6 +84,7 @@ class GLMFamily(str, Enum):
             GLMFamily.gaussian: Gaussian,
             GLMFamily.poisson: Poisson,
             GLMFamily.bernoulli: Bernoulli,
+            GLMFamily.binomial: Binomial,
             GLMFamily.beta: Beta,
             GLMFamily.gamma: Gamma,
             GLMFamily.lognormal: LogNormal,
@@ -274,48 +276,124 @@ class Gaussian(ExponentialFamily):
         return X
 
 
-class Bernoulli(ExponentialFamily):
-    r"""Bernoulli distribution
+class Binomial(ExponentialFamily):
+    r"""Binomial with a fixed number of trials N for every entry.
+
+    A feature with N sites, each of them cut or not, gives a count from 0 to N:
+
+        log p(x) = x theta - N softplus(theta) + log C(N, x)
+
+    with `theta` the log-odds of a site. Bernoulli is the case N = 1. For chromatin
+    bins, N is the number of nucleosomes that fit in a bin times the copies of the
+    genome, for example 12 for a bin of 1 kb in a diploid cell. A count above N cannot
+    come from N sites, so every method clips the data to N, and
+    initialize_family_parameters reports how many entries it clips.
 
     family_params of interest:
-        - "max_val" (int) corresponding to the max value (replaces infinity).
-        Empirically, values above 10 yield similar results.
-
+        - "n_trials" (int): N. Defaults to 1.
+        - "max_val" (float): bound of the saturated log-odds, which replaces the
+        infinity of `logit(0)` and `logit(1)`. Values above 10 give similar results.
+        Defaults to 30.
+        - "n_clipped" (int): entries above N, set by initialize_family_parameters.
     """
 
     def __init__(
         self, family_params: dict[str, Any] | None = None, **kwargs: object
     ) -> None:
-        self.family_name = "bernoulli"
-        default_family_params: dict[str, Any] = {"max_val": 30}
+        self.family_name = "binomial"
+        default_family_params: dict[str, Any] = {"max_val": 30, "n_trials": 1}
         self.family_params = (
             dict(family_params) if family_params else default_family_params
         )
         self.family_params.update(kwargs)
         for key, value in default_family_params.items():
             self.family_params.setdefault(key, value)
+        if int(self.family_params["n_trials"]) < 1:
+            msg = (
+                f"n_trials={self.family_params['n_trials']} is not valid. Use 1 or "
+                f"more."
+            )
+            raise ValueError(msg)
+
+    def _clipped(self, X: torch.Tensor) -> torch.Tensor:
+        return X.clip(max=float(self.family_params["n_trials"]))
 
     def sufficient_statistics(self, X: torch.Tensor) -> torch.Tensor:
-        return X
+        return self._clipped(X)
 
     def natural_parametrization(self, theta: torch.Tensor) -> torch.Tensor:
         return theta
 
     def log_partition(self, theta: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.softplus(theta)
+        return float(self.family_params["n_trials"]) * torch.nn.functional.softplus(
+            theta
+        )
+
+    def log_base_measure(self, X: torch.Tensor) -> torch.Tensor:
+        n_trials = float(self.family_params["n_trials"])
+        X = self._clipped(X)
+        return (
+            math.lgamma(n_trials + 1)
+            - torch.lgamma(X + 1)
+            - torch.lgamma(n_trials - X + 1)
+        )
 
     def base_measure(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.ones_like(X)
+        return torch.exp(self.log_base_measure(X))
+
+    def log_distribution(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        expt = self.exponential_term(X, theta) - self.log_partition(theta)
+        return expt + self.log_base_measure(X)
 
     def invert_g(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.log(X / (1 - X)).clip(
+        share = self._clipped(X) / float(self.family_params["n_trials"])
+        return torch.log(share / (1 - share)).clip(
             -self.family_params["max_val"], self.family_params["max_val"]
         )
 
-    def neg_log_likelihood(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        """Computes negative log-likelihood between dataset X and parameters theta"""
-        expt = self.exponential_term(X, theta) - self.log_partition(theta)
-        return -torch.sum(expt)
+    def initialize_family_parameters(self, X: torch.Tensor | SparseRows) -> None:
+        """Counts the entries above N, which every method clips to N."""
+        n_trials = float(self.family_params["n_trials"])
+        chunk = int(self.family_params.get("chunk_size", 8192))
+        clipped = 0
+        for start in range(0, X.shape[0], chunk):
+            block = X[start : start + chunk]
+            if bool((block < 0).any()):
+                msg = (
+                    f"The {self.family_name} family takes counts, but the input has "
+                    f"negative values."
+                )
+                raise ValueError(msg)
+            clipped += int((block > n_trials).sum())
+        self.family_params["n_clipped"] = clipped
+        if clipped:
+            tqdm.write(
+                f"CLIPPED: {clipped} of {X.shape[0] * X.shape[1]} entries are above "
+                f"n_trials={int(n_trials)} and count as {int(n_trials)}"
+            )
+
+
+class Bernoulli(Binomial):
+    r"""Bernoulli distribution: the binomial with one trial.
+
+    A value above 1 counts as 1, and initialize_family_parameters reports how many
+    entries that changes.
+
+    family_params of interest:
+        - "max_val" (float): bound of the saturated log-odds, as in Binomial.
+    """
+
+    def __init__(
+        self, family_params: dict[str, Any] | None = None, **kwargs: object
+    ) -> None:
+        super().__init__(family_params, **kwargs)
+        if int(self.family_params["n_trials"]) != 1:
+            msg = (
+                f"The Bernoulli family has one trial, not "
+                f"n_trials={self.family_params['n_trials']}. Use the binomial family."
+            )
+            raise ValueError(msg)
+        self.family_name = "bernoulli"
 
 
 class Poisson(ExponentialFamily):

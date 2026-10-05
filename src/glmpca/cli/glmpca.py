@@ -83,6 +83,7 @@ class FamilyChoice(str, Enum):
     gaussian = "gaussian"
     poisson = "poisson"
     bernoulli = "bernoulli"
+    binomial = "binomial"
     negative_binomial = "negative_binomial"
     beta = "beta"
     gamma = "gamma"
@@ -408,6 +409,7 @@ def main(
                 "One of: [bold yellow]gaussian[/bold yellow], "
                 "[bold yellow]poisson[/bold yellow], "
                 "[bold yellow]bernoulli[/bold yellow], "
+                "[bold yellow]binomial[/bold yellow], "
                 "[bold yellow]beta[/bold yellow], "
                 "[bold yellow]gamma[/bold yellow], "
                 "[bold yellow]lognormal[/bold yellow], "
@@ -506,6 +508,22 @@ def main(
             ),
         ),
     ] = Optimizer.adagrad,
+    n_trials: Annotated[
+        int,
+        typer.Option(
+            "--nTrials",
+            min=1,
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Number of trials of ``-gf binomial``: the largest count an entry can "
+                "hold, for example 12 for chromatin bins of 1 kb in a diploid cell "
+                "(about 6 nucleosomes per copy). Larger counts are clipped to it, and "
+                "the number of clipped entries is reported and stored in "
+                '``uns["glmPCA"]``. 1 gives the Bernoulli family. It does not apply '
+                "to the other families."
+            ),
+        ),
+    ] = 1,
     depth_factor: Annotated[
         bool,
         typer.Option(
@@ -724,6 +742,7 @@ def main(
             keep_sparse=keep_sparse,
             torch_compile=torch_compile,
             depth_factor=depth_factor,
+            n_trials=n_trials,
             log_normalize=log_normalize,
             out_file_umap=out_file_umap,
             n_neighbors=n_neighbors,
@@ -744,7 +763,7 @@ def main(
         raise fail(msg)
     if log_normalize and glmpca_family.value in WEIGHTED_FAMILIES:
         logging.warning(
-            "--logNormalize is ignored for -gf %s, which weighs the raw counts itself.",
+            "--logNormalize is ignored for -gf %s, which needs the raw counts.",
             glmpca_family.value,
         )
         log_normalize = False
@@ -767,6 +786,9 @@ def main(
         keep_sparse=keep_sparse,
         depth_factor=depth_factor,
         compile=torch_compile,
+        family_params=(
+            {"n_trials": n_trials} if glmpca_family is FamilyChoice.binomial else None
+        ),
     )
     scores, loadings, intercept, depth = run_glmpca(model, fit_data)
     if glmpca_family is FamilyChoice.negative_binomial:
@@ -783,6 +805,12 @@ def main(
         adata.obs["glmPCA_depth"] = depth
     if dispersion is not None:
         adata.var["MLE_dispersion"] = dispersion
+    binomial_report = None
+    if glmpca_family is FamilyChoice.binomial:
+        binomial_report = {
+            "n_trials": n_trials,
+            "n_clipped": model.exponential_family.family_params["n_clipped"],
+        }
     adata.uns["glmPCA"] = {
         "params": {
             "n_pc": n_prin_comps,
@@ -802,6 +830,8 @@ def main(
     }
     if depth_components is not None:
         adata.uns["glmPCA"].update(depth_components)
+    if binomial_report is not None:
+        adata.uns["glmPCA"].update(binomial_report)
 
     if out_file_umap is not None:
         embedding, clusters = umap_leiden(scores, n_neighbors, cluster_resolution)

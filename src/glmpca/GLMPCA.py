@@ -41,6 +41,7 @@ SPARSE_FAMILIES = (
     "poisson",
     "negative_binomial",
     "bernoulli",
+    "binomial",
     "signac_lsi",
     "gensim_lsi",
 )
@@ -343,7 +344,8 @@ class GLMPCA:
         "poisson", "negative_binomial", "lognormal" and, for the fitted mean, "gamma".
         For "gaussian" it shifts the mean rather than scaling it, and the families on
         a bounded support have no multiplicative depth at all, so there it is a plain
-        offset of a cell rather than a size factor.
+        offset of a cell rather than a size factor. For the LSI families it drops the
+        components that follow the depth instead.
 
     n_jobs: int or None
         Number of jobs for the per-feature fits of the family parameters. If given,

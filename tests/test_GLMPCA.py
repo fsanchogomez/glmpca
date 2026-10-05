@@ -56,7 +56,11 @@ def sample(family: GLMFamily) -> torch.Tensor:
     shape = (N_CELLS, N_FEATURES)
     if family is GLMFamily.gaussian:
         return torch.randn(shape)
-    if family in {GLMFamily.poisson, GLMFamily.signac_lsi, GLMFamily.gensim_lsi}:
+    if family in {
+        GLMFamily.poisson,
+        GLMFamily.signac_lsi,
+        GLMFamily.gensim_lsi,
+    }:
         return torch.poisson(torch.full(shape, 3.0))
     if family is GLMFamily.negative_binomial:
         return torch.distributions.NegativeBinomial(
@@ -835,6 +839,25 @@ def test_signac_lsi_scales_its_scores_and_gensim_lsi_does_not() -> None:
     torch.testing.assert_close(scores.std(dim=0), torch.ones(3), atol=1e-4, rtol=0)
     assert gensim.score_mean_ is None
     assert gensim.score_sd_ is None
+
+
+@pytest.mark.parametrize("keep_sparse", [False, True])
+def test_a_binomial_fit_takes_its_number_of_trials(keep_sparse: bool) -> None:
+    X = torch.poisson(torch.full((N_CELLS, N_FEATURES), 3.0))
+    model = GLMPCA(
+        N_PC,
+        family="binomial",
+        family_params={"n_trials": 6},
+        max_iter=2,
+        batch_size=16,
+        keep_sparse=keep_sparse,
+    )
+
+    model.fit(X.numpy())
+
+    assert model.exponential_family.family_params["n_clipped"] == int((X > 6).sum())
+    assert model.log_likelihood_ is not None
+    assert np.isfinite(model.log_likelihood_)
 
 
 def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> None:
