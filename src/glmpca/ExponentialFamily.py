@@ -74,12 +74,8 @@ class GLMFamily(str, Enum):
     lognormal = "lognormal"
     sigmoid_beta = "sigmoid_beta"
     negative_binomial = "negative_binomial"
-    signac_lsi = "signac_lsi"
-    gensim_lsi = "gensim_lsi"
 
     def distribution(self) -> type[ExponentialFamily]:
-        from .LSIfamilies import GensimLSI, SignacLSI  # noqa: PLC0415
-
         return {
             GLMFamily.gaussian: Gaussian,
             GLMFamily.poisson: Poisson,
@@ -90,8 +86,6 @@ class GLMFamily(str, Enum):
             GLMFamily.lognormal: LogNormal,
             GLMFamily.sigmoid_beta: SigmoidBeta,
             GLMFamily.negative_binomial: NegativeBinomial,
-            GLMFamily.signac_lsi: SignacLSI,
-            GLMFamily.gensim_lsi: GensimLSI,
         }[self]
 
 

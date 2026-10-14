@@ -55,10 +55,22 @@ class Grassmann(EuclideanStiefel):
     egrad2rgrad = proju
 
 
+def largest_entry_signs(basis: torch.Tensor) -> torch.Tensor:
+    """The sign that makes the entry of largest magnitude of every column positive.
+
+    A zero column keeps its sign. Multiplying the columns by it fixes the arbitrary sign
+    of an eigenvector or a singular vector.
+    """
+    largest = basis.abs().argmax(dim=0)
+    signs = torch.sign(
+        basis[largest, torch.arange(basis.shape[1], device=basis.device)]
+    )
+    signs[signs == 0] = 1
+    return signs
+
+
 def canonical_basis(
-    loadings: torch.Tensor,
-    centered_chunks: Iterable[torch.Tensor],
-    center: bool = True,
+    loadings: torch.Tensor, centered_chunks: Iterable[torch.Tensor]
 ) -> torch.Tensor:
     r"""The basis of `span(loadings)` whose scores are uncorrelated, by variance.
 
@@ -76,9 +88,6 @@ def canonical_basis(
     runs.
 
     The span, and with it `V Vᵀ` and every fitted value, does not change.
-
-    With `center=False` the scores are not centered: the basis diagonalises their second
-    moment, and the columns are sorted by it. Used for the LSI families.
     """
     size = loadings.shape[1]
     gram = torch.zeros(size, size, dtype=torch.float64)
@@ -90,16 +99,10 @@ def canonical_basis(
         total += scores.sum(dim=0)
         rows += scores.shape[0]
     mean = total / max(rows, 1)
-    covariance = gram / max(rows, 1)
-    if center:
-        covariance = covariance - torch.outer(mean, mean)
+    covariance = gram / max(rows, 1) - torch.outer(mean, mean)
 
     variances, rotation = torch.linalg.eigh(covariance)
     order = torch.argsort(variances, descending=True)
     rotation = rotation[:, order].to(dtype=loadings.dtype, device=loadings.device)
     basis = loadings @ rotation
-
-    largest = basis.abs().argmax(dim=0)
-    signs = torch.sign(basis[largest, torch.arange(size, device=basis.device)])
-    signs[signs == 0] = 1
-    return basis * signs
+    return basis * largest_entry_signs(basis)

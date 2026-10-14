@@ -9,8 +9,7 @@ import numpy as np
 import pytest
 import scipy.stats
 import torch
-from glmpca.LSA import LSA, idf, tfidf
-from glmpca.LSIfamilies import GensimLSI, SignacLSI
+from glmpca.LSA import LSA, TFIDF_SCALE, idf, tfidf
 from scipy import sparse
 
 if TYPE_CHECKING:
@@ -55,36 +54,65 @@ def captured(model: LSA, X: sparse.csr_matrix) -> float:
     return float(np.square(product).sum() / np.square(best).sum())
 
 
-@pytest.mark.parametrize(
-    ("flavor", "family_type"), [("signac", SignacLSI), ("gensim", GensimLSI)]
+LSI_COUNTS = np.array(
+    [
+        [1, 0, 3, 2, 0],
+        [0, 2, 1, 4, 0],
+        [5, 1, 0, 1, 0],
+        [2, 0, 0, 3, 0],
+        [0, 0, 7, 1, 0],
+        [1, 1, 1, 1, 0],
+    ],
+    dtype=np.float32,
 )
-def test_tfidf_is_the_weighting_of_the_lsi_family(
-    flavor: str, family_type: type
-) -> None:
-    rng = np.random.default_rng(0)
-    counts = rng.poisson(0.7, size=(30, 9)).astype(np.float32)
-    counts[:, 4] = 0
-    counts[:, 6] = 1 + counts[:, 6]
-    family = family_type()
-    family.initialize_family_parameters(torch.from_numpy(counts))
+"""Feature 3 is held by every cell and feature 4 by none."""
+
+GENSIM_WEIGHTS = np.array([
+    [0.2228428574, 0.0, 0.57604043, 0.0, 0.0],
+    [0.0, 0.7619047619, 0.2228428574, 0.0, 0.0],
+    [0.7402679488, 0.380952381, 0.0, 0.0, 0.0],
+    [0.4926000006, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.9377515185, 0.0, 0.0],
+    [0.2034652176, 0.347826087, 0.2034652176, 0.0, 0.0],
+])
+"""gensim 4.4.0, `TfidfModel(corpus, normalize=True, smartirs="lfu")`, on LSI_COUNTS."""
+
+
+def tfidf_of_counts(flavor: str, counts: np.ndarray) -> np.ndarray:
     feature_idf, pivot = idf(
         flavor, counts.sum(axis=0), (counts > 0).sum(axis=0), counts.shape[0]
     )
+    return tfidf(sparse.csr_matrix(counts), flavor, feature_idf, pivot).toarray()
 
-    result = tfidf(sparse.csr_matrix(counts), flavor, feature_idf, pivot)
+
+def test_the_gensim_tfidf_is_the_tfidf_of_gensim() -> None:
+    np.testing.assert_allclose(
+        tfidf_of_counts("gensim", LSI_COUNTS), GENSIM_WEIGHTS, atol=1e-6
+    )
+
+
+def test_the_signac_tfidf_is_the_tfidf_of_signac_runtfidf() -> None:
+    depth = LSI_COUNTS.sum(axis=1, keepdims=True)
+    feature_idf = LSI_COUNTS.shape[0] / np.maximum(LSI_COUNTS.sum(axis=0), 1.0)
+    expected = np.log1p(LSI_COUNTS / depth * feature_idf * TFIDF_SCALE)
 
     np.testing.assert_allclose(
-        feature_idf, family.family_params["idf"].numpy(), rtol=1e-6
+        tfidf_of_counts("signac", LSI_COUNTS), expected, rtol=1e-6
     )
-    if flavor == "gensim":
-        assert pivot == pytest.approx(family.family_params["pivot"])
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_the_tfidf_keeps_the_entries_of_the_counts(flavor: str) -> None:
+    counts = sparse.csr_matrix(LSI_COUNTS)
+    feature_idf, pivot = idf(
+        flavor, LSI_COUNTS.sum(axis=0), (LSI_COUNTS > 0).sum(axis=0), 6
+    )
+
+    result = tfidf(counts, flavor, feature_idf, pivot)
+
     assert sparse.isspmatrix_csr(result)
-    np.testing.assert_allclose(
-        result.toarray(),
-        family.weigh(torch.from_numpy(counts)).numpy(),
-        rtol=1e-6,
-        atol=1e-7,
-    )
+    np.testing.assert_array_equal(result.indices, counts.indices)
+    np.testing.assert_array_equal(result.indptr, counts.indptr)
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)

@@ -22,11 +22,11 @@ from tqdm.auto import tqdm
 
 from .GLMPCA import (
     DEFAULT_RANDOM_STATE,
-    DEPTH_CORRELATION_CUTOFF,
     _announce_device,
     _resolve_device,
     _to_sparse,
 )
+from .manifolds import largest_entry_signs
 from .sparse import BackedRows, SparseRows, binary
 
 if TYPE_CHECKING:
@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 DEFAULT_CHUNK_ROWS = 16384
 FLAVORS = ("gensim", "signac")
 SOLVERS = ("auto", "arpack", "randomized")
+DEPTH_CORRELATION_CUTOFF = 0.75
+"""|Spearman rho| with the depth above which drop_depth drops a component."""
 # Scale factor of Signac's `RunTFIDF(method = 1)`, applied before `log1p`.
 TFIDF_SCALE = 1e4
 # Slope of gensim's pivoted unique normalization, `smartirs="lfu"`.
@@ -263,9 +265,7 @@ class LSA:
             _announce_device(device)
             components, singular, scores = self._randomized(source, device)
 
-        largest = components.abs().argmax(dim=0)
-        signs = torch.sign(components[largest, torch.arange(components.shape[1])])
-        signs[signs == 0] = 1.0
+        signs = largest_entry_signs(components)
         components, scores = components * signs, scores * signs
 
         self.depth_correlations_ = self.n_dropped_components_ = None

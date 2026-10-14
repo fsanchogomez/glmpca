@@ -20,7 +20,7 @@ from scipy import sparse
 from tqdm.auto import tqdm
 
 from glmpca.ExponentialFamily import _n_workers
-from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA, WEIGHTED_FAMILIES
+from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA
 
 DESCRIPTION = (
     "Reduce the dimensionality of a cell-by-feature matrix with GLM-PCA.\n\n"
@@ -91,8 +91,6 @@ class FamilyChoice(str, Enum):
     gamma = "gamma"
     lognormal = "lognormal"
     sigmoid_beta = "sigmoid_beta"
-    signac_lsi = "signac_lsi"
-    gensim_lsi = "gensim_lsi"
 
 
 class PlotFileFormat(str, Enum):
@@ -461,9 +459,8 @@ def main(
                 "[bold yellow]gamma[/bold yellow], "
                 "[bold yellow]lognormal[/bold yellow], "
                 "[bold yellow]sigmoid_beta[/bold yellow], "
-                "[bold yellow]negative_binomial[/bold yellow], "
-                "[bold yellow]signac_lsi[/bold yellow], "
-                "[bold yellow]gensim_lsi[/bold yellow]."
+                "[bold yellow]negative_binomial[/bold yellow]. For latent semantic "
+                "analysis, use the ``scLSA`` command."
             ),
         ),
     ] = FamilyChoice.poisson,
@@ -589,11 +586,7 @@ def main(
                 "``poisson`` and ``negative_binomial``, a size factor; for "
                 "``bernoulli`` and ``binomial`` it takes the slope of every feature. "
                 "With ``--binarize`` the total is the number of features that are not "
-                "zero. For ``signac_lsi`` and "
-                "``gensim_lsi`` it drops every component whose scores follow the depth "
-                "of the cells (|Spearman rho| above 0.75), so fewer than "
-                "``--nPrinComps`` components can be left; the number dropped is "
-                'reported at the end and stored in ``uns["glmPCA"]``.'
+                "zero."
             ),
         ),
     ] = False,
@@ -654,8 +647,8 @@ def main(
                 "blocks of cells, instead of loading it into memory. Only the rows of "
                 "the block being read are in memory, so the matrix can be larger "
                 "than the memory. Each pass reads the file again. Only gaussian, "
-                "poisson, negative_binomial, bernoulli, binomial, signac_lsi and "
-                "gensim_lsi take it, and it cannot be used with ``--logNormalize``."
+                "poisson, negative_binomial, bernoulli and binomial take it, and it "
+                "cannot be used with ``--logNormalize``."
             ),
         ),
     ] = False,
@@ -857,16 +850,9 @@ def main(
     if adata.X is None:
         msg = f"'{input}' has no matrix in .X."
         raise fail(msg)
-    if log_normalize and glmpca_family.value in WEIGHTED_FAMILIES:
-        logging.warning(
-            "--logNormalize is ignored for -gf %s, which needs the raw counts.",
-            glmpca_family.value,
-        )
-        log_normalize = False
     fit_data = ad.AnnData(log_normalized(adata.X)) if log_normalize else adata
 
     dispersion = None
-    depth_components = None
     model = GLMPCA(
         n_pc=n_prin_comps,
         family=glmpca_family.value,
@@ -890,11 +876,6 @@ def main(
     scores, loadings, intercept = run_glmpca(model, fit_data)
     if glmpca_family is FamilyChoice.negative_binomial:
         dispersion = model.exponential_family.family_params["nu"].cpu().numpy()
-    if model.depth_correlations_ is not None:
-        depth_components = {
-            "depth_correlations": model.depth_correlations_,
-            "n_dropped_components": model.n_dropped_components_,
-        }
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
     adata.var["glmPCA_intercept"] = intercept
@@ -931,8 +912,6 @@ def main(
     }
     if model.log_depth_mean_ is not None:
         adata.uns["glmPCA"]["log_depth_mean"] = model.log_depth_mean_
-    if depth_components is not None:
-        adata.uns["glmPCA"].update(depth_components)
     if binomial_report is not None:
         adata.uns["glmPCA"].update(binomial_report)
 
