@@ -334,6 +334,47 @@ def plot_umap(
     figure.savefig(path, dpi=dpi, format=file_format.value)
 
 
+def write_umap(
+    adata: ad.AnnData,
+    scores: np.ndarray,
+    out_file_umap: str,
+    n_neighbors: int,
+    cluster_resolution: float,
+    plot_width: float,
+    plot_height: float,
+    plot_file_format: PlotFileFormat,
+    dpi: int,
+) -> None:
+    """Adds the UMAP and the Leiden clusters of `scores` to `adata`, plots them, and
+    writes the .tsv file beside the plot."""
+    embedding, clusters = umap_leiden(scores, n_neighbors, cluster_resolution)
+    leiden = pd.Categorical(
+        clusters.astype(str),
+        categories=[str(cluster) for cluster in range(clusters.max() + 1)],
+    )
+    adata.obsm["X_umap"] = embedding
+    adata.obs["leiden"] = leiden
+
+    plot_umap(
+        embedding,
+        clusters,
+        out_file_umap,
+        plot_width,
+        plot_height,
+        plot_file_format,
+        dpi,
+    )
+    table = pd.DataFrame(
+        embedding,
+        index=adata.obs_names,
+        columns=pd.Index(["UMAP1", "UMAP2"]),
+    )
+    table["cluster"] = leiden
+    table.to_csv(
+        Path(out_file_umap).with_suffix(".tsv"), sep="\t", index_label="Cell_ID"
+    )
+
+
 def run_glmpca(
     model: GLMPCA, adata: ad.AnnData
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -896,31 +937,16 @@ def main(
         adata.uns["glmPCA"].update(binomial_report)
 
     if out_file_umap is not None:
-        embedding, clusters = umap_leiden(scores, n_neighbors, cluster_resolution)
-        leiden = pd.Categorical(
-            clusters.astype(str),
-            categories=[str(cluster) for cluster in range(clusters.max() + 1)],
-        )
-        adata.obsm["X_umap"] = embedding
-        adata.obs["leiden"] = leiden
-
-        plot_umap(
-            embedding,
-            clusters,
+        write_umap(
+            adata,
+            scores,
             out_file_umap,
+            n_neighbors,
+            cluster_resolution,
             plot_width,
             plot_height,
             plot_file_format,
             dpi,
-        )
-        table = pd.DataFrame(
-            embedding,
-            index=adata.obs_names,
-            columns=pd.Index(["UMAP1", "UMAP2"]),
-        )
-        table["cluster"] = leiden
-        table.to_csv(
-            Path(out_file_umap).with_suffix(".tsv"), sep="\t", index_label="Cell_ID"
         )
 
     adata.write_h5ad(out_file)

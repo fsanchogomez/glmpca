@@ -1,3 +1,3 @@
-from . import GLMPCA, ExponentialFamily
+from . import GLMPCA, LSA, ExponentialFamily
 
-__all__ = ["GLMPCA", "ExponentialFamily"]
+__all__ = ["GLMPCA", "LSA", "ExponentialFamily"]

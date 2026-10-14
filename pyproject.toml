@@ -41,6 +41,7 @@ test = [
 
 [project.scripts]
 glmpca = "glmpca.cli.glmpca:cli"
+scLSA = "glmpca.cli.sclsa:cli"
 
 [tool.coverage.run]
 source = ["src"]
