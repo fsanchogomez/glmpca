@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 from glmpca.ExponentialFamily import _n_workers
 from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA
+from glmpca.utils import cell_depth
 
 DESCRIPTION = (
     "Reduce the dimensionality of a cell-by-feature matrix with GLM-PCA.\n\n"
@@ -374,11 +375,15 @@ def write_umap(
 
 
 def run_glmpca(
-    model: GLMPCA, adata: ad.AnnData
+    model: GLMPCA, adata: ad.AnnData, depth: np.ndarray | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Fits the saturated-parameter model and returns the arrays to store."""
+    """Fits the saturated-parameter model and returns the arrays to store.
+
+    `depth` is the depth of every cell for --dropDepth when `adata` is no longer the
+    counts; None takes the row sums of `adata`.
+    """
     try:
-        model.fit(adata)
+        model.fit(adata, depth)
     except ValueError as exc:
         raise fail(str(exc)) from exc
 
@@ -587,6 +592,20 @@ def main(
                 "``bernoulli`` and ``binomial`` it takes the slope of every feature. "
                 "With ``--binarize`` the total is the number of features that are not "
                 "zero."
+            ),
+        ),
+    ] = False,
+    drop_depth: Annotated[
+        bool,
+        typer.Option(
+            "--dropDepth",
+            rich_help_panel=_GLMPCA,
+            help=(
+                "Drop every component whose scores follow the depth of the cells, "
+                "the total of their counts in the input (|Spearman rho| above 0.75), "
+                "off by default, so fewer than ``--nPrinComps`` components can be "
+                "left. It can be used with ``--depthCovariate``. The correlations and "
+                'the number dropped are reported and stored in ``uns["glmPCA"]``.'
             ),
         ),
     ] = False,
@@ -821,6 +840,7 @@ def main(
             torch_compile=torch_compile,
             backed=backed,
             depth_covariate=depth_covariate,
+            drop_depth=drop_depth,
             n_trials=n_trials,
             log_normalize=log_normalize,
             binarize=binarize,
@@ -867,13 +887,15 @@ def main(
         device=device,
         keep_sparse=True if keep_sparse else None,
         depth_covariate=depth_covariate,
+        drop_depth=drop_depth,
         compile=torch_compile,
         binarize=binarize,
         family_params=(
             {"n_trials": n_trials} if glmpca_family is FamilyChoice.binomial else None
         ),
     )
-    scores, loadings, intercept = run_glmpca(model, fit_data)
+    depth = cell_depth(adata) if drop_depth and log_normalize else None
+    scores, loadings, intercept = run_glmpca(model, fit_data, depth)
     if glmpca_family is FamilyChoice.negative_binomial:
         dispersion = model.exponential_family.family_params["nu"].cpu().numpy()
     adata.obsm["X_glmPCA"] = scores
@@ -905,6 +927,7 @@ def main(
             "compile": torch_compile,
             "backed": backed,
             "depth_covariate": depth_covariate,
+            "drop_depth": drop_depth,
             "log_normalize": log_normalize,
             "binarize": binarize,
             "random_state": model.random_state,
@@ -912,6 +935,9 @@ def main(
     }
     if model.log_depth_mean_ is not None:
         adata.uns["glmPCA"]["log_depth_mean"] = model.log_depth_mean_
+    if model.depth_correlations_ is not None:
+        adata.uns["glmPCA"]["depth_correlations"] = model.depth_correlations_
+        adata.uns["glmPCA"]["n_dropped_components"] = model.n_dropped_components_
     if binomial_report is not None:
         adata.uns["glmPCA"].update(binomial_report)
 

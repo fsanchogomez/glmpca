@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import anndata as ad
+import glmpca.LSA as lsa_module
 import numpy as np
 import pytest
 import scipy.stats
@@ -285,6 +286,24 @@ def test_drop_depth_drops_the_component_that_follows_the_depth() -> None:
     depth = np.asarray(X.sum(axis=1)).ravel()
     for column in scores.T.numpy():
         assert abs(scipy.stats.spearmanr(column, depth).statistic) <= 0.75
+
+
+def test_drop_depth_reads_the_counts_as_given_even_when_binarized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    X = grouped_counts(depth_spread=1.5)
+    depths: list[np.ndarray] = []
+    original = lsa_module.components_to_keep
+
+    def recording(scores: torch.Tensor, depth: np.ndarray) -> tuple:
+        depths.append(depth)
+        return original(scores, depth)
+
+    monkeypatch.setattr(lsa_module, "components_to_keep", recording)
+    LSA(N_PC, binarize=True, drop_depth=True, device="cpu").fit(X)
+
+    (depth,) = depths
+    np.testing.assert_allclose(depth, np.asarray(X.sum(axis=1)).ravel())
 
 
 def test_binarize_fits_the_binary_matrix() -> None:

@@ -138,9 +138,11 @@ def test_glmpca_passes_every_option_to_the_model(
     models: list[GLMPCA] = []
     original_fit = GLMPCA.fit
 
-    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
+    def recording_fit(
+        self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
+    ) -> bool:
         models.append(self)
-        return original_fit(self, X)
+        return original_fit(self, X, depth)
 
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     input_path = write_input(tmp_path, poisson_counts())
@@ -411,9 +413,11 @@ def test_the_depth_covariate_flag_reaches_the_model(
     models: list[GLMPCA] = []
     original_fit = GLMPCA.fit
 
-    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
+    def recording_fit(
+        self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
+    ) -> bool:
         models.append(self)
-        return original_fit(self, X)
+        return original_fit(self, X, depth)
 
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     out_path = tmp_path / "out.h5ad"
@@ -433,9 +437,11 @@ def test_the_keep_sparse_flag_reaches_the_model(
     models: list[GLMPCA] = []
     original_fit = GLMPCA.fit
 
-    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
+    def recording_fit(
+        self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
+    ) -> bool:
         models.append(self)
-        return original_fit(self, X)
+        return original_fit(self, X, depth)
 
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     out_path = tmp_path / "out.h5ad"
@@ -476,9 +482,11 @@ def test_the_log_normalize_flag_fits_the_transformed_matrix(
     fitted: list[np.ndarray] = []
     original_fit = GLMPCA.fit
 
-    def recording_fit(self: GLMPCA, X: ad.AnnData) -> bool:
+    def recording_fit(
+        self: GLMPCA, X: ad.AnnData, depth: np.ndarray | None = None
+    ) -> bool:
         fitted.append(np.asarray(X.X))
-        return original_fit(self, X)
+        return original_fit(self, X, depth)
 
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     counts = poisson_counts()
@@ -556,9 +564,11 @@ def test_the_compile_flag_reaches_the_model(
     models: list[GLMPCA] = []
     original_fit = GLMPCA.fit
 
-    def recording_fit(self: GLMPCA, X: torch.Tensor) -> bool:
+    def recording_fit(
+        self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
+    ) -> bool:
         models.append(self)
-        return original_fit(self, X)
+        return original_fit(self, X, depth)
 
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     monkeypatch.setattr(torch, "compile", lambda function, **_: function)
@@ -597,6 +607,62 @@ def test_other_families_write_no_dispersion(tmp_path: Path) -> None:
     assert "MLE_dispersion" not in ad.read_h5ad(out_path).var
 
 
+def test_drop_depth_reports_the_dropped_components_in_uns(tmp_path: Path) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path, "--dropDepth")
+
+    assert result.exit_code == 0, result.output
+    assert "DEPTH:" in result.output
+    adata = ad.read_h5ad(out_path)
+    report = adata.uns["glmPCA"]
+    assert report["params"]["drop_depth"]
+    assert len(report["depth_correlations"]) == N_PC
+    kept = N_PC - int(report["n_dropped_components"])
+    assert adata.obsm["X_glmPCA"].shape == (N_CELLS, kept)
+
+
+def test_no_drop_depth_by_default_leaves_the_report_out(tmp_path: Path) -> None:
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path)
+
+    assert result.exit_code == 0, result.output
+    report = ad.read_h5ad(out_path).uns["glmPCA"]
+    assert not report["params"]["drop_depth"]
+    assert "depth_correlations" not in report
+
+
+def test_drop_depth_with_log_normalize_takes_the_depth_of_the_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    depths: list[np.ndarray | None] = []
+    original_fit = GLMPCA.fit
+
+    def recording_fit(
+        self: GLMPCA, X: ad.AnnData, depth: np.ndarray | None = None
+    ) -> bool:
+        depths.append(depth)
+        return original_fit(self, X, depth)
+
+    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    counts = poisson_counts()
+
+    result = run(
+        write_input(tmp_path, counts),
+        tmp_path / "out.h5ad",
+        "-gf",
+        "gaussian",
+        "--logNormalize",
+        "--dropDepth",
+    )
+
+    assert result.exit_code == 0, result.output
+    (depth,) = depths
+    assert depth is not None
+    np.testing.assert_allclose(depth, counts.sum(axis=1))
+
+
 def test_the_binomial_stores_its_trials_and_clipped_entries_in_uns(
     tmp_path: Path,
 ) -> None:
@@ -619,9 +685,11 @@ def test_without_keep_sparse_the_storage_is_chosen_and_recorded(
     models: list[GLMPCA] = []
     original_fit = GLMPCA.fit
 
-    def recording_fit(self: GLMPCA, X: ad.AnnData) -> bool:
+    def recording_fit(
+        self: GLMPCA, X: ad.AnnData, depth: np.ndarray | None = None
+    ) -> bool:
         models.append(self)
-        return original_fit(self, X)
+        return original_fit(self, X, depth)
 
     monkeypatch.setattr(GLMPCA, "fit", recording_fit)
     out_path = tmp_path / "out.h5ad"

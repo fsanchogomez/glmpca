@@ -24,6 +24,7 @@ from .manifolds import (
     canonical_basis,
 )
 from .sparse import BackedRows, SparseRows, binary
+from .utils import cell_depth, components_to_keep
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -314,6 +315,12 @@ class GLMPCA:
         "negative_binomial" `beta` is near 1, a size factor; on a bounded support it
         takes the slope of every feature, which saturates. Defaults to False.
 
+    drop_depth: bool
+        Whether to drop, after the fit, every component whose scores follow the depth
+        of the cells, the total of their counts as given, |Spearman rho| above
+        DEPTH_CORRELATION_CUTOFF (`components_to_keep`), so fewer than n_pc components
+        can stay. log_likelihood_ is that of the fit before the drop. Defaults to False.
+
     n_jobs: int or None
         Number of jobs for the per-feature fits of the family parameters. If given,
         it is written to family_params["n_jobs"] and replaces any value there. Only
@@ -381,6 +388,7 @@ class GLMPCA:
         n_init: int = 1,
         init: Literal["spectral", "random"] = "spectral",
         depth_covariate: bool = False,
+        drop_depth: bool = False,
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
         chunk_size: int | None = None,
@@ -405,6 +413,7 @@ class GLMPCA:
         self.gamma = gamma
         self.init = init
         self.depth_covariate = depth_covariate
+        self.drop_depth = drop_depth
         self.chunk_size = chunk_size
         self._chunk = chunk_size or batch_size
         self.optimizer = optimizer
@@ -426,6 +435,10 @@ class GLMPCA:
         self.depth_coef_: torch.Tensor | None = None
         self.log_depth_mean_: float | None = None
         self._depth_floor: float | None = None
+        # drop_depth: the Spearman rho of every component with the depth, and how many
+        # components went.
+        self.depth_correlations_: np.ndarray | None = None
+        self.n_dropped_components_: int | None = None
         # reconstruction_intercept: after projecting
         self.reconstruction_intercept_ = None
 
@@ -451,13 +464,20 @@ class GLMPCA:
             self.exponential_family.family_params["n_jobs"] = n_jobs
         self.exponential_family.family_params["chunk_size"] = self._chunk
 
-    def fit(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
+    def fit(
+        self,
+        X: torch.Tensor | np.ndarray | ad.AnnData,
+        depth: np.ndarray | None = None,
+    ) -> bool:
         r"""Fits a GLM-PCA to a specific dataset.
 
         Parameters
         ----------
         X : torch.Tensor, np.ndarray or AnnData
             Dataset with cells in rows and features in columns.
+        depth : np.ndarray or None
+            The depth of every cell for drop_depth, for an `X` that is no longer the
+            counts, as after a normalization. None takes the row sums of `X`.
 
         Returns
         -------
@@ -473,9 +493,11 @@ class GLMPCA:
             if seeded:
                 torch.manual_seed(self.random_state)
             self._rng = np.random.default_rng(self.random_state)
-            return self._fit(X)
+            return self._fit(X, depth)
 
-    def _fit(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> bool:
+    def _fit(
+        self, X: torch.Tensor | np.ndarray | ad.AnnData, depth: np.ndarray | None
+    ) -> bool:
         """The fit itself, which fit runs with the random state of the model."""
         device = _resolve_device(self.device)
         if self.init not in ("spectral", "random"):
@@ -666,6 +688,18 @@ class GLMPCA:
         self.saturated_loadings_ = canonical_basis(
             best_loadings, self._centered_chunks(rows, after)
         ).cpu()
+        self.depth_correlations_ = self.n_dropped_components_ = None
+        if self.drop_depth:
+            cells = cell_depth(X) if depth is None else np.asarray(depth, np.float64)
+            basis = self.saturated_loadings_.to(after)
+            scores = torch.cat([
+                (chunk @ basis).cpu() for chunk in self._centered_chunks(rows, after)
+            ])
+            kept, self.depth_correlations_ = components_to_keep(scores, cells)
+            self.n_dropped_components_ = basis.shape[1] - len(kept)
+            self.saturated_loadings_ = self.saturated_loadings_[
+                :, torch.from_numpy(kept)
+            ]
         self.saturated_intercept_ = self.saturated_intercept_.cpu()
         if self.depth_coef_ is not None and self.log_depth_ is not None:
             self.depth_coef_ = self.depth_coef_.cpu()

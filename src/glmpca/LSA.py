@@ -17,7 +17,6 @@ import numpy as np
 import torch
 from scipy.sparse import csr_matrix, issparse, spmatrix
 from scipy.sparse.linalg import svds
-from scipy.stats import spearmanr
 from tqdm.auto import tqdm
 
 from .GLMPCA import (
@@ -28,6 +27,7 @@ from .GLMPCA import (
 )
 from .manifolds import largest_entry_signs
 from .sparse import BackedRows, SparseRows, binary
+from .utils import cell_depth, components_to_keep
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,8 +35,6 @@ if TYPE_CHECKING:
 DEFAULT_CHUNK_ROWS = 16384
 FLAVORS = ("gensim", "signac")
 SOLVERS = ("auto", "arpack", "randomized")
-DEPTH_CORRELATION_CUTOFF = 0.75
-"""|Spearman rho| with the depth above which drop_depth drops a component."""
 # Scale factor of Signac's `RunTFIDF(method = 1)`, applied before `log1p`.
 TFIDF_SCALE = 1e4
 # Slope of gensim's pivoted unique normalization, `smartirs="lfu"`.
@@ -146,7 +144,8 @@ class LSA:
         Columns of the randomized solver beyond n_pc. Defaults to 10.
     drop_depth : bool
         Whether to drop every component whose scores follow the depth of the cells,
-        |Spearman rho| above DEPTH_CORRELATION_CUTOFF, so fewer than n_pc components
+        the total of their counts as given, |Spearman rho| above
+        DEPTH_CORRELATION_CUTOFF (`components_to_keep`), so fewer than n_pc components
         can stay. Defaults to False.
     binarize : bool
         Whether to read every value that is not zero as 1. Defaults to False.
@@ -258,7 +257,7 @@ class LSA:
         self.solver_ = solver
         tqdm.write(f"SOLVER: {solver}")
 
-        depth = self._fit_idf(source)
+        self._fit_idf(source)
         if solver == "arpack":
             components, singular, scores = self._arpack(source)
         else:
@@ -270,18 +269,9 @@ class LSA:
 
         self.depth_correlations_ = self.n_dropped_components_ = None
         if self.drop_depth:
-            correlations = np.nan_to_num([
-                spearmanr(score, depth).statistic for score in scores.double().T
-            ])
-            dropped = np.abs(correlations) > DEPTH_CORRELATION_CUTOFF
-            kept = torch.from_numpy(np.flatnonzero(~dropped))
-            self.depth_correlations_ = correlations
-            self.n_dropped_components_ = int(dropped.sum())
-            tqdm.write(
-                f"DEPTH: {self.n_dropped_components_} of {components.shape[1]} "
-                f"components dropped, |Spearman rho| with cell depth above "
-                f"{DEPTH_CORRELATION_CUTOFF}"
-            )
+            keep, self.depth_correlations_ = components_to_keep(scores, cell_depth(X))
+            self.n_dropped_components_ = components.shape[1] - len(keep)
+            kept = torch.from_numpy(keep)
             components, singular, scores = (
                 components[:, kept],
                 singular[kept],
@@ -354,21 +344,18 @@ class LSA:
         for rows, block in self._raw_blocks(source):
             yield rows, self._tfidf(block)
 
-    def _fit_idf(self, source: SparseRows) -> np.ndarray:
-        """Fits the idf in one pass over the counts, and returns the depth of a cell."""
+    def _fit_idf(self, source: SparseRows) -> None:
+        """Fits the idf in one pass over the counts."""
         n, p = source.shape
         totals = np.zeros(p)
         holders = np.zeros(p)
-        depth = np.empty(n)
-        for rows, block in self._raw_blocks(source):
+        for _, block in self._raw_blocks(source):
             if bool((block.data < 0).any()):
                 msg = "LSA takes counts, but the input has negative values."
                 raise ValueError(msg)
             totals += np.asarray(block.sum(axis=0), dtype=np.float64).ravel()
             holders += np.asarray((block > 0).sum(axis=0), dtype=np.float64).ravel()
-            depth[rows] = np.asarray(block.sum(axis=1), dtype=np.float64).ravel()
         self.idf_, self.pivot_ = idf(self.flavor, totals, holders, n)
-        return depth
 
     def _tfidf_in_memory(self, source: SparseRows) -> csr_matrix | None:
         """The whole TF-IDF matrix for a matrix in memory, else None."""

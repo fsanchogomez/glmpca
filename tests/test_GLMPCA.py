@@ -7,6 +7,7 @@ import warnings
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anndata as ad
+import glmpca.GLMPCA as glmpca_module
 import numpy as np
 import pytest
 import scipy.stats
@@ -1128,6 +1129,65 @@ def depth_gradient() -> torch.Tensor:
     depth = torch.exp(torch.randn(N_CELLS) * 0.8).unsqueeze(1)
     structure = torch.randn(N_CELLS, N_PC) @ torch.randn(N_PC, N_FEATURES) * 0.3
     return torch.poisson(torch.exp(structure) * depth)
+
+
+def test_drop_depth_drops_the_components_that_follow_the_depth() -> None:
+    X = depth_gradient()
+    model = GLMPCA(N_PC, family="poisson", max_iter=40, batch_size=16, drop_depth=True)
+
+    model.fit(X)
+
+    assert model.depth_correlations_ is not None
+    assert model.depth_correlations_.shape == (N_PC,)
+    dropped = int((np.abs(model.depth_correlations_) > 0.75).sum())
+    assert model.n_dropped_components_ == dropped >= 1
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape == (N_FEATURES, N_PC - dropped)
+    scores = model.transform(X).numpy()
+    assert scores.shape == (N_CELLS, N_PC - dropped)
+    for column in scores.T:
+        rho = scipy.stats.spearmanr(column, X.sum(dim=1).numpy()).statistic
+        assert abs(rho) <= 0.75
+
+
+def test_no_drop_depth_by_default_keeps_every_component() -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16)
+
+    model.fit(depth_gradient())
+
+    assert model.depth_correlations_ is None
+    assert model.n_dropped_components_ is None
+    assert model.saturated_loadings_ is not None
+    assert model.saturated_loadings_.shape == (N_FEATURES, N_PC)
+
+
+def test_drop_depth_reads_the_counts_as_given_even_when_binarized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    X = depth_gradient()
+    depths: list[np.ndarray] = []
+    original = glmpca_module.components_to_keep
+
+    def recording(scores: torch.Tensor, depth: np.ndarray) -> tuple:
+        depths.append(depth)
+        return original(scores, depth)
+
+    monkeypatch.setattr(glmpca_module, "components_to_keep", recording)
+    GLMPCA(
+        N_PC,
+        family="bernoulli",
+        max_iter=2,
+        batch_size=16,
+        binarize=True,
+        drop_depth=True,
+    ).fit(X)
+    given = np.arange(N_CELLS, dtype=np.float64) + 1
+    GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16, drop_depth=True).fit(
+        X, depth=given
+    )
+
+    np.testing.assert_allclose(depths[0], X.sum(dim=1).numpy())
+    np.testing.assert_array_equal(depths[1], given)
 
 
 def test_the_depth_covariate_is_the_centered_log_total_of_every_cell() -> None:
