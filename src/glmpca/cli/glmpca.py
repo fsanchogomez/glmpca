@@ -651,10 +651,11 @@ def main(
             "--compile",
             rich_help_panel=_OPTIMISATION,
             help=(
-                "Compile the cost of the training loop with torch.compile. A pass "
-                "over the matrix takes about 30% less time, for about 10 s of "
-                "compilation at the start, so it pays only in a long fit. It needs a "
-                "C++ compiler on the CPU, and Triton on a GPU."
+                "Compile the cost of the training loop, with the saturated parameters "
+                "of every block, with torch.compile. An epoch on the CPU took 14% to "
+                "44% less time (Poisson and Bernoulli), for a few seconds of "
+                "compilation at the start, so it pays in a long fit. It needs a C++ "
+                "compiler on the CPU, and Triton on a GPU."
             ),
         ),
     ] = False,

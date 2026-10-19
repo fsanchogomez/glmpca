@@ -186,9 +186,16 @@ class _Rows:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The data and the saturated parameters of `rows`, on `device`."""
         data = self.read(rows, device)
+        stored = self.stored(rows, device)
+        return data, self.family.invert_g(data) if stored is None else stored
+
+    def stored(
+        self, rows: slice | torch.Tensor, device: torch.device
+    ) -> torch.Tensor | None:
+        """The stored saturated parameters of `rows` on `device`, or None."""
         if self.theta is None:
-            return data, self.family.invert_g(data)
-        return data, self.theta[rows].to(device, non_blocking=True)
+            return None
+        return self.theta[rows].to(device, non_blocking=True)
 
     def slices(self, size: int) -> Iterator[slice]:
         for start in range(0, self.shape[0], size):
@@ -317,7 +324,8 @@ class GLMPCA:
 
     compile: bool
         Whether to compile the cost of the training loop with `torch.compile`, which
-        joins its element-wise operations. This speeds up the training iterations in
+        joins its element-wise operations, with `invert_g` of every block where the
+        saturated parameters are not stored. This speeds up the training iterations
         for a fixed compilation time. Recommended for long fits (>100 iters).
         It needs a C++ compiler on the CPU, and Triton on CUDA. Defaults to False.
 
@@ -833,12 +841,11 @@ class GLMPCA:
                 _optimizer.zero_grad()
                 total = torch.zeros((), device=device, dtype=torch.float64)
                 for part in parts():
-                    data, parameters = rows.block(part, device)
                     part_cost = cost(
                         loadings=_loadings,
                         intercept=_intercept,
-                        batch_data=data,
-                        batch_parameters=parameters,
+                        batch_data=rows.read(part, device),
+                        batch_parameters=rows.stored(part, device),
                     )
                     part_cost.backward()
                     total += part_cost.detach()
@@ -1081,8 +1088,12 @@ class GLMPCA:
         loadings: torch.Tensor,
         intercept: torch.Tensor,
         batch_data: torch.Tensor,
-        batch_parameters: torch.Tensor,
+        batch_parameters: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """The cost of a block, from its saturated parameters or, when they are not
+        stored, from `invert_g` of its data, which compile then compiles with it."""
+        if batch_parameters is None:
+            batch_parameters = self.exponential_family.invert_g(batch_data)
         intercept_term = intercept.unsqueeze(0)
 
         projected_parameters = batch_parameters - intercept_term
