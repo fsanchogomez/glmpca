@@ -497,12 +497,11 @@ def main(
             rich_help_panel=_OPTIMISATION,
             help=(
                 "Number of cells in each mini-batch. If there are fewer cells, the "
-                "number of cells is used. On the CPU it is also the number of cells "
-                "handled at a time in every pass over the whole matrix. If one batch "
-                "does not fit in half of the memory (of the machine, or of the job on "
-                "a cluster), the fit stops and gives the largest batch that fits. On "
-                "a GPU the passes take as many cells as the free memory of the device "
-                "holds."
+                "number of cells is used. It is a setting of the optimization only: a "
+                "batch larger than a block of cells is read block by block, and the "
+                "gradients of its blocks add up before its one step. A block holds "
+                "256 MB of dense values on the CPU, and as many cells as the free "
+                "memory of a GPU holds, halved again when the GPU runs out of memory."
             ),
         ),
     ] = DEFAULT_BATCH_SIZE,
@@ -645,14 +644,11 @@ def main(
             rich_help_panel=_OPTIMISATION,
             help=(
                 "Hold the matrix as sparse for the whole fit, and densify it one "
-                "chunk of cells at a time, instead of holding it dense beside a dense "
-                "copy of its saturated parameters. Without this flag the choice is "
-                "automatic: dense when both dense matrices fit in half of the memory "
-                "(of the machine, or of the job on a cluster), else sparse; the fit "
-                "says what it chose. Sparse cuts the memory of the data to its "
-                "non-zero entries, and a fit takes longer: +14% (adagrad) to +42% "
-                "(cg) on a count matrix with 15% non-zeros. The families beta, "
-                "sigmoid_beta, gamma and lognormal cannot take it."
+                "block of cells at a time. Without this flag the matrix keeps the "
+                "storage of the input file: sparse when ``.X`` is sparse, else dense; "
+                "the fit says which. Sparse cuts the memory of the data to its "
+                "non-zero entries. The families beta, sigmoid_beta, gamma and "
+                "lognormal cannot take it."
             ),
         ),
     ] = False,

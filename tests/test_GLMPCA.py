@@ -14,23 +14,22 @@ import scipy.stats
 import torch
 from glmpca.ExponentialFamily import (
     Beta,
+    ExponentialFamily,
     GLMFamily,
     NegativeBinomial,
     _n_workers,
 )
 from glmpca.GLMPCA import (
+    BLOCK_BYTES,
     DEFAULT_BATCH_SIZE,
     DEVICE_MEMORY_SHARE,
     GLMPCA,
-    HOST_MEMORY_SHARE,
-    HOST_STAGING_COPIES,
     INTERCEPT_RATE_SCALE,
     LEARNING_RATE_LIMIT,
     PLATEAU_PATIENCE,
     WORKING_COPIES,
     _fits_in,
     _free_device_memory,
-    _host_memory,
     _Rows,
     _to_tensor,
 )
@@ -704,56 +703,29 @@ def test_a_binomial_fit_takes_its_number_of_trials(keep_sparse: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    ("family", "memory", "chosen", "report"),
+    ("as_input", "family", "chosen"),
     [
-        (GLMFamily.poisson, 10**15, False, "STORAGE: dense"),
-        (GLMFamily.poisson, 10, True, "STORAGE: sparse"),
-        (GLMFamily.gamma, 10, False, ""),
+        (lambda X: X, GLMFamily.poisson, False),
+        (lambda X: ad.AnnData(X.numpy()), GLMFamily.poisson, False),
+        (lambda X: ad.AnnData(sparse.csr_matrix(X.numpy())), GLMFamily.poisson, True),
+        (lambda X: ad.AnnData(sparse.csr_matrix(X.numpy())), GLMFamily.gamma, False),
     ],
+    ids=["tensor", "dense-anndata", "csr-anndata", "csr-gamma"],
 )
-def test_keep_sparse_none_chooses_the_storage_from_the_memory(
-    monkeypatch: pytest.MonkeyPatch,
+def test_keep_sparse_none_keeps_the_storage_of_the_input(
     capsys: pytest.CaptureFixture[str],
+    as_input: Callable[[torch.Tensor], Any],
     family: GLMFamily,
-    memory: int,
     chosen: bool,
-    report: str,
 ) -> None:
-    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: memory)
-    monkeypatch.setattr(
-        GLMPCA, "_rows_that_fit", lambda self, X, device: (10**9, "memory")
-    )
     model = GLMPCA(N_PC, family=family, max_iter=1, batch_size=16)
 
-    model.fit(sample(family))
+    model.fit(as_input(sample(family)))
 
     assert model.keep_sparse is None
     assert model.keep_sparse_ is chosen
-    assert report in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    ("gpu", "chosen", "report"),
-    [
-        (10**15, False, "allowed (host memory))"),
-        (10**3, True, "allowed (GPU memory))"),
-    ],
-)
-def test_on_cuda_the_storage_is_dense_only_if_it_also_fits_on_the_gpu(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    gpu: int,
-    chosen: bool,
-    report: str,
-) -> None:
-    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: 10**12)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (gpu, gpu))
-    model = GLMPCA(N_PC, family="poisson", batch_size=16)
-
-    sparse = model._use_sparse(sample(GLMFamily.poisson), torch.device("cuda"))
-
-    assert sparse is chosen
-    assert report in capsys.readouterr().out
+    storage = "sparse" if chosen else "dense"
+    assert f"STORAGE: {storage} (as the input)" in capsys.readouterr().out
 
 
 def test_the_free_gpu_memory_counts_what_the_process_caches(
@@ -780,43 +752,52 @@ def test_transform_does_not_report_the_storage_again(
     assert "STORAGE:" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize(("keep_sparse", "memory"), [(True, 10**15), (False, 10)])
-def test_an_explicit_keep_sparse_wins_over_the_memory(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("keep_sparse", "as_input"),
+    [
+        (True, lambda X: X),
+        (False, lambda X: ad.AnnData(sparse.csr_matrix(X.numpy()))),
+    ],
+)
+def test_an_explicit_keep_sparse_wins_over_the_input(
     capsys: pytest.CaptureFixture[str],
     keep_sparse: bool,
-    memory: int,
+    as_input: Callable[[torch.Tensor], Any],
 ) -> None:
-    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: memory)
-    monkeypatch.setattr(
-        GLMPCA, "_rows_that_fit", lambda self, X, device: (10**9, "memory")
-    )
     model = GLMPCA(
         N_PC, family="poisson", max_iter=1, batch_size=16, keep_sparse=keep_sparse
     )
 
-    model.fit(sample(GLMFamily.poisson))
+    model.fit(as_input(sample(GLMFamily.poisson)))
 
     assert model.keep_sparse_ is keep_sparse
-    assert "STORAGE:" not in capsys.readouterr().out
+    assert "(keep_sparse)" in capsys.readouterr().out
 
 
-def test_the_host_memory_is_the_lower_of_the_ram_and_the_cgroup_limit(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("family", "precomputed"), [("poisson", False), ("gamma", True)]
+)
+def test_only_the_bisection_families_hold_their_saturated_parameters(
+    monkeypatch: pytest.MonkeyPatch, family: str, precomputed: bool
 ) -> None:
-    monkeypatch.setattr(
-        "glmpca.GLMPCA.os.sysconf",
-        lambda name: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 10**6}[name],
+    held: list[bool] = []
+    original = _Rows.__init__
+
+    def recording(
+        self: _Rows,
+        data: torch.Tensor,
+        family: ExponentialFamily,
+        theta: torch.Tensor | None,
+    ) -> None:
+        held.append(theta is not None)
+        original(self, data, family, theta)
+
+    monkeypatch.setattr(_Rows, "__init__", recording)
+    GLMPCA(N_PC, family=family, max_iter=1, batch_size=16).fit(
+        sample(GLMFamily(family))
     )
 
-    def read_text(path: Path) -> str:
-        if str(path) == "/sys/fs/cgroup/memory.max":
-            return "1000000\n"
-        raise OSError
-
-    monkeypatch.setattr("glmpca.GLMPCA.Path.read_text", read_text)
-
-    assert _host_memory() == 1_000_000
+    assert held[0] is precomputed
 
 
 def test_a_given_batch_size_is_used_and_reported(
@@ -1016,60 +997,73 @@ def test_the_batch_size_defaults_to_4096_and_the_chunk_size_to_automatic() -> No
     assert model.chunk_size is None
 
 
-def test_a_batch_that_does_not_fit_in_memory_stops_with_the_largest_that_does(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("optimizer", ["adagrad", "cg"])
+def test_a_batch_read_in_blocks_takes_the_step_of_the_whole_batch(
+    optimizer: Literal["adagrad", "cg"],
 ) -> None:
-    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: 15_360)
-    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=16)
+    X = sample(GLMFamily.poisson)
+    fits = []
+    for chunk_size in (None, 3):
+        model = GLMPCA(
+            N_PC,
+            family="poisson",
+            max_iter=3,
+            batch_size=16,
+            chunk_size=chunk_size,
+            optimizer=optimizer,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(X)
+        fits.append(model)
 
-    with pytest.raises(ValueError, match="The largest batch that fits is 10"):
-        model.fit(sample(GLMFamily.poisson))
-
-
-def test_a_batch_that_fits_in_memory_is_used(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: 15_360)
-    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8)
-
-    model.fit(sample(GLMFamily.poisson))
-
-    assert model.keep_sparse_ is False
-    assert model.batch_size_ == 8
-
-
-@pytest.mark.parametrize(
-    ("host", "gpu", "limit"),
-    [(2**40, 2**20, "GPU memory"), (2**20, 2**40, "host memory")],
-)
-def test_on_cuda_a_batch_fits_in_both_the_gpu_and_the_host_memory(
-    monkeypatch: pytest.MonkeyPatch, host: int, gpu: int, limit: str
-) -> None:
-    monkeypatch.setattr("glmpca.GLMPCA._host_memory", lambda: host)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (gpu, gpu))
-    X = torch.zeros(10, 5000)
-    row_bytes = 4 * 5000
-    on_gpu = int(DEVICE_MEMORY_SHARE * gpu) // (WORKING_COPIES * row_bytes)
-    staged = int(HOST_MEMORY_SHARE * host - 2 * X.nbytes) // (
-        HOST_STAGING_COPIES * row_bytes
+    whole, blocks = fits
+    assert whole.saturated_loadings_ is not None
+    assert blocks.saturated_loadings_ is not None
+    torch.testing.assert_close(
+        blocks.saturated_loadings_, whole.saturated_loadings_, atol=1e-4, rtol=0
     )
-
-    rows, memory = GLMPCA(N_PC)._rows_that_fit(X, torch.device("cuda"))
-
-    assert rows == min(on_gpu, staged)
-    assert limit in memory
+    assert blocks.log_likelihood_ == pytest.approx(whole.log_likelihood_, rel=1e-5)
 
 
-def test_on_the_cpu_a_pass_takes_the_batch_size_unless_a_chunk_size_is_given() -> None:
+def test_on_the_cpu_a_block_holds_block_bytes_unless_a_chunk_size_is_given() -> None:
     automatic = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8)
     automatic.fit(sample(GLMFamily.poisson))
     given = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=8, chunk_size=5)
     given.fit(sample(GLMFamily.poisson))
 
-    assert automatic._chunk == 8
-    assert automatic.exponential_family.family_params["chunk_size"] == 8
+    assert automatic._chunk == N_CELLS
+    assert automatic._chunk_rows(torch.device("cpu"), 10**9, 4 * 5000) == (
+        BLOCK_BYTES // (4 * 5000)
+    )
     assert given._chunk == 5
     assert given.exponential_family.family_params["chunk_size"] == 5
+
+
+def test_a_pass_that_runs_out_of_gpu_memory_runs_again_with_half_the_rows() -> None:
+    model = GLMPCA(N_PC, family="poisson")
+    model._chunk = 64
+    calls: list[int] = []
+
+    def run() -> str:
+        calls.append(model._chunk)
+        if len(calls) < 3:
+            raise torch.OutOfMemoryError
+        return "done"
+
+    assert model._with_smaller_blocks(torch.device("cuda"), run) == "done"
+    assert calls == [64, 32, 16]
+
+
+def test_an_out_of_memory_error_on_the_cpu_is_not_caught() -> None:
+    model = GLMPCA(N_PC, family="poisson")
+    model._chunk = 64
+
+    def run() -> None:
+        raise torch.OutOfMemoryError
+
+    with pytest.raises(torch.OutOfMemoryError):
+        model._with_smaller_blocks(torch.device("cpu"), run)
 
 
 def test_on_cuda_a_pass_takes_the_rows_that_the_free_memory_holds(
@@ -1086,7 +1080,7 @@ def test_on_cuda_a_pass_takes_the_rows_that_the_free_memory_holds(
 
     assert rows == int(DEVICE_MEMORY_SHARE * free) // (WORKING_COPIES * 4 * 5000)
     assert model._chunk_rows(cuda, n_rows=100, row_bytes=4 * 5000) == 100
-    assert model._chunk_rows(torch.device("cpu"), n_rows=10**9, row_bytes=4) == 8
+    assert model._chunk_rows(torch.device("cpu"), n_rows=100, row_bytes=4) == 100
 
 
 @pytest.mark.parametrize("chunk_size", [0, -1])

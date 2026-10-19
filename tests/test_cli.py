@@ -679,7 +679,7 @@ def test_the_binomial_stores_its_trials_and_clipped_entries_in_uns(
     assert report["n_clipped"] == int((counts > 3).sum())
 
 
-def test_without_keep_sparse_the_storage_is_chosen_and_recorded(
+def test_without_keep_sparse_the_storage_follows_the_input_and_is_recorded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models: list[GLMPCA] = []
@@ -699,7 +699,7 @@ def test_without_keep_sparse_the_storage_is_chosen_and_recorded(
     assert result.exit_code == 0, result.output
     (model,) = models
     assert model.keep_sparse is None
-    assert "STORAGE: dense" in result.output
+    assert "STORAGE: dense (as the input)" in result.output
     params = ad.read_h5ad(out_path).uns["glmPCA"]["params"]
     assert not params["keep_sparse"]
     assert params["batch_size"] == model.batch_size_
