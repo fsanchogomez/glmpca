@@ -35,7 +35,7 @@ _OPTIMIZERS = {
 
 _Result = TypeVar("_Result")
 
-DEFAULT_LEARNING_RATE = 0.2
+DEFAULT_LEARNING_RATE = 0.1
 SPARSE_FAMILIES = (
     "gaussian",
     "poisson",
@@ -47,9 +47,16 @@ PRECOMPUTED_FAMILIES = ("beta", "sigmoid_beta", "gamma")
 """The families whose `invert_g` is a bisection, too slow to repeat at every step, so
 the fit computes their saturated parameters once and holds them."""
 INTERCEPT_RATE_SCALE = 0.01
-LEARNING_RATE_LIMIT = 1e-8
+CONVERGENCE_WINDOW = 10
+"""Epochs over which the cost test compares the best cost, and before which no
+convergence test stops the fit."""
+DEFAULT_TOL = 1e-8
+DEFAULT_SUBSPACE_TOL = 1e-6
+MAX_RESTARTS = 10
+"""Restarts with a lower learning rate after a cost that is not finite, before fit
+stops."""
 PLATEAU_PATIENCE = 10
-PLATEAU_THRESHOLD = 1e-4
+PLATEAU_THRESHOLD = 1e-3
 DEFAULT_BATCH_SIZE = 4096
 DEFAULT_RANDOM_STATE = 42
 SPECTRAL_ROWS = 4096
@@ -87,6 +94,16 @@ def _free_device_memory(device: torch.device) -> int:
     if torch.cuda.is_initialized():
         free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     return free
+
+
+def _subspace_move(before: torch.Tensor, after: torch.Tensor) -> float:
+    """The sine of the largest principal angle between two spans of orthonormal bases.
+
+    It is the largest singular value of the part of `after` outside the span of
+    `before`, in float64, which keeps its accuracy for small angles, unlike `1 - cos^2`.
+    """
+    old, new = before.double(), after.double()
+    return float(torch.linalg.matrix_norm(new - old @ (old.T @ new), ord=2))
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -242,16 +259,36 @@ class GLMPCA:
         Defaults to None.
 
     max_iter : int
-        Maximum number of epochs in the GLM-PCA optimisation. Defaults to 100.
+        Maximum number of epochs in the GLM-PCA optimisation. The fit stops earlier
+        when it converges (tol, subspace_tol). Defaults to 100.
+
+    tol : float
+        The fit has converged when the best epoch cost of the last CONVERGENCE_WINDOW
+        epochs is below the best cost before them, but by less than `tol`, relative.
+        A cost that rose does not stop the fit, so the scheduler can lower the
+        learning rate. 0 turns the test off. Defaults to DEFAULT_TOL.
+
+    subspace_tol : float
+        The fit has converged when the span of the loadings moves by less than
+        `subspace_tol` in one epoch, the sine of the largest principal angle between
+        the spans before and after it (`_subspace_move`). 0 turns the test off. Defaults
+        to DEFAULT_SUBSPACE_TOL. Neither test stops the fit in its first
+        CONVERGENCE_WINDOW epochs, and the fit stops at the first test that holds.
 
     learning_rate: float
-        Learning rate to be used in the GLM-PCA optimisation. If learning_rate is too
-        high and leads to NaN, our implementation automatically restarts the
-        optimisation with a smaller value. Defaults to 0.2.
+        Learning rate to be used in the GLM-PCA optimisation, as a fraction of a
+        typical entry of the loadings: the loadings take `learning_rate / sqrt(p)`, p
+        the number of features, because a column of p entries has unit norm and the
+        first step of Adagrad and Adam moves every entry by the full rate. A larger
+        step loses the spectral start in the first epoch, and with Poisson it can
+        make the cost explode and freeze the fit. The intercept takes
+        `learning_rate * INTERCEPT_RATE_SCALE`. If learning_rate is too high and leads
+        to NaN, our implementation automatically restarts the optimisation with a
+        smaller value. Defaults to DEFAULT_LEARNING_RATE (0.1).
 
-        The scheduler lowers this rate when the cost stops falling (see gamma) and
-        never takes it below LEARNING_RATE_LIMIT. A fit that reaches that floor stops
-        with a warning, because the steps no longer move the loadings.
+        The scheduler lowers this rate when the cost stops falling (see gamma). A
+        cost that is not finite restarts the run with the rate times gamma, at most
+        MAX_RESTARTS times.
 
     batch_size : int
         Size of the batch in the SGD optimisation step. If the matrix to fit has
@@ -305,9 +342,8 @@ class GLMPCA:
 
     optimizer: str
         "adagrad" for the Riemannian Adagrad of this package, "adam" for its Riemannian
-        Adam, or "cg" for its Riemannian conjugate gradients. The learning rate defaults
-        are calibrated for Adagrad, Adam usually performs better with a smaller learning
-        rate (e.g., 0.01). Defaults to "adagrad".
+        Adam, or "cg" for its Riemannian conjugate gradients. The default learning rate
+        was chosen for Adagrad. Defaults to "adagrad".
 
         "cg" is different in kind: it works on the whole matrix rather than on
         mini-batches, and it has no learning rate, because it chooses every step by a
@@ -349,6 +385,8 @@ class GLMPCA:
         family: str | ExponentialFamily = "gaussian",
         family_params: dict[str, Any] | None = None,
         max_iter: int = 100,
+        tol: float = DEFAULT_TOL,
+        subspace_tol: float = DEFAULT_SUBSPACE_TOL,
         learning_rate: float = DEFAULT_LEARNING_RATE,
         batch_size: int = DEFAULT_BATCH_SIZE,
         gamma: float = 0.5,
@@ -369,6 +407,11 @@ class GLMPCA:
         self.family_params = family_params
         self.log_part_theta_matrices_ = None
         self.max_iter = np.abs(max_iter)
+        self.tol = tol
+        self.subspace_tol = subspace_tol
+        self.n_epochs_: int | None = None
+        self.subspace_moves_: list[list[float]] = []
+        self._restarts = 0
         self.learning_rate_ = learning_rate
         self.initial_learning_rate_ = learning_rate
         self.n_jobs = n_jobs
@@ -584,6 +627,7 @@ class GLMPCA:
         # Initialize the learning procedure
         self.loadings_learning_scores_ = []
         self.loadings_learning_rates_ = []
+        self.subspace_moves_ = []
 
         cost = (
             torch.compile(self._optim_cost, dynamic=False)
@@ -595,6 +639,7 @@ class GLMPCA:
         runs = []
         for _ in range(self.n_init):
             self.learning_rate_ = self.initial_learning_rate_
+            self._restarts = 0
             runs.append(
                 self._saturated_loading_iter(
                     rows, batch_size, device, log_base_measure, cost
@@ -620,6 +665,7 @@ class GLMPCA:
                 ])
             best_model_idx = int(torch.argmin(training_cost))
         best_loadings, best_intercept = runs[best_model_idx]
+        self.n_epochs_ = len(self.subspace_moves_[best_model_idx])
         best_loadings = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
         with torch.no_grad():
@@ -815,13 +861,11 @@ class GLMPCA:
             The loadings and the intercept of every feature.
 
         """
-        if self.learning_rate_ < LEARNING_RATE_LIMIT:
-            msg = "LEARNING RATE IS TOO SMALL : DID NOT CONVERGE"
-            raise ValueError(msg)
-
         # Set up list of saving scores
         self.loadings_learning_scores_.append([])
         self.loadings_learning_rates_.append([])
+        self.subspace_moves_.append([])
+        epoch_costs: list[float] = []
 
         _optimizer, _loadings, _intercept, _lr_scheduler = (
             self._init_saturated_loading_optim(
@@ -865,6 +909,7 @@ class GLMPCA:
                 epoch_log_likelihood = 0.0
                 epoch_cost = 0.0
                 learning_rate = self.learning_rate_
+                before = _loadings.detach().clone()
                 if isinstance(_optimizer, RiemannianConjugateGradient):
                     # One line-search step on the whole matrix. The bar shows the step
                     # it accepted, and the log-likelihood of every cell, not a sample.
@@ -930,10 +975,19 @@ class GLMPCA:
                 if np.isinf(self.loadings_learning_scores_[-1][-1]) or np.isnan(
                     self.loadings_learning_scores_[-1][-1]
                 ):
+                    self._restarts += 1
+                    if self._restarts > MAX_RESTARTS:
+                        msg = (
+                            f"The cost was not finite after {MAX_RESTARTS} restarts "
+                            f"with a lower learning rate, the last "
+                            f"{self.learning_rate_:.1e}. Check the data and the family."
+                        )
+                        raise ValueError(msg)
                     tqdm.write("\tRESTART BECAUSE INF/NAN FOUND")
                     self.learning_rate_ = self.learning_rate_ * self.gamma
                     self.loadings_learning_scores_ = self.loadings_learning_scores_[:-1]
                     self.loadings_learning_rates_ = self.loadings_learning_rates_[:-1]
+                    self.subspace_moves_ = self.subspace_moves_[:-1]
 
                     # Remove memory
                     del (
@@ -953,20 +1007,39 @@ class GLMPCA:
                         cost=cost,
                     )
 
-                if (
-                    not isinstance(_optimizer, RiemannianConjugateGradient)
-                    and learning_rate <= LEARNING_RATE_LIMIT
-                ):
-                    msg = (
-                        f"The learning rate reached its floor of "
-                        f"{LEARNING_RATE_LIMIT:.0e}. The loadings have stopped moving, "
-                        f"so the fit will stop after this epoch. Increase gamma for a "
-                        f"longer fit."
-                    )
-                    warnings.warn(msg, UserWarning, stacklevel=2)
+                move = _subspace_move(before, _loadings.detach())
+                self.subspace_moves_[-1].append(move)
+                epoch_costs.append(epoch_cost)
+                reason = self._converged(epoch_costs, move)
+                if reason is not None:
+                    tqdm.write(f"CONVERGED after {len(epoch_costs)} epochs: {reason}")
                     break
 
         return (_loadings, _intercept)
+
+    def _converged(self, epoch_costs: list[float], move: float) -> str | None:
+        """Why the fit has converged after the epochs of `epoch_costs`, or None.
+
+        `move` is the `_subspace_move` of the last epoch. No test holds in the first
+        CONVERGENCE_WINDOW epochs. A cost that rose does not stop the fit: the
+        scheduler lowers the learning rate for it, and the fit goes on.
+        """
+        if len(epoch_costs) <= CONVERGENCE_WINDOW:
+            return None
+        if self.subspace_tol > 0 and move < self.subspace_tol:
+            return (
+                f"the loadings moved by {move:.1e}, below "
+                f"subspace_tol={self.subspace_tol:g}"
+            )
+        earlier = min(epoch_costs[:-CONVERGENCE_WINDOW])
+        recent = min(epoch_costs[-CONVERGENCE_WINDOW:])
+        gain = (earlier - recent) / max(abs(earlier), 1e-12)
+        if self.tol > 0 and 0 <= gain < self.tol:
+            return (
+                f"the best cost of the last {CONVERGENCE_WINDOW} epochs fell by "
+                f"{gain:.1e} (relative), below tol={self.tol:g}"
+            )
+        return None
 
     def _init_saturated_loading_optim(
         self,
@@ -1040,14 +1113,15 @@ class GLMPCA:
             )
 
         intercept = ManifoldParameter(center.to(device))
+        loadings_rate = self.learning_rate_ / np.sqrt(p)
         groups = [
-            {"params": loadings, "lr": self.learning_rate_},
+            {"params": loadings, "lr": loadings_rate},
             {"params": intercept, "lr": self.learning_rate_ * INTERCEPT_RATE_SCALE},
         ]
-        floors = [LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE]
 
         tqdm.write(f"GLMPCA FAMILY: {self.family}")
-        tqdm.write(f"INITIAL LEARNING RATE: {self.learning_rate_}")
+        if self.optimizer != "cg":
+            tqdm.write(f"INITIAL LEARNING RATE: {loadings_rate:.2e}")
         blocks = f" (blocks of {self._chunk} rows)" if self._chunk < batch_size else ""
         tqdm.write(f"BATCH SIZE: {batch_size}{blocks}")
         algorithm = _OPTIMIZERS[self.optimizer]
@@ -1058,7 +1132,6 @@ class GLMPCA:
             patience=PLATEAU_PATIENCE,
             threshold=PLATEAU_THRESHOLD,
             threshold_mode="abs",
-            min_lr=floors,
             eps=0.0,
         )
 

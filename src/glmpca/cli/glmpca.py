@@ -20,7 +20,13 @@ from scipy import sparse
 from tqdm.auto import tqdm
 
 from glmpca.ExponentialFamily import _n_workers
-from glmpca.GLMPCA import DEFAULT_BATCH_SIZE, GLMPCA
+from glmpca.GLMPCA import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_SUBSPACE_TOL,
+    DEFAULT_TOL,
+    GLMPCA,
+)
 from glmpca.utils import cell_depth
 
 DESCRIPTION = (
@@ -472,20 +478,56 @@ def main(
         typer.Option(
             "--maxIter",
             rich_help_panel=_OPTIMISATION,
-            help="Maximum number of epochs.",
+            help=(
+                "Maximum number of epochs. The fit stops earlier when it converges "
+                "(``--tol``, ``--subspaceTol``), and the epochs it ran are stored in "
+                '``uns["glmPCA"]["n_epochs"]``.'
+            ),
         ),
     ] = 100,
+    tol: Annotated[
+        float,
+        typer.Option(
+            "--tol",
+            min=0.0,
+            rich_help_panel=_OPTIMISATION,
+            help=(
+                "The fit stops when the best epoch cost of the last 10 epochs is "
+                "below the best cost before them, but by less than this fraction. A "
+                "cost that rose does not stop the fit, so that the learning rate can "
+                "fall. 0 turns the test off."
+            ),
+        ),
+    ] = DEFAULT_TOL,
+    subspace_tol: Annotated[
+        float,
+        typer.Option(
+            "--subspaceTol",
+            min=0.0,
+            rich_help_panel=_OPTIMISATION,
+            help=(
+                "The fit stops when the span of the loadings moves by less than this "
+                "in one epoch (the sine of the largest angle between the spans). 0 "
+                "turns the test off. Neither test stops the fit in its first 10 "
+                "epochs."
+            ),
+        ),
+    ] = DEFAULT_SUBSPACE_TOL,
     learning_rate: Annotated[
         float,
         typer.Option(
             "--learningRate",
             rich_help_panel=_OPTIMISATION,
             help=(
-                "Initial learning rate. If the optimisation gives NaN values, it "
+                "Initial learning rate of adagrad and adam, as a fraction of a "
+                "typical entry of the loadings: the loadings take this rate over the "
+                "square root of the number of features, so a rate keeps its meaning "
+                "for any number of features. Rates far above 0.1 can lose the start "
+                "in the first epoch. If the optimisation gives NaN values, it "
                 "restarts with a smaller learning rate."
             ),
         ),
-    ] = 0.2,
+    ] = DEFAULT_LEARNING_RATE,
     batch_size: Annotated[
         int,
         typer.Option(
@@ -805,6 +847,8 @@ def main(
             n_prin_comps=n_prin_comps,
             glmpca_family=glmpca_family,
             max_iter=max_iter,
+            tol=tol,
+            subspace_tol=subspace_tol,
             learning_rate=learning_rate,
             batch_size=batch_size,
             gamma=gamma,
@@ -851,6 +895,8 @@ def main(
         n_pc=n_prin_comps,
         family=glmpca_family.value,
         max_iter=max_iter,
+        tol=tol,
+        subspace_tol=subspace_tol,
         learning_rate=learning_rate,
         batch_size=batch_size,
         gamma=gamma,
@@ -887,6 +933,8 @@ def main(
             "n_pc": n_prin_comps,
             "family": glmpca_family.value,
             "max_iter": max_iter,
+            "tol": tol,
+            "subspace_tol": subspace_tol,
             "learning_rate": learning_rate,
             "batch_size": model.batch_size_,
             "gamma": gamma,
@@ -901,6 +949,7 @@ def main(
             "binarize": binarize,
             "random_state": model.random_state,
         },
+        "n_epochs": model.n_epochs_,
     }
     if model.depth_correlations_ is not None:
         adata.uns["glmPCA"]["depth_correlations"] = model.depth_correlations_

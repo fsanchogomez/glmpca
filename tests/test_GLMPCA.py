@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -20,15 +21,19 @@ from glmpca.ExponentialFamily import (
 )
 from glmpca.GLMPCA import (
     BLOCK_BYTES,
+    CONVERGENCE_WINDOW,
     DEFAULT_BATCH_SIZE,
+    DEFAULT_LEARNING_RATE,
     DEVICE_MEMORY_SHARE,
     GLMPCA,
-    LEARNING_RATE_LIMIT,
+    INTERCEPT_RATE_SCALE,
+    MAX_RESTARTS,
     PLATEAU_PATIENCE,
     WORKING_COPIES,
     _fits_in,
     _free_device_memory,
     _Rows,
+    _subspace_move,
     _to_tensor,
 )
 from glmpca.manifolds import ManifoldParameter, RiemannianAdagrad
@@ -209,6 +214,7 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma
+        model.subspace_moves_.append([])
         return torch.eye(N_FEATURES, N_PC), torch.zeros(N_FEATURES)
 
     monkeypatch.setattr(model, "_saturated_loading_iter", run_that_restarts_once)
@@ -235,25 +241,90 @@ def test_the_fit_says_which_device_it_uses(capsys: pytest.CaptureFixture[str]) -
     assert "DEVICE: cpu" in capsys.readouterr().out
 
 
-def test_a_scheduled_learning_rate_under_the_limit_stops_the_fit() -> None:
-    X = sample(GLMFamily.poisson)[:16]
+def test_the_fit_stops_when_the_subspace_test_holds(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     model = GLMPCA(
         N_PC,
         family="poisson",
-        max_iter=3 * PLATEAU_PATIENCE,
+        max_iter=5 * CONVERGENCE_WINDOW,
         batch_size=16,
-        learning_rate=2 * LEARNING_RATE_LIMIT,
-        gamma=1e-3,
+        tol=0.0,
+        subspace_tol=1.0,
     )
 
-    with pytest.warns(UserWarning, match="reached its floor"):
-        assert model.fit(X)
+    model.fit(sample(GLMFamily.poisson))
 
-    (epochs_run,) = [len(scores) for scores in model.loadings_learning_scores_]
-    assert epochs_run < model.max_iter
-    rates = [rate[0] for rate in model.loadings_learning_rates_[-1]]
-    assert rates[-1] == LEARNING_RATE_LIMIT
-    assert min(rates) >= LEARNING_RATE_LIMIT
+    assert model.n_epochs_ == CONVERGENCE_WINDOW + 1
+    assert len(model.subspace_moves_[-1]) == CONVERGENCE_WINDOW + 1
+    output = capsys.readouterr().out
+    assert f"CONVERGED after {CONVERGENCE_WINDOW + 1} epochs: the loadings" in output
+
+
+@pytest.mark.parametrize(
+    ("recent", "stops"),
+    [(99.999, True), (99.0, False), (100.5, False)],
+    ids=["slow-gain", "fast-gain", "rising"],
+)
+def test_the_cost_test_stops_only_on_a_small_gain(recent: float, stops: bool) -> None:
+    model = GLMPCA(N_PC, family="poisson", tol=1e-3, subspace_tol=0.0)
+    costs = [100.0] + [recent] * CONVERGENCE_WINDOW
+
+    reason = model._converged(costs, move=1.0)
+
+    assert (reason is not None) is stops
+    if stops:
+        assert reason is not None
+        assert "fell by 1.0e-05" in reason
+
+
+def test_no_convergence_test_holds_in_the_first_window() -> None:
+    model = GLMPCA(N_PC, family="poisson", tol=1.0, subspace_tol=1.0)
+
+    assert model._converged([100.0] * CONVERGENCE_WINDOW, move=0.0) is None
+
+
+def test_without_the_tests_the_fit_runs_every_epoch() -> None:
+    model = GLMPCA(
+        N_PC,
+        family="poisson",
+        max_iter=2 * CONVERGENCE_WINDOW,
+        batch_size=16,
+        tol=0.0,
+        subspace_tol=0.0,
+    )
+
+    model.fit(sample(GLMFamily.poisson))
+
+    assert model.n_epochs_ == 2 * CONVERGENCE_WINDOW
+
+
+def test_the_subspace_move_is_the_sine_of_the_largest_principal_angle() -> None:
+    basis = torch.linalg.qr(torch.randn(50, 3)).Q
+    rotation = torch.linalg.qr(torch.randn(3, 3)).Q
+    angle = 1e-4
+    turned = basis.clone()
+    outside = torch.linalg.qr(torch.cat([basis, torch.randn(50, 1)], dim=1)).Q[:, 3]
+    turned[:, 0] = math.cos(angle) * basis[:, 0] + math.sin(angle) * outside
+
+    assert _subspace_move(basis, basis @ rotation) < 1e-6
+    assert _subspace_move(basis, turned) == pytest.approx(math.sin(angle), rel=1e-2)
+
+
+def test_a_cost_that_stays_infinite_stops_after_the_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16)
+
+    def infinite(
+        loadings: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        return loadings.sum() * float("inf")
+
+    monkeypatch.setattr(model, "_optim_cost", infinite)
+
+    with pytest.raises(ValueError, match=f"after {MAX_RESTARTS} restarts"):
+        model.fit(sample(GLMFamily.poisson))
 
 
 def test_a_fit_that_keeps_improving_does_not_lower_the_learning_rate() -> None:
@@ -265,7 +336,40 @@ def test_a_fit_that_keeps_improving_does_not_lower_the_learning_rate() -> None:
     # The plateau scheduler waits for PLATEAU_PATIENCE epochs without progress, so a
     # fit this short always runs at the rate it started from.
     rates = [rate[0] for rate in model.loadings_learning_rates_[-1]]
-    assert rates == [model.initial_learning_rate_] * len(rates)
+    start = model.initial_learning_rate_ / math.sqrt(N_FEATURES)
+    assert rates == [pytest.approx(start)] * len(rates)
+
+
+@pytest.mark.parametrize(("optimizer", "printed"), [("adagrad", True), ("cg", False)])
+def test_the_learning_rate_is_printed_only_for_the_optimizers_that_use_it(
+    capsys: pytest.CaptureFixture[str],
+    optimizer: Literal["adagrad", "cg"],
+    printed: bool,
+) -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, optimizer=optimizer)
+
+    model.fit(sample(GLMFamily.poisson))
+
+    assert ("INITIAL LEARNING RATE" in capsys.readouterr().out) is printed
+
+
+def test_the_loadings_take_the_rate_over_the_root_of_the_features() -> None:
+    model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=16)
+    model.fit(sample(GLMFamily.poisson))
+    saturated = model.exponential_family.invert_g(sample(GLMFamily.poisson))
+
+    optimizer, *_ = model._init_saturated_loading_optim(
+        _Rows(saturated, model.exponential_family, saturated),
+        torch.device("cpu"),
+        batch_size=16,
+    )
+
+    rates = [group["lr"] for group in optimizer.param_groups]
+    assert model.initial_learning_rate_ == DEFAULT_LEARNING_RATE == 0.1
+    assert rates == [
+        pytest.approx(0.1 / math.sqrt(N_FEATURES)),
+        pytest.approx(0.1 * INTERCEPT_RATE_SCALE),
+    ]
 
 
 def test_a_batch_size_larger_than_the_row_count_is_reduced_with_a_warning() -> None:
