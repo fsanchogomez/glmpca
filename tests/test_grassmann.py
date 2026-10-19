@@ -12,6 +12,7 @@ from glmpca.manifolds import (
     ManifoldParameter,
     RiemannianAdagrad,
     canonical_basis,
+    canonical_rotation,
 )
 
 N_ROWS = 40
@@ -166,3 +167,16 @@ def test_a_fit_reports_its_components_ordered_by_variance() -> None:
     variances = model.transform(counts).var(dim=0)
 
     assert torch.all(variances[:-1] >= variances[1:]), variances
+
+
+def test_the_rotation_from_the_sums_gives_the_canonical_basis() -> None:
+    x, data = point(), torch.randn(60, N_ROWS)
+    scores = data.double() @ x.double()
+
+    rotation = canonical_rotation(
+        x, scores.T @ scores, scores.sum(dim=0), scores.shape[0]
+    )
+
+    torch.testing.assert_close(
+        x @ rotation, canonical_basis(x, [data]), atol=1e-6, rtol=0
+    )

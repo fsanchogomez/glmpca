@@ -136,15 +136,15 @@ def test_glmpca_passes_every_option_to_the_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models: list[GLMPCA] = []
-    original_fit = GLMPCA.fit
+    original_fit = GLMPCA.fit_transform
 
     def recording_fit(
         self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
-    ) -> bool:
+    ) -> torch.Tensor:
         models.append(self)
         return original_fit(self, X, depth)
 
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    monkeypatch.setattr(GLMPCA, "fit_transform", recording_fit)
     input_path = write_input(tmp_path, poisson_counts())
 
     result = runner.invoke(
@@ -382,15 +382,15 @@ def test_the_keep_sparse_flag_reaches_the_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models: list[GLMPCA] = []
-    original_fit = GLMPCA.fit
+    original_fit = GLMPCA.fit_transform
 
     def recording_fit(
         self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
-    ) -> bool:
+    ) -> torch.Tensor:
         models.append(self)
         return original_fit(self, X, depth)
 
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    monkeypatch.setattr(GLMPCA, "fit_transform", recording_fit)
     out_path = tmp_path / "out.h5ad"
 
     result = run(write_input(tmp_path, poisson_counts()), out_path, "--keepSparse")
@@ -427,15 +427,15 @@ def test_the_log_normalize_flag_fits_the_transformed_matrix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fitted: list[np.ndarray] = []
-    original_fit = GLMPCA.fit
+    original_fit = GLMPCA.fit_transform
 
     def recording_fit(
         self: GLMPCA, X: ad.AnnData, depth: np.ndarray | None = None
-    ) -> bool:
+    ) -> torch.Tensor:
         fitted.append(np.asarray(X.X))
         return original_fit(self, X, depth)
 
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    monkeypatch.setattr(GLMPCA, "fit_transform", recording_fit)
     counts = poisson_counts()
     out_path = tmp_path / "out.h5ad"
 
@@ -464,8 +464,9 @@ def test_no_log_normalize_by_default(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("backed", [False, True])
 def test_the_binarize_flag_gives_the_scores_of_the_binary_matrix(
-    tmp_path: Path, backed: bool
+    tmp_path: Path, backed: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.SHUFFLE_SEGMENTS", 0)
     counts = poisson_counts()
     binary_path = tmp_path / "binary"
     binary_path.mkdir()
@@ -509,15 +510,15 @@ def test_the_compile_flag_reaches_the_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models: list[GLMPCA] = []
-    original_fit = GLMPCA.fit
+    original_fit = GLMPCA.fit_transform
 
     def recording_fit(
         self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
-    ) -> bool:
+    ) -> torch.Tensor:
         models.append(self)
         return original_fit(self, X, depth)
 
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    monkeypatch.setattr(GLMPCA, "fit_transform", recording_fit)
     monkeypatch.setattr(torch, "compile", lambda function, **_: function)
     out_path = tmp_path / "out.h5ad"
 
@@ -554,6 +555,21 @@ def test_other_families_write_no_dispersion(tmp_path: Path) -> None:
     assert "MLE_dispersion" not in ad.read_h5ad(out_path).var
 
 
+def test_the_command_takes_the_scores_of_the_fit_without_transform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_transform(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError
+
+    monkeypatch.setattr(GLMPCA, "transform", no_transform)
+    out_path = tmp_path / "out.h5ad"
+
+    result = run(write_input(tmp_path, poisson_counts()), out_path)
+
+    assert result.exit_code == 0, result.output
+    assert ad.read_h5ad(out_path).obsm["X_glmPCA"].shape == (N_CELLS, N_PC)
+
+
 def test_drop_depth_reports_the_dropped_components_in_uns(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 
@@ -584,15 +600,15 @@ def test_drop_depth_with_log_normalize_takes_the_depth_of_the_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     depths: list[np.ndarray | None] = []
-    original_fit = GLMPCA.fit
+    original_fit = GLMPCA.fit_transform
 
     def recording_fit(
         self: GLMPCA, X: ad.AnnData, depth: np.ndarray | None = None
-    ) -> bool:
+    ) -> torch.Tensor:
         depths.append(depth)
         return original_fit(self, X, depth)
 
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    monkeypatch.setattr(GLMPCA, "fit_transform", recording_fit)
     counts = poisson_counts()
 
     result = run(
@@ -630,15 +646,15 @@ def test_without_keep_sparse_the_storage_follows_the_input_and_is_recorded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models: list[GLMPCA] = []
-    original_fit = GLMPCA.fit
+    original_fit = GLMPCA.fit_transform
 
     def recording_fit(
         self: GLMPCA, X: ad.AnnData, depth: np.ndarray | None = None
-    ) -> bool:
+    ) -> torch.Tensor:
         models.append(self)
         return original_fit(self, X, depth)
 
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
+    monkeypatch.setattr(GLMPCA, "fit_transform", recording_fit)
     out_path = tmp_path / "out.h5ad"
 
     result = run(write_input(tmp_path, poisson_counts()), out_path)
@@ -682,7 +698,10 @@ def test_the_fit_is_seeded_so_two_runs_give_the_same_scores(tmp_path: Path) -> N
     np.testing.assert_array_equal(scores[0], scores[1])
 
 
-def test_backed_gives_the_same_scores_as_a_fit_in_memory(tmp_path: Path) -> None:
+def test_backed_gives_the_same_scores_as_a_fit_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.SHUFFLE_SEGMENTS", 0)
     input_path = write_input(tmp_path, sparse.csr_matrix(poisson_counts()))
     scores = {}
     for backed in (False, True):

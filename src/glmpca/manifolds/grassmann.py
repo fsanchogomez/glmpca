@@ -77,10 +77,12 @@ def canonical_basis(
     `centered_chunks` yields the rows of `Θ - offset` in blocks, so that the `n x p`
     matrix is never formed. The scores `(Θ - offset) V` of every block add to their
     `k x k` covariance, whose eigenvectors `B` rotate the basis: the scores of `V B` are
-    then
-    uncorrelated, and the columns are sorted by decreasing variance. The scores and
-    their sums run in float64: two components of nearly equal variance make the
-    eigenvectors sensitive, and float32 would let the chunk size move the basis.
+    then uncorrelated, and the columns are sorted by decreasing variance. The scores are
+    a float32 product, which does not depend on the chunk, and their sums run in
+    float64: two components of nearly equal variance make the eigenvectors sensitive,
+    and float32 sums would let the chunk size move the basis. A float64 product would
+    double the memory of a chunk and run at a small share of the float32 speed on most
+    GPUs.
 
     The sign of an eigenvector is arbitrary, so every column is turned to make its
     entry of largest magnitude positive. With that, the same span gives the same basis
@@ -94,15 +96,25 @@ def canonical_basis(
     total = torch.zeros(size, dtype=torch.float64)
     rows = 0
     for chunk in centered_chunks:
-        scores = (chunk.double() @ loadings.double()).cpu()
+        scores = (chunk @ loadings).double().cpu()
         gram += scores.T @ scores
         total += scores.sum(dim=0)
         rows += scores.shape[0]
+    return loadings @ canonical_rotation(loadings, gram, total, rows)
+
+
+def canonical_rotation(
+    loadings: torch.Tensor, gram: torch.Tensor, total: torch.Tensor, rows: int
+) -> torch.Tensor:
+    """The `k x k` rotation that turns `loadings` into its canonical basis.
+
+    `gram` and `total` are the float64 sums of `sᵀ s` and of `s` over the `rows` scores
+    `s = (Θ - offset) V`. The rotation holds the order by variance and the sign of every
+    column, so the canonical scores are the scores times the rotation.
+    """
     mean = total / max(rows, 1)
     covariance = gram / max(rows, 1) - torch.outer(mean, mean)
-
     variances, rotation = torch.linalg.eigh(covariance)
     order = torch.argsort(variances, descending=True)
     rotation = rotation[:, order].to(dtype=loadings.dtype, device=loadings.device)
-    basis = loadings @ rotation
-    return basis * largest_entry_signs(basis)
+    return rotation * largest_entry_signs(loadings @ rotation)

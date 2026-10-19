@@ -10,7 +10,12 @@ right manifold for a cost that depends on the basis rather than on the span.
 """
 
 from .euclidean import Euclidean
-from .grassmann import Grassmann, canonical_basis, largest_entry_signs
+from .grassmann import (
+    Grassmann,
+    canonical_basis,
+    canonical_rotation,
+    largest_entry_signs,
+)
 from .optimizer import (
     RiemannianAdagrad,
     RiemannianAdam,
@@ -28,5 +33,6 @@ __all__ = [
     "RiemannianAdam",
     "RiemannianConjugateGradient",
     "canonical_basis",
+    "canonical_rotation",
     "largest_entry_signs",
 ]

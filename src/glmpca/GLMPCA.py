@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import anndata as ad
@@ -10,6 +11,7 @@ import torch
 import torch.optim
 from anndata.abc import CSCDataset, CSRDataset
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix, issparse
+from scipy.sparse import vstack as sparse_vstack
 from tqdm.auto import tqdm
 
 from .ExponentialFamily import ExponentialFamily, GLMFamily
@@ -19,7 +21,7 @@ from .manifolds import (
     RiemannianAdagrad,
     RiemannianAdam,
     RiemannianConjugateGradient,
-    canonical_basis,
+    canonical_rotation,
 )
 from .sparse import BackedRows, SparseRows, binary
 from .utils import cell_depth, components_to_keep
@@ -53,6 +55,8 @@ convergence test stops the fit."""
 DEFAULT_TOL = 1e-8
 DEFAULT_SUBSPACE_TOL = 1e-6
 MAX_RESTARTS = 10
+SHUFFLE_SEGMENTS = 8
+"""Contiguous segments of batch_size rows that one buffer of a backed matrix reads."""
 """Restarts with a lower learning rate after a cost that is not finite, before fit
 stops."""
 PLATEAU_PATIENCE = 10
@@ -205,6 +209,43 @@ class _Rows:
         data = self.read(rows, device)
         stored = self.stored(rows, device)
         return data, self.family.invert_g(data) if stored is None else stored
+
+    def subset(self, rows: slice | torch.Tensor, *, pin: bool = False) -> _Rows:
+        """The rows `rows`, read now into a `_Rows` of their own on the host.
+
+        A dense matrix gives a copy of the rows, pinned with `pin` for a fast copy to
+        CUDA, a CSR matrix or a backed one gives a CSR block. The saturated parameters
+        follow when they are stored.
+        """
+        if isinstance(self.data, SparseRows):
+            block = self.data._block(rows)
+            data: torch.Tensor | SparseRows = SparseRows(
+                csr_matrix(
+                    block if issparse(block) else np.asarray(block), dtype=np.float32
+                )
+            )
+        else:
+            data = self.data[rows]
+            if pin:
+                data = data.pin_memory()
+        theta = None
+        if self.theta is not None:
+            theta = self.theta[rows]
+            if pin:
+                theta = theta.pin_memory()
+        return _Rows(data, self.family, theta)
+
+    def segments(self, starts: list[int], size: int) -> _Rows:
+        """The segments of `size` rows from every start in `starts`, by slice reads."""
+        assert isinstance(self.data, SparseRows)
+        blocks = [self.data._block(slice(start, start + size)) for start in starts]
+        matrix = sparse_vstack([
+            csr_matrix(block if issparse(block) else np.asarray(block))
+            for block in blocks
+        ])
+        return _Rows(
+            SparseRows(csr_matrix(matrix, dtype=np.float32)), self.family, None
+        )
 
     def stored(
         self, rows: slice | torch.Tensor, device: torch.device
@@ -486,6 +527,19 @@ class GLMPCA:
             Returns True if the fitting procedure was successful.
 
         """
+        self.fit_transform(X, depth)
+        return True
+
+    def fit_transform(
+        self,
+        X: torch.Tensor | np.ndarray | ad.AnnData,
+        depth: np.ndarray | None = None,
+    ) -> torch.Tensor:
+        """Fits the model to `X` and returns the scores of its cells, on the CPU.
+
+        The scores come from the last pass of the fit, so they cost no pass of their
+        own, and they equal `transform(X)` up to the rounding of float sums.
+        """
         device = _resolve_device(self.device)
         seeded = self.random_state is not None
         with torch.random.fork_rng(
@@ -498,7 +552,7 @@ class GLMPCA:
 
     def _fit(
         self, X: torch.Tensor | np.ndarray | ad.AnnData, depth: np.ndarray | None
-    ) -> bool:
+    ) -> torch.Tensor:
         """The fit itself, which fit runs with the random state of the model."""
         device = _resolve_device(self.device)
         if self.init not in ("spectral", "random"):
@@ -669,39 +723,27 @@ class GLMPCA:
         best_loadings = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
         with torch.no_grad():
-            training_cost = self._with_smaller_blocks(
-                after,
-                lambda: self._full_cost(
-                    best_loadings, self.saturated_intercept_, rows, after
-                ),
+            training_cost, gram, total, raw_scores = self._with_smaller_blocks(
+                after, lambda: self._last_pass(rows, after, best_loadings)
             )
         self.log_likelihood_ = float(training_cost.neg().cpu()) + float(
             log_base_measure.sum()
         )
-        self.saturated_loadings_ = self._with_smaller_blocks(
-            after,
-            lambda: canonical_basis(best_loadings, self._centered_chunks(rows, after)),
-        ).cpu()
+        rotation = canonical_rotation(best_loadings, gram, total, n_rows)
+        self.saturated_loadings_ = (best_loadings @ rotation).cpu()
+        scores = raw_scores @ rotation.cpu()
         self.depth_correlations_ = self.n_dropped_components_ = None
         if self.drop_depth:
             cells = cell_depth(X) if depth is None else np.asarray(depth, np.float64)
-            basis = self.saturated_loadings_.to(after)
-            scores = self._with_smaller_blocks(
-                after,
-                lambda: torch.cat([
-                    (chunk @ basis).cpu()
-                    for chunk in self._centered_chunks(rows, after)
-                ]),
-            )
             kept, self.depth_correlations_ = components_to_keep(scores, cells)
-            self.n_dropped_components_ = basis.shape[1] - len(kept)
-            self.saturated_loadings_ = self.saturated_loadings_[
-                :, torch.from_numpy(kept)
-            ]
+            self.n_dropped_components_ = scores.shape[1] - len(kept)
+            kept_columns = torch.from_numpy(kept)
+            self.saturated_loadings_ = self.saturated_loadings_[:, kept_columns]
+            scores = scores[:, kept_columns]
         self.saturated_intercept_ = self.saturated_intercept_.cpu()
         family.load_family_params_to_gpu(torch.device("cpu"))
 
-        return True
+        return scores
 
     def _rows_source(
         self,
@@ -779,19 +821,31 @@ class GLMPCA:
             tqdm.write(f"GPU MEMORY: out of memory, blocks of {self._chunk} rows")
         return self._with_smaller_blocks(device, run)
 
-    def _centered_chunks(
-        self, rows: _Rows, device: torch.device
-    ) -> Iterator[torch.Tensor]:
-        """The rows that transform projects, in blocks of chunk_size.
+    def _last_pass(
+        self, rows: _Rows, device: torch.device, loadings: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The cost of the fit, the sums of its scores, and the scores, in one pass.
 
-        They are centered with the intercept, as transform centers the same cells, so
-        the scores canonical_basis orders are the scores that transform reports.
+        The scores `(Θ - μ) V` of every block are computed in float32 and added in
+        float64 into `sᵀ s` and `s`, which `canonical_rotation` needs. The raw scores
+        stay on the CPU, so the canonical scores are a `k x k` product away.
         """
         intercept = self.saturated_intercept_
         assert intercept is not None
+        size = loadings.shape[1]
+        cost = torch.zeros((), device=device, dtype=torch.float64)
+        gram = torch.zeros(size, size, dtype=torch.float64)
+        total = torch.zeros(size, dtype=torch.float64)
+        scores = []
         for chunk in rows.slices(self._chunk):
-            _, theta = rows.block(chunk, device)
-            yield theta - intercept.unsqueeze(0)
+            data, theta = rows.block(chunk, device)
+            cost = cost + self._optim_cost(loadings, intercept, data, theta)
+            block = ((theta - intercept.unsqueeze(0)) @ loadings).cpu()
+            wide = block.double()
+            gram += wide.T @ wide
+            total += wide.sum(dim=0)
+            scores.append(block)
+        return cost, gram, total, torch.cat(scores)
 
     def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
         r"""Transforms and projects dataset X onto the principal components.
@@ -799,13 +853,13 @@ class GLMPCA:
         Parameters
         ----------
         X : torch.Tensor, np.ndarray or AnnData
-            Dataset with cells in rows and features in columns. An np.ndarray or an
-            AnnData input is converted on the CPU, as in fit.
+            Dataset with cells in rows and features in columns. It is stored as in fit
+            and read by blocks on the device of the model.
 
         Returns
         -------
         torch.Tensor
-            Projected saturated parameters, on the device of the converted dataset.
+            Projected saturated parameters, on the CPU.
 
         """
         loadings, intercept = self.saturated_loadings_, self.saturated_intercept_
@@ -813,23 +867,27 @@ class GLMPCA:
             msg = "GLMPCA is not fitted. Call fit() before transform()."
             raise RuntimeError(msg)
 
-        X_transform = self._rows_source(X, torch.device("cpu"), announce=False)
-        device = X_transform.device
+        device = _resolve_device(self.device)
+        X_transform = self._rows_source(X, device, announce=False)
         loadings, intercept = loadings.to(device), intercept.to(device)
         self.exponential_family.load_family_params_to_gpu(device)
-
         rows = _Rows(X_transform, self.exponential_family, None)
-        scores = [torch.empty(0, loadings.shape[1], device=device)]
-        chunk_rows = self._chunk_rows(
-            device,
-            X_transform.shape[0],
-            X_transform.shape[1] * X_transform.dtype.itemsize,
+        self._chunk = self._chunk_rows(
+            device, X_transform.shape[0], X_transform.shape[1] * 4
         )
-        for chunk in rows.slices(chunk_rows):
-            _, theta = rows.block(chunk, device)
-            scores.append((theta - intercept.unsqueeze(0)).matmul(loadings))
 
-        return torch.cat(scores)
+        def projection_pass() -> torch.Tensor:
+            scores = [torch.empty(0, loadings.shape[1])]
+            for chunk in rows.slices(self._chunk):
+                _, theta = rows.block(chunk, device)
+                scores.append(((theta - intercept.unsqueeze(0)) @ loadings).cpu())
+            return torch.cat(scores)
+
+        try:
+            with torch.no_grad():
+                return self._with_smaller_blocks(device, projection_pass)
+        finally:
+            self.exponential_family.load_family_params_to_gpu(torch.device("cpu"))
 
     def _saturated_loading_iter(
         self,
@@ -872,34 +930,37 @@ class GLMPCA:
                 rows=rows, device=device, batch_size=batch_size
             )
         )
-        n = rows.shape[0]
 
-        def backward(parts: Callable[[], Iterable[slice | torch.Tensor]]) -> float:
+        def backward(
+            parts: Callable[[], Iterable[slice | torch.Tensor]],
+            source: _Rows = rows,
+        ) -> torch.Tensor:
             """The cost of the rows of `parts`, with its gradient summed over them.
 
             It starts from a zero gradient, so a run that CUDA stops for memory can
-            start over with smaller blocks.
+            start over with smaller blocks. The cost stays on the device, so the next
+            batch does not wait for this one to finish.
             """
 
-            def run() -> float:
+            def run() -> torch.Tensor:
                 _optimizer.zero_grad()
                 total = torch.zeros((), device=device, dtype=torch.float64)
                 for part in parts():
                     part_cost = cost(
                         loadings=_loadings,
                         intercept=_intercept,
-                        batch_data=rows.read(part, device),
-                        batch_parameters=rows.stored(part, device),
+                        batch_data=source.read(part, device),
+                        batch_parameters=source.stored(part, device),
                     )
                     part_cost.backward()
                     total += part_cost.detach()
-                return float(total)
+                return total
 
             return self._with_smaller_blocks(device, run)
 
         def closure() -> float:
             """The cost of the whole matrix, with the gradient summed over blocks."""
-            return backward(lambda: rows.slices(self._chunk))
+            return float(backward(lambda: rows.slices(self._chunk)))
 
         # Run epoch in a for loop
         with tqdm(total=self.max_iter, unit="epoch", dynamic_ncols=True) as epochs:
@@ -938,22 +999,29 @@ class GLMPCA:
                         break
                 else:
                     step_costs = []
-                    order = torch.randperm(n)[: n - n % batch_size]
-                    for batch in order.split(batch_size):
+                    seen = []
+                    pin = device.type == "cuda" and rows.data.device.type == "cpu"
+                    batches = self._epoch_batches(rows, batch_size, pin=pin)
+                    if device.type == "cuda" or isinstance(rows.data, BackedRows):
+                        batches = self._prefetched(batches)
+                    for cells, batch in batches:
+                        seen.append(cells)
                         step_costs.append(
-                            backward(lambda batch=batch: batch.split(self._chunk))
+                            backward(
+                                lambda batch=batch: batch.slices(self._chunk), batch
+                            )
                         )
                         _optimizer.step()
                         _optimizer.zero_grad()
                         self.loadings_learning_rates_[-1].append(
                             _lr_scheduler.get_last_lr()
                         )
-                    costs = np.asarray(step_costs, dtype=np.float32)
-                    self.loadings_learning_scores_[-1].extend(costs)
-                    epoch_cost = float(costs.sum(dtype=np.float64))
+                    costs = torch.stack(step_costs).cpu().numpy()
+                    self.loadings_learning_scores_[-1].extend(costs.astype(np.float32))
+                    epoch_cost = float(costs.sum())
                     # The cost leaves out log h, which the bar puts back.
                     epoch_log_likelihood = (
-                        float(log_base_measure[order].sum()) - epoch_cost
+                        float(log_base_measure[torch.cat(seen)].sum()) - epoch_cost
                     )
                     learning_rate = _lr_scheduler.get_last_lr()[0]
                     if cost_anchor is None:
@@ -1016,6 +1084,54 @@ class GLMPCA:
                     break
 
         return (_loadings, _intercept)
+
+    def _epoch_batches(
+        self, rows: _Rows, batch_size: int, *, pin: bool = False
+    ) -> Iterator[tuple[torch.Tensor, _Rows]]:
+        """The cells and the rows of every batch of one epoch, read on the host.
+
+        Every epoch drops `n mod batch_size` cells, as before. A matrix in memory gives
+        batches of random cells. A backed matrix is read in contiguous segments of
+        batch_size rows, in random order, SHUFFLE_SEGMENTS at a time; the rows of those
+        segments are shuffled together and split into batches, so an epoch reads the
+        file once by slices instead of every batch by scattered rows.
+        """
+        n = rows.shape[0]
+        usable = n - n % batch_size
+        if not isinstance(rows.data, BackedRows) or SHUFFLE_SEGMENTS < 1:
+            order = torch.randperm(n)[:usable]
+            for cells in order.split(batch_size):
+                yield cells, rows.subset(cells, pin=pin)
+            return
+        offset = int(torch.randint(0, n % batch_size + 1, ()))
+        segments = torch.randperm(usable // batch_size)
+        for group in segments.split(SHUFFLE_SEGMENTS):
+            starts = [offset + int(segment) * batch_size for segment in group]
+            buffer = rows.segments(starts, batch_size)
+            cells = torch.cat([
+                torch.arange(start, start + batch_size) for start in starts
+            ])
+            mixed = torch.randperm(len(cells))
+            for local in mixed.split(batch_size):
+                yield cells[local], buffer.subset(local, pin=pin)
+
+    @staticmethod
+    def _prefetched(items: Iterator[_Result]) -> Iterator[_Result]:
+        """`items`, with the next one prepared in a thread while this one is used.
+
+        The fit uses it for a backed matrix and on CUDA. On the CPU with the matrix in
+        memory the thread competes with the threads of torch, and an epoch took about a
+        third longer with it.
+        """
+        end = object()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            following = pool.submit(next, items, end)
+            while True:
+                item = following.result()
+                if item is end:
+                    return
+                following = pool.submit(next, items, end)
+                yield item
 
     def _converged(self, epoch_costs: list[float], move: float) -> str | None:
         """Why the fit has converged after the epochs of `epoch_costs`, or None.
@@ -1087,26 +1203,22 @@ class GLMPCA:
             min(max(SPECTRAL_ROWS, batch_size), n, SPECTRAL_BYTES // row_bytes),
             self.n_pc,
         )
-        random_idx = self._rng.choice(n, replace=False, size=random_batch_size)
-        _, subset = (
-            part.cpu() for part in rows.block(torch.from_numpy(random_idx), device)
+        random_idx = torch.from_numpy(
+            self._rng.choice(n, replace=False, size=random_batch_size)
         )
         components = self.n_pc
-        if self.exponential_family.family_name in ["poisson"]:
-            center = torch.median(subset, dim=0).values
+        try:
+            _, subset = rows.block(random_idx, device)
+            center, start = self._start_values(subset)
+        except torch.OutOfMemoryError:
+            if device.type != "cuda":
+                raise
+            torch.cuda.empty_cache()
+            _, subset = (part.cpu() for part in rows.block(random_idx, device))
+            center, start = self._start_values(subset)
+        if start is not None:
+            loadings = ManifoldParameter(start.to(device), manifold=Grassmann())
         else:
-            center = torch.mean(subset, dim=0)
-        if self.init == "spectral":
-            centered = subset - subset.mean(dim=0)
-            _, _, v = torch.svd_lowrank(
-                centered,
-                q=min(2 * components, *centered.shape),
-                niter=SPECTRAL_ITERATIONS,
-            )
-            loadings = ManifoldParameter(
-                v[:, :components].to(device), manifold=Grassmann()
-            )
-        elif self.init == "random":
             loadings = ManifoldParameter(
                 Grassmann().random(p, components, device=device),
                 manifold=Grassmann(),
@@ -1136,6 +1248,28 @@ class GLMPCA:
         )
 
         return optimizer, loadings, intercept, lr_scheduler
+
+    def _start_values(
+        self, subset: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The intercept, and with init="spectral" the loadings, from a sample of Θ.
+
+        It runs where `subset` is, on the device of the fit when the sample fits there,
+        so the randomized SVD of a wide sample runs on the GPU.
+        """
+        if self.exponential_family.family_name in ["poisson"]:
+            center = torch.median(subset, dim=0).values
+        else:
+            center = torch.mean(subset, dim=0)
+        if self.init != "spectral":
+            return center, None
+        centered = subset - subset.mean(dim=0)
+        _, _, v = torch.svd_lowrank(
+            centered,
+            q=min(2 * self.n_pc, *centered.shape),
+            niter=SPECTRAL_ITERATIONS,
+        )
+        return center, v[:, : self.n_pc]
 
     def _full_cost(
         self,

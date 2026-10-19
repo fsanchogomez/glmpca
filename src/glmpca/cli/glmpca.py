@@ -386,14 +386,14 @@ def run_glmpca(
     counts; None takes the row sums of `adata`.
     """
     try:
-        model.fit(adata, depth)
+        scores = model.fit_transform(adata, depth)
     except ValueError as exc:
         raise fail(str(exc)) from exc
 
     loadings, intercept = model.saturated_loadings_, model.saturated_intercept_
     assert loadings is not None
     assert intercept is not None
-    return model.transform(adata).numpy(), loadings.numpy(), intercept.numpy()
+    return scores.numpy(), loadings.numpy(), intercept.numpy()
 
 
 @app.callback(invoke_without_command=True)
@@ -586,12 +586,11 @@ def main(
             metavar="NAME",
             rich_help_panel=_OPTIMISATION,
             help=(
-                "The optimiser on the Stiefel manifold.\n\n"
+                "The optimiser on the Grassmann manifold.\n\n"
                 "One of: [bold yellow]adagrad[/bold yellow], "
                 "[bold yellow]adam[/bold yellow], [bold yellow]cg[/bold yellow] "
                 "(conjugate gradients). The learning rate default is calibrated for "
-                "[bold yellow]adagrad[/bold yellow], and "
-                "[bold yellow]adam[/bold yellow] usually needs a smaller one.\n\n"
+                "[bold yellow]adagrad[/bold yellow].\n\n"
                 "[bold yellow]cg[/bold yellow] works on the whole matrix and picks "
                 "every step by a line search, so --learningRate, --gamma and "
                 "--batchSize do not reach it. It stops when no step lowers the cost."

@@ -353,6 +353,51 @@ def test_the_learning_rate_is_printed_only_for_the_optimizers_that_use_it(
     assert ("INITIAL LEARNING RATE" in capsys.readouterr().out) is printed
 
 
+@pytest.mark.parametrize("keep_sparse", [False, True])
+@pytest.mark.parametrize("drop_depth", [False, True])
+def test_fit_transform_gives_the_scores_of_transform(
+    keep_sparse: bool, drop_depth: bool
+) -> None:
+    X = depth_gradient()
+    model = GLMPCA(
+        N_PC,
+        family="poisson",
+        max_iter=5,
+        batch_size=16,
+        keep_sparse=keep_sparse,
+        drop_depth=drop_depth,
+    )
+
+    scores = model.fit_transform(X)
+
+    assert model.saturated_loadings_ is not None
+    assert scores.shape == (N_CELLS, model.saturated_loadings_.shape[1])
+    torch.testing.assert_close(scores, model.transform(X), atol=1e-4, rtol=1e-4)
+
+
+def test_one_run_reads_the_matrix_once_after_its_epochs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_full_cost(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError
+
+    monkeypatch.setattr(GLMPCA, "_full_cost", no_full_cost)
+    passes: list[int] = []
+    original = GLMPCA._last_pass
+
+    def counting(self: GLMPCA, *args: object) -> tuple:
+        passes.append(1)
+        return original(self, *args)
+
+    monkeypatch.setattr(GLMPCA, "_last_pass", counting)
+    model = GLMPCA(N_PC, family="poisson", max_iter=2, batch_size=16, drop_depth=True)
+
+    model.fit(depth_gradient())
+
+    assert passes == [1]
+    assert model.log_likelihood_ is not None
+
+
 def test_the_loadings_take_the_rate_over_the_root_of_the_features() -> None:
     model = GLMPCA(N_PC, family="poisson", max_iter=1, batch_size=16)
     model.fit(sample(GLMFamily.poisson))
@@ -434,8 +479,11 @@ def test_anndata_input_is_fitted_with_cells_in_rows(
     ids=lambda matrix_type: matrix_type.__name__,
 )
 def test_backed_anndata_input_is_fitted_like_in_memory_input(
-    matrix_type: Callable[[np.ndarray], Any], tmp_path: Path
+    matrix_type: Callable[[np.ndarray], Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.SHUFFLE_SEGMENTS", 0)
     counts = (
         np.random
         .default_rng(0)
@@ -1035,7 +1083,10 @@ def test_a_binarized_fit_equals_a_fit_on_the_binary_matrix(keep_sparse: bool) ->
     torch.testing.assert_close(binarized.transform(X), expected.transform(X != 0))
 
 
-def test_a_backed_binarized_fit_equals_one_in_memory(tmp_path: Path) -> None:
+def test_a_backed_binarized_fit_equals_one_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.SHUFFLE_SEGMENTS", 0)
     adata, X = backed_counts(tmp_path)
     options = {"max_iter": 3, "batch_size": 8, "binarize": True}
     backed = GLMPCA(N_PC, family="poisson", **options)
@@ -1049,7 +1100,52 @@ def test_a_backed_binarized_fit_equals_one_in_memory(tmp_path: Path) -> None:
     )
 
 
-def test_a_backed_fit_equals_a_sparse_fit_in_memory(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backed", [False, True])
+def test_an_epoch_uses_every_usable_cell_once(tmp_path: Path, backed: bool) -> None:
+    adata, X = backed_counts(tmp_path)
+    model = GLMPCA(N_PC, family="poisson")
+    source = BackedRows(adata.X) if backed else SparseRows(sparse.csr_matrix(X.numpy()))
+    rows = _Rows(source, model.exponential_family, None)
+    batch_size = 7
+
+    batches = list(model._epoch_batches(rows, batch_size))
+
+    cells = torch.cat([cells for cells, _ in batches])
+    assert len(cells) == N_CELLS - N_CELLS % batch_size
+    assert len(set(cells.tolist())) == len(cells)
+    for cells, batch in batches:
+        torch.testing.assert_close(
+            batch.read(slice(None), torch.device("cpu")), X[cells]
+        )
+
+
+def test_a_backed_batch_comes_from_few_contiguous_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.SHUFFLE_SEGMENTS", 2)
+    adata, _ = backed_counts(tmp_path)
+    model = GLMPCA(N_PC, family="poisson")
+    rows = _Rows(BackedRows(adata.X), model.exponential_family, None)
+
+    batches = list(model._epoch_batches(rows, batch_size=4))
+
+    assert len(batches) == N_CELLS // 4
+    offset = int(torch.cat([cells for cells, _ in batches]).min())
+    for cells, _ in batches:
+        assert len(set(((cells - offset) // 4).tolist())) <= 2
+
+
+def test_prefetched_gives_the_items_in_order() -> None:
+    items = [torch.tensor(i) for i in range(5)]
+
+    assert list(GLMPCA._prefetched(iter(items))) == items
+    assert list(GLMPCA._prefetched(iter([]))) == []
+
+
+def test_a_backed_fit_equals_a_sparse_fit_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("glmpca.GLMPCA.SHUFFLE_SEGMENTS", 0)
     adata, X = backed_counts(tmp_path)
     backed = GLMPCA(N_PC, family="poisson", max_iter=3, batch_size=8)
     backed.fit(adata)
