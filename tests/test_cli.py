@@ -378,59 +378,6 @@ def test_the_family_choices_are_the_library_families() -> None:
     }
 
 
-def test_the_depth_covariate_is_written_to_obs_var_and_uns(tmp_path: Path) -> None:
-    out_path = tmp_path / "out.h5ad"
-    counts = poisson_counts()
-
-    result = run(write_input(tmp_path, counts), out_path, "--depthCovariate")
-
-    assert result.exit_code == 0, result.output
-    adata = ad.read_h5ad(out_path)
-    logs = np.log(counts.sum(axis=1, dtype=np.float64))
-    np.testing.assert_allclose(
-        adata.obs["glmPCA_log_depth"].to_numpy(), logs - logs.mean(), atol=1e-5
-    )
-    assert adata.var["glmPCA_depth_coef"].shape == (N_FEATURES,)
-    assert np.all(np.isfinite(adata.var["glmPCA_depth_coef"].to_numpy()))
-    assert adata.uns["glmPCA"]["log_depth_mean"] == pytest.approx(logs.mean())
-
-
-def test_no_depth_covariate_by_default_leaves_the_columns_out(tmp_path: Path) -> None:
-    out_path = tmp_path / "out.h5ad"
-
-    result = run(write_input(tmp_path, poisson_counts()), out_path)
-
-    assert result.exit_code == 0, result.output
-    adata = ad.read_h5ad(out_path)
-    assert "glmPCA_log_depth" not in adata.obs
-    assert "glmPCA_depth_coef" not in adata.var
-    assert "log_depth_mean" not in adata.uns["glmPCA"]
-
-
-def test_the_depth_covariate_flag_reaches_the_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    models: list[GLMPCA] = []
-    original_fit = GLMPCA.fit
-
-    def recording_fit(
-        self: GLMPCA, X: torch.Tensor, depth: np.ndarray | None = None
-    ) -> bool:
-        models.append(self)
-        return original_fit(self, X, depth)
-
-    monkeypatch.setattr(GLMPCA, "fit", recording_fit)
-    out_path = tmp_path / "out.h5ad"
-
-    result = run(write_input(tmp_path, poisson_counts()), out_path, "--depthCovariate")
-
-    assert result.exit_code == 0, result.output
-    (model,) = models
-    assert model.depth_covariate
-    assert model.depth_coef_ is not None
-    assert ad.read_h5ad(out_path).uns["glmPCA"]["params"]["depth_covariate"]
-
-
 def test_the_keep_sparse_flag_reaches_the_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

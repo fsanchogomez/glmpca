@@ -89,35 +89,6 @@ def _free_device_memory(device: torch.device) -> int:
     return free
 
 
-def _row_sums(X: torch.Tensor | SparseRows, chunk: int) -> torch.Tensor:
-    """The sum of every row of `X` in float64, by blocks of `chunk` rows when backed."""
-    if isinstance(X, torch.Tensor):
-        return X.sum(dim=1, dtype=torch.float64).cpu()
-    if not isinstance(X, BackedRows):
-        return torch.from_numpy(
-            np.asarray(X.matrix.sum(axis=1), dtype=np.float64).ravel()
-        )
-    return torch.cat([
-        X[start : start + chunk].sum(dim=1, dtype=torch.float64)
-        for start in range(0, X.shape[0], chunk)
-    ])
-
-
-def _log_depth(sums: torch.Tensor, floor: float) -> torch.Tensor:
-    """`log` of the row sums, a row that sums to less than `floor` taken at `floor`.
-
-    A negative sum has no depth, so it stops the fit.
-    """
-    if bool((sums < 0).any()):
-        row = int(torch.nonzero(sums < 0)[0])
-        msg = (
-            f"depth_covariate needs data that is not negative, but row {row} sums to "
-            f"{float(sums[row]):.4g}."
-        )
-        raise ValueError(msg)
-    return sums.clamp(min=floor).log()
-
-
 def _resolve_device(device: str | torch.device | None) -> torch.device:
     if device is None:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -299,18 +270,6 @@ class GLMPCA:
         random cells and "random" performs a random initialization on the
         Grassmann manifold. Defaults to "spectral".
 
-    depth_covariate: bool
-        Whether to model the depth of a cell as a covariate: the centered log of its row
-        sum, `z = log N - mean(log N)`, with a coefficient `beta` for every feature
-        that the fit learns, so the parameters are centered by `1 mu.T + z beta.T`
-        before the projection and a component does not have to carry the depth. `z` is
-        fixed by the data, so `transform` computes it for an unseen cell from its row
-        sum, with the mean of the fit. `beta` starts at the least-squares slope on the
-        spectral sample and has the learning rate of the intercept. A row that sums to
-        zero takes the smallest positive sum of the fit. For "poisson" and
-        "negative_binomial" `beta` is near 1, a size factor; on a bounded support it
-        takes the slope of every feature, which saturates. Defaults to False.
-
     drop_depth: bool
         Whether to drop, after the fit, every component whose scores follow the depth
         of the cells, the total of their counts as given, |Spearman rho| above
@@ -387,7 +346,6 @@ class GLMPCA:
         gamma: float = 0.5,
         n_init: int = 1,
         init: Literal["spectral", "random"] = "spectral",
-        depth_covariate: bool = False,
         drop_depth: bool = False,
         n_jobs: int | None = None,
         device: str | torch.device | None = None,
@@ -411,7 +369,6 @@ class GLMPCA:
         self.n_init = n_init
         self.gamma = gamma
         self.init = init
-        self.depth_covariate = depth_covariate
         self.drop_depth = drop_depth
         self.chunk_size = chunk_size
         self._chunk = chunk_size or batch_size
@@ -428,12 +385,6 @@ class GLMPCA:
         self.log_likelihood_: float | None = None
         # saturated_intercept_: before projecting
         self.saturated_intercept_: torch.Tensor | None = None
-        # The depth covariate: z of every cell of the fit, beta of every feature, the
-        # mean that centers log N, and the floor of a row sum.
-        self.log_depth_: torch.Tensor | None = None
-        self.depth_coef_: torch.Tensor | None = None
-        self.log_depth_mean_: float | None = None
-        self._depth_floor: float | None = None
         # drop_depth: the Spearman rho of every component with the depth, and how many
         # components went.
         self.depth_correlations_: np.ndarray | None = None
@@ -581,15 +532,6 @@ class GLMPCA:
                 ).cpu()
         rows = _Rows(X_fit, family, saturated_parameters)
 
-        log_depth = None
-        if self.depth_covariate:
-            sums = _row_sums(X_fit, self._chunk)
-            positive = sums[sums > 0]
-            self._depth_floor = float(positive.min()) if positive.numel() else 1.0
-            logs = _log_depth(sums, self._depth_floor)
-            self.log_depth_mean_ = float(logs.mean())
-            log_depth = (logs - self.log_depth_mean_).float()
-
         # log h(x) of every cell, summed over its features. It turns the cost into
         # the real log-likelihood.
         log_base_measure = torch.empty(X_fit.shape[0], dtype=torch.float64)
@@ -647,20 +589,13 @@ class GLMPCA:
             self.learning_rate_ = self.initial_learning_rate_
             runs.append(
                 self._saturated_loading_iter(
-                    rows, batch_size, device, log_base_measure, cost, log_depth
+                    rows, batch_size, device, log_base_measure, cost
                 )
             )
 
         runs = [
-            (
-                loadings.to(after),
-                intercept.to(after),
-                None if coef is None else coef.to(after),
-            )
-            for loadings, intercept, coef in runs
+            (loadings.to(after), intercept.to(after)) for loadings, intercept in runs
         ]
-        if log_depth is not None:
-            log_depth = log_depth.to(after)
         family.load_family_params_to_gpu(after)
         self._chunk = self._chunk_rows(after, n_rows, row_bytes)
 
@@ -671,28 +606,19 @@ class GLMPCA:
                 training_cost = torch.stack([
                     self._with_smaller_blocks(
                         after,
-                        lambda run=run: self._full_cost(
-                            run[0], run[1], rows, after, run[2], log_depth
-                        ),
+                        lambda run=run: self._full_cost(run[0], run[1], rows, after),
                     )
                     for run in runs
                 ])
             best_model_idx = int(torch.argmin(training_cost))
-        best_loadings, best_intercept, best_coef = runs[best_model_idx]
+        best_loadings, best_intercept = runs[best_model_idx]
         best_loadings = best_loadings.detach()
         self.saturated_intercept_ = best_intercept.detach()
-        self.depth_coef_ = None if best_coef is None else best_coef.detach()
-        self.log_depth_ = log_depth
         with torch.no_grad():
             training_cost = self._with_smaller_blocks(
                 after,
                 lambda: self._full_cost(
-                    best_loadings,
-                    self.saturated_intercept_,
-                    rows,
-                    after,
-                    self.depth_coef_,
-                    self.log_depth_,
+                    best_loadings, self.saturated_intercept_, rows, after
                 ),
             )
         self.log_likelihood_ = float(training_cost.neg().cpu()) + float(
@@ -719,9 +645,6 @@ class GLMPCA:
                 :, torch.from_numpy(kept)
             ]
         self.saturated_intercept_ = self.saturated_intercept_.cpu()
-        if self.depth_coef_ is not None and self.log_depth_ is not None:
-            self.depth_coef_ = self.depth_coef_.cpu()
-            self.log_depth_ = self.log_depth_.cpu()
         family.load_family_params_to_gpu(torch.device("cpu"))
 
         return True
@@ -807,18 +730,14 @@ class GLMPCA:
     ) -> Iterator[torch.Tensor]:
         """The rows that transform projects, in blocks of chunk_size.
 
-        They are centered with the intercept and, with depth_covariate, with `z beta.T`,
-        as transform centers the same cells, so the scores canonical_basis orders are
-        the scores that transform reports.
+        They are centered with the intercept, as transform centers the same cells, so
+        the scores canonical_basis orders are the scores that transform reports.
         """
         intercept = self.saturated_intercept_
         assert intercept is not None
         for chunk in rows.slices(self._chunk):
             _, theta = rows.block(chunk, device)
-            block = theta - intercept.unsqueeze(0)
-            if self.depth_coef_ is not None and self.log_depth_ is not None:
-                block = block - self.log_depth_[chunk].unsqueeze(1) * self.depth_coef_
-            yield block
+            yield theta - intercept.unsqueeze(0)
 
     def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
         r"""Transforms and projects dataset X onto the principal components.
@@ -852,19 +771,9 @@ class GLMPCA:
             X_transform.shape[0],
             X_transform.shape[1] * X_transform.dtype.itemsize,
         )
-        coef = None if self.depth_coef_ is None else self.depth_coef_.to(device)
         for chunk in rows.slices(chunk_rows):
-            data, theta = rows.block(chunk, device)
-            projected_parameters = theta - intercept.unsqueeze(0)
-            if coef is not None:
-                assert self.log_depth_mean_ is not None
-                assert self._depth_floor is not None
-                sums = data.sum(dim=1, dtype=torch.float64)
-                z = _log_depth(sums, self._depth_floor) - self.log_depth_mean_
-                projected_parameters = (
-                    projected_parameters - z.float().unsqueeze(1) * coef
-                )
-            scores.append(projected_parameters.matmul(loadings))
+            _, theta = rows.block(chunk, device)
+            scores.append((theta - intercept.unsqueeze(0)).matmul(loadings))
 
         return torch.cat(scores)
 
@@ -875,8 +784,7 @@ class GLMPCA:
         device: torch.device,
         log_base_measure: torch.Tensor,
         cost: Callable[..., torch.Tensor],
-        log_depth: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Computes the loadings solution of the GLM-PCA optimisation problem.
 
         Parameters
@@ -892,14 +800,11 @@ class GLMPCA:
             `log h(x)` of every cell, summed over its features.
         cost : Callable
             `_optim_cost`, or its compiled form when compile is on.
-        log_depth : torch.Tensor or None
-            `z` of every cell with depth_covariate, else None.
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
-            The loadings, the intercept of every feature, and the depth coefficient of
-            every feature when depth_covariate is on, else None.
+        tuple[torch.Tensor, torch.Tensor]
+            The loadings and the intercept of every feature.
 
         """
         if self.learning_rate_ < LEARNING_RATE_LIMIT:
@@ -910,10 +815,9 @@ class GLMPCA:
         self.loadings_learning_scores_.append([])
         self.loadings_learning_rates_.append([])
 
-        z = None if log_depth is None else log_depth.to(device)
-        _optimizer, _loadings, _intercept, _coef, _lr_scheduler = (
+        _optimizer, _loadings, _intercept, _lr_scheduler = (
             self._init_saturated_loading_optim(
-                rows=rows, device=device, batch_size=batch_size, log_depth=z
+                rows=rows, device=device, batch_size=batch_size
             )
         )
         n = rows.shape[0]
@@ -930,19 +834,11 @@ class GLMPCA:
                 total = torch.zeros((), device=device, dtype=torch.float64)
                 for part in parts():
                     data, parameters = rows.block(part, device)
-                    if z is None:
-                        part_depth = None
-                    elif isinstance(part, torch.Tensor):
-                        part_depth = z[part.to(device)]
-                    else:
-                        part_depth = z[part]
                     part_cost = cost(
                         loadings=_loadings,
                         intercept=_intercept,
                         batch_data=data,
                         batch_parameters=parameters,
-                        depth_coef=_coef,
-                        batch_log_depth=part_depth,
                     )
                     part_cost.backward()
                     total += part_cost.detach()
@@ -1037,7 +933,6 @@ class GLMPCA:
                         _optimizer,
                         _loadings,
                         _intercept,
-                        _coef,
                         _lr_scheduler,
                     )
                     if device.type == "cuda":
@@ -1049,7 +944,6 @@ class GLMPCA:
                         device=device,
                         log_base_measure=log_base_measure,
                         cost=cost,
-                        log_depth=log_depth,
                     )
 
                 if (
@@ -1065,19 +959,17 @@ class GLMPCA:
                     warnings.warn(msg, UserWarning, stacklevel=2)
                     break
 
-        return (_loadings, _intercept, _coef)
+        return (_loadings, _intercept)
 
     def _init_saturated_loading_optim(
         self,
         rows: _Rows,
         device: torch.device,
         batch_size: int,
-        log_depth: torch.Tensor | None = None,
     ) -> tuple[
         torch.optim.Optimizer,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor | None,
         torch.optim.lr_scheduler.ReduceLROnPlateau,
     ]:
         r"""Initializes the optimisation problem.
@@ -1093,8 +985,6 @@ class GLMPCA:
             The spectral start and the intercept take
             min(max(SPECTRAL_ROWS, batch_size), n) random cells, no more than
             SPECTRAL_BYTES hold densely, but at least n_pc.
-        log_depth : torch.Tensor or None
-            `z` of every cell with depth_covariate, else None.
 
         Returns
         -------
@@ -1126,17 +1016,8 @@ class GLMPCA:
             center = torch.median(subset, dim=0).values
         else:
             center = torch.mean(subset, dim=0)
-        coef = None
-        residual = subset - center
-        if log_depth is not None:
-            sample_z = log_depth[
-                torch.from_numpy(random_idx).to(log_depth.device)
-            ].cpu()
-            weight = float(sample_z @ sample_z)
-            coef = (sample_z @ residual) / weight if weight > 0 else torch.zeros(p)
-            residual = residual - sample_z.unsqueeze(1) * coef
         if self.init == "spectral":
-            centered = residual - residual.mean(dim=0)
+            centered = subset - subset.mean(dim=0)
             _, _, v = torch.svd_lowrank(
                 centered,
                 q=min(2 * components, *centered.shape),
@@ -1157,13 +1038,6 @@ class GLMPCA:
             {"params": intercept, "lr": self.learning_rate_ * INTERCEPT_RATE_SCALE},
         ]
         floors = [LEARNING_RATE_LIMIT, LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE]
-        if coef is not None:
-            coef = ManifoldParameter(coef.to(device))
-            groups.append({
-                "params": coef,
-                "lr": self.learning_rate_ * INTERCEPT_RATE_SCALE,
-            })
-            floors.append(LEARNING_RATE_LIMIT * INTERCEPT_RATE_SCALE)
 
         tqdm.write(f"GLMPCA FAMILY: {self.family}")
         tqdm.write(f"INITIAL LEARNING RATE: {self.learning_rate_}")
@@ -1181,7 +1055,7 @@ class GLMPCA:
             eps=0.0,
         )
 
-        return optimizer, loadings, intercept, coef, lr_scheduler
+        return optimizer, loadings, intercept, lr_scheduler
 
     def _full_cost(
         self,
@@ -1189,8 +1063,6 @@ class GLMPCA:
         intercept: torch.Tensor,
         rows: _Rows,
         device: torch.device,
-        depth_coef: torch.Tensor | None = None,
-        log_depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Sums the cost over chunks of chunk_size rows, to never expand X.
 
@@ -1201,14 +1073,7 @@ class GLMPCA:
         total = torch.zeros((), device=device, dtype=torch.float64)
         for chunk in rows.slices(self._chunk):
             data, parameters = rows.block(chunk, device)
-            total = total + self._optim_cost(
-                loadings,
-                intercept,
-                data,
-                parameters,
-                depth_coef,
-                None if log_depth is None else log_depth[chunk],
-            )
+            total = total + self._optim_cost(loadings, intercept, data, parameters)
         return total
 
     def _optim_cost(
@@ -1217,12 +1082,8 @@ class GLMPCA:
         intercept: torch.Tensor,
         batch_data: torch.Tensor,
         batch_parameters: torch.Tensor,
-        depth_coef: torch.Tensor | None = None,
-        batch_log_depth: torch.Tensor | None = None,
     ) -> torch.Tensor:
         intercept_term = intercept.unsqueeze(0)
-        if depth_coef is not None and batch_log_depth is not None:
-            intercept_term = intercept_term + batch_log_depth.unsqueeze(1) * depth_coef
 
         projected_parameters = batch_parameters - intercept_term
         projected_parameters = projected_parameters.matmul(loadings).matmul(loadings.T)

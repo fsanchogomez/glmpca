@@ -31,9 +31,6 @@ DESCRIPTION = (
     '* ``obsm["X_glmPCA"]``: the coordinates of the cells.\n'
     '* ``varm["glmPCA_loadings"]``: the loadings of the features.\n'
     '* ``var["glmPCA_intercept"]``: the intercept of the features.\n'
-    '* ``obs["glmPCA_log_depth"]`` and ``var["glmPCA_depth_coef"]``: the depth '
-    "covariate of the cells and its coefficient for the features, present with "
-    "``--depthCovariate``.\n"
     '* ``var["MLE_dispersion"]``: the dispersion of the features, fitted by maximum '
     "likelihood, present with ``-gf negative_binomial``.\n"
     '* ``uns["glmPCA"]``: the parameters of the fit.\n\n'
@@ -575,25 +572,6 @@ def main(
             ),
         ),
     ] = 1,
-    depth_covariate: Annotated[
-        bool,
-        typer.Option(
-            "--depthCovariate",
-            rich_help_panel=_GLMPCA,
-            help=(
-                "Model the depth of a cell as a covariate, off by default: the "
-                "centered log of its total counts, with a coefficient for every "
-                "feature that the fit learns, so a component does not have to carry "
-                "the depth. The covariate is stored in "
-                '``obs["glmPCA_log_depth"]`` and the coefficient in '
-                '``var["glmPCA_depth_coef"]``. The coefficient is near 1 for '
-                "``poisson`` and ``negative_binomial``, a size factor; for "
-                "``bernoulli`` and ``binomial`` it takes the slope of every feature. "
-                "With ``--binarize`` the total is the number of features that are not "
-                "zero."
-            ),
-        ),
-    ] = False,
     drop_depth: Annotated[
         bool,
         typer.Option(
@@ -603,8 +581,8 @@ def main(
                 "Drop every component whose scores follow the depth of the cells, "
                 "the total of their counts in the input (|Spearman rho| above 0.75), "
                 "off by default, so fewer than ``--nPrinComps`` components can be "
-                "left. It can be used with ``--depthCovariate``. The correlations and "
-                'the number dropped are reported and stored in ``uns["glmPCA"]``.'
+                "left. The correlations and the number dropped are reported and "
+                'stored in ``uns["glmPCA"]``.'
             ),
         ),
     ] = False,
@@ -835,7 +813,6 @@ def main(
             keep_sparse=keep_sparse,
             torch_compile=torch_compile,
             backed=backed,
-            depth_covariate=depth_covariate,
             drop_depth=drop_depth,
             n_trials=n_trials,
             log_normalize=log_normalize,
@@ -882,7 +859,6 @@ def main(
         n_jobs=number_of_processors,
         device=device,
         keep_sparse=True if keep_sparse else None,
-        depth_covariate=depth_covariate,
         drop_depth=drop_depth,
         compile=torch_compile,
         binarize=binarize,
@@ -897,9 +873,6 @@ def main(
     adata.obsm["X_glmPCA"] = scores
     adata.varm["glmPCA_loadings"] = loadings
     adata.var["glmPCA_intercept"] = intercept
-    if model.log_depth_ is not None and model.depth_coef_ is not None:
-        adata.obs["glmPCA_log_depth"] = model.log_depth_.numpy()
-        adata.var["glmPCA_depth_coef"] = model.depth_coef_.numpy()
     if dispersion is not None:
         adata.var["MLE_dispersion"] = dispersion
     binomial_report = None
@@ -922,15 +895,12 @@ def main(
             "keep_sparse": model.keep_sparse_,
             "compile": torch_compile,
             "backed": backed,
-            "depth_covariate": depth_covariate,
             "drop_depth": drop_depth,
             "log_normalize": log_normalize,
             "binarize": binarize,
             "random_state": model.random_state,
         },
     }
-    if model.log_depth_mean_ is not None:
-        adata.uns["glmPCA"]["log_depth_mean"] = model.log_depth_mean_
     if model.depth_correlations_ is not None:
         adata.uns["glmPCA"]["depth_correlations"] = model.depth_correlations_
         adata.uns["glmPCA"]["n_dropped_components"] = model.n_dropped_components_

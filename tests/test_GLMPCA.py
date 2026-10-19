@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import warnings
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -24,7 +23,6 @@ from glmpca.GLMPCA import (
     DEFAULT_BATCH_SIZE,
     DEVICE_MEMORY_SHARE,
     GLMPCA,
-    INTERCEPT_RATE_SCALE,
     LEARNING_RATE_LIMIT,
     PLATEAU_PATIENCE,
     WORKING_COPIES,
@@ -208,11 +206,10 @@ def test_each_init_run_starts_from_the_initial_learning_rate(
         device: torch.device,
         log_base_measure: torch.Tensor,
         cost: Callable[..., torch.Tensor],
-        log_depth: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         start_rates.append(model.learning_rate_)
         model.learning_rate_ *= model.gamma
-        return torch.eye(N_FEATURES, N_PC), torch.zeros(N_FEATURES), None
+        return torch.eye(N_FEATURES, N_PC), torch.zeros(N_FEATURES)
 
     monkeypatch.setattr(model, "_saturated_loading_iter", run_that_restarts_once)
     model.fit(sample(GLMFamily.poisson))
@@ -671,7 +668,6 @@ def test_a_compiled_fit_equals_an_eager_fit() -> None:
             N_PC,
             family="poisson",
             optimizer="cg",
-            depth_covariate=True,
             max_iter=3,
             compile=compile_cost,
         )
@@ -1182,180 +1178,6 @@ def test_drop_depth_reads_the_counts_as_given_even_when_binarized(
 
     np.testing.assert_allclose(depths[0], X.sum(dim=1).numpy())
     np.testing.assert_array_equal(depths[1], given)
-
-
-def test_the_depth_covariate_is_the_centered_log_total_of_every_cell() -> None:
-    X = depth_gradient()
-    model = GLMPCA(
-        N_PC, family="poisson", max_iter=5, batch_size=16, depth_covariate=True
-    )
-
-    model.fit(X)
-
-    logs = torch.log(X.sum(dim=1, dtype=torch.float64))
-    assert model.log_depth_mean_ == pytest.approx(float(logs.mean()))
-    assert model.log_depth_ is not None
-    torch.testing.assert_close(
-        model.log_depth_, (logs - logs.mean()).float(), rtol=1e-6, atol=1e-6
-    )
-    assert model.depth_coef_ is not None
-    assert model.depth_coef_.shape == (N_FEATURES,)
-    assert torch.all(torch.isfinite(model.depth_coef_))
-
-
-def test_no_depth_covariate_by_default() -> None:
-    model = GLMPCA(N_PC, family="poisson", max_iter=5, batch_size=16)
-
-    model.fit(depth_gradient())
-
-    assert model.log_depth_ is None
-    assert model.depth_coef_ is None
-    assert model.log_depth_mean_ is None
-
-
-def test_the_depth_covariate_keeps_the_components_off_the_depth() -> None:
-    X = depth_gradient()
-    totals = X.sum(dim=1).numpy()
-    worst = {}
-    for depth_covariate in (True, False):
-        torch.manual_seed(0)
-        np.random.seed(0)
-        model = GLMPCA(
-            N_PC,
-            family="poisson",
-            max_iter=40,
-            batch_size=16,
-            depth_covariate=depth_covariate,
-        )
-        model.fit(X)
-        embedding = model.transform(X).detach().numpy()
-        worst[depth_covariate] = max(
-            abs(float(scipy.stats.spearmanr(embedding[:, pc], totals).statistic))
-            for pc in range(N_PC)
-        )
-
-    assert worst[True] < worst[False], worst
-
-
-def test_the_poisson_depth_coefficient_is_a_size_factor() -> None:
-    model = GLMPCA(
-        N_PC, family="poisson", max_iter=40, batch_size=16, depth_covariate=True
-    )
-
-    model.fit(depth_gradient())
-
-    assert model.depth_coef_ is not None
-    assert float(model.depth_coef_.median()) == pytest.approx(1.0, abs=0.2)
-
-
-def test_the_depth_coefficient_has_the_learning_rate_of_the_intercept() -> None:
-    model = GLMPCA(
-        N_PC, family="poisson", max_iter=2, batch_size=16, depth_covariate=True
-    )
-    saturated = torch.log(depth_gradient().clip(min=1.0))
-    log_depth = torch.randn(N_CELLS)
-
-    optimizer, _, _, coef, _ = model._init_saturated_loading_optim(
-        _Rows(saturated, model.exponential_family, saturated),
-        torch.device("cpu"),
-        batch_size=16,
-        log_depth=log_depth,
-    )
-
-    assert coef is not None
-    assert coef.shape == (N_FEATURES,)
-    rates = [group["lr"] for group in optimizer.param_groups]
-    assert rates == [
-        model.learning_rate_,
-        model.learning_rate_ * INTERCEPT_RATE_SCALE,
-        model.learning_rate_ * INTERCEPT_RATE_SCALE,
-    ]
-
-
-def test_transform_reproduces_the_fitted_scores_with_the_depth_covariate() -> None:
-    X = depth_gradient()
-    model = GLMPCA(
-        N_PC, family="poisson", max_iter=20, batch_size=16, depth_covariate=True
-    )
-    model.fit(X)
-
-    embedding = model.transform(X).detach()
-
-    coef, intercept = model.depth_coef_, model.saturated_intercept_
-    assert coef is not None
-    assert intercept is not None
-    assert model.log_depth_ is not None
-    assert model.saturated_loadings_ is not None
-    fitted = (
-        model.exponential_family.invert_g(X)
-        - intercept.unsqueeze(0)
-        - model.log_depth_.unsqueeze(1) * coef
-    ) @ model.saturated_loadings_
-    torch.testing.assert_close(embedding, fitted, rtol=1e-4, atol=1e-4)
-
-
-def test_a_cell_without_counts_takes_the_smallest_total_of_the_fit() -> None:
-    X = depth_gradient()
-    X[0] = 0
-    model = GLMPCA(
-        N_PC, family="poisson", max_iter=2, batch_size=16, depth_covariate=True
-    )
-
-    model.fit(X)
-
-    assert model.log_depth_ is not None
-    assert model.log_depth_mean_ is not None
-    smallest = float(X[1:].sum(dim=1).min())
-    assert float(model.log_depth_[0]) == pytest.approx(
-        math.log(smallest) - model.log_depth_mean_, abs=1e-5
-    )
-    assert torch.all(torch.isfinite(model.transform(X)))
-
-
-def test_the_depth_covariate_rejects_a_row_with_a_negative_sum() -> None:
-    X = depth_gradient()
-    X[3] = -1.0
-    model = GLMPCA(
-        N_PC, family="gaussian", max_iter=2, batch_size=16, depth_covariate=True
-    )
-
-    with pytest.raises(ValueError, match="row 3 sums to"):
-        model.fit(X)
-
-
-def test_a_binarized_depth_covariate_counts_the_features_that_are_not_zero() -> None:
-    X = depth_gradient()
-    model = GLMPCA(
-        N_PC,
-        family="bernoulli",
-        max_iter=2,
-        batch_size=16,
-        depth_covariate=True,
-        binarize=True,
-    )
-
-    model.fit(X)
-
-    logs = torch.log((X != 0).sum(dim=1, dtype=torch.float64))
-    assert model.log_depth_mean_ == pytest.approx(float(logs.mean()))
-
-
-def test_a_backed_depth_covariate_equals_one_in_memory(tmp_path: Path) -> None:
-    X = depth_gradient()
-    path = tmp_path / "depth.h5ad"
-    ad.AnnData(sparse.csr_matrix(X.numpy())).write_h5ad(path)
-    options = {"max_iter": 3, "batch_size": 8, "depth_covariate": True}
-    backed = GLMPCA(N_PC, family="poisson", **options)
-    backed.fit(ad.read_h5ad(path, backed="r"))
-    in_memory = GLMPCA(N_PC, family="poisson", keep_sparse=True, **options)
-    in_memory.fit(X)
-
-    assert backed.log_depth_mean_ == pytest.approx(in_memory.log_depth_mean_)
-    assert backed.depth_coef_ is not None
-    assert in_memory.depth_coef_ is not None
-    torch.testing.assert_close(
-        backed.depth_coef_, in_memory.depth_coef_, atol=1e-5, rtol=1e-5
-    )
 
 
 @pytest.mark.parametrize(
