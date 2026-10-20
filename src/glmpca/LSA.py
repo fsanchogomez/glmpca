@@ -1,10 +1,11 @@
 """Latent semantic analysis: the truncated SVD of a TF-IDF matrix, solved directly.
 
-The LSI families of GLMPCA reach the same subspace by gradient steps. `LSA` computes it
-with an SVD solver instead: ARPACK (`scipy.sparse.linalg.svds`) on a matrix in memory,
-or a randomized SVD in torch that reads the matrix by blocks of rows, on the CPU or the
-GPU, from memory or from a backed AnnData. The TF-IDF of Signac or of gensim (`tfidf`)
-is computed on the stored entries of every CSR block, so nothing is made dense.
+`LSA` computes it with an SVD solver: ARPACK (`scipy.sparse.linalg.svds`) on a matrix in
+memory, or a randomized SVD in torch that reads the matrix by blocks of rows, on the CPU
+or the GPU, from memory or from a backed AnnData.
+
+The LSA implementation follows gensim's `TfidfModel` with `smartirs='lfu'` followed by
+`LsiModel`.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING, Literal
 import anndata as ad
 import numpy as np
 import torch
-from scipy.sparse import csr_matrix, issparse, spmatrix
+from scipy.sparse import csr_matrix, spmatrix
 from scipy.sparse.linalg import svds
 from tqdm.auto import tqdm
 
@@ -33,71 +34,46 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 DEFAULT_CHUNK_ROWS = 16384
-FLAVORS = ("gensim", "signac")
 SOLVERS = ("auto", "arpack", "randomized")
-# Scale factor of Signac's `RunTFIDF(method = 1)`, applied before `log1p`.
-TFIDF_SCALE = 1e4
 # Slope of gensim's pivoted unique normalization, `smartirs="lfu"`.
 GENSIM_SLOPE = 0.25
 
 
-def idf(
-    flavor: str, totals: np.ndarray, holders: np.ndarray, n_cells: int
-) -> tuple[np.ndarray, float | None]:
-    """The idf of every feature, and for "gensim" the pivot of the normalization.
+def idf(holders: np.ndarray, n_cells: int) -> tuple[np.ndarray, float]:
+    """The idf of every feature, and the pivot of the normalization.
 
-    `totals` are the total counts of the features and `holders` the cells that hold
-    them. "signac" divides the number of cells by the total counts, as Signac's
-    `rowSums` does, with a total of at least 1. "gensim" takes `log2(cells / holders)`,
+    `holders` are the cells that hold every feature. The idf is `log2(cells / holders)`,
     zero for a feature that no cell holds, and the pivot is the mean number of features
     that a cell holds.
     """
-    if flavor == "signac":
-        return n_cells / np.clip(totals, 1.0, None), None
     feature_idf = np.where(
         holders > 0, np.log2(n_cells / np.clip(holders, 1.0, None)), 0.0
     )
     return feature_idf, float(holders.sum()) / n_cells
 
 
-def tfidf(
-    block: csr_matrix, flavor: str, feature_idf: np.ndarray, pivot: float | None
-) -> csr_matrix:
+def tfidf(block: csr_matrix, feature_idf: np.ndarray, pivot: float) -> csr_matrix:
     r"""The TF-IDF of the CSR `block`, computed on its stored entries.
 
-    "signac" is Signac's `RunTFIDF(method = 1)`:
-
-        log1p(count / depth of the cell · idf · TFIDF_SCALE)
-
-    "gensim" is gensim's `TfidfModel(normalize=True, smartirs="lfu")`, for a count
-    above zero:
+    It is gensim's `TfidfModel(normalize=True, smartirs="lfu")`, for a count above
+    zero:
 
         (1 + log2(count)) · idf / ((1 - GENSIM_SLOPE) · pivot + GENSIM_SLOPE · kept)
 
-    with `kept` the features of the cell whose weight is above zero. Both keep a zero at
-    zero, so the result has the entries of `block`.
+    with `kept` the features of the cell whose weight is above zero. A zero stays zero,
+    so the result has the entries of `block`.
     """
     counts = np.asarray(block.data, dtype=np.float64)
     rows = np.repeat(np.arange(block.shape[0]), np.diff(block.indptr))
-    if flavor == "signac":
-        depth = np.bincount(rows, weights=counts, minlength=block.shape[0])
-        values = np.log1p(
-            counts
-            / np.clip(depth, 1.0, None)[rows]
-            * feature_idf[block.indices]
-            * TFIDF_SCALE
-        )
-    else:
-        assert pivot is not None
-        held = counts > 0
-        weight = np.where(
-            held,
-            (1.0 + np.log2(np.where(held, counts, 1.0))) * feature_idf[block.indices],
-            0.0,
-        )
-        kept = np.bincount(rows[weight > 0], minlength=block.shape[0])
-        norm = (1.0 - GENSIM_SLOPE) * pivot + GENSIM_SLOPE * kept
-        values = weight / norm[rows]
+    held = counts > 0
+    weight = np.where(
+        held,
+        (1.0 + np.log2(np.where(held, counts, 1.0))) * feature_idf[block.indices],
+        0.0,
+    )
+    kept = np.bincount(rows[weight > 0], minlength=block.shape[0])
+    norm = (1.0 - GENSIM_SLOPE) * pivot + GENSIM_SLOPE * kept
+    values = weight / norm[rows]
     return csr_matrix(
         (values.astype(np.float32), block.indices, block.indptr), shape=block.shape
     )
@@ -117,21 +93,37 @@ def _torch_csr(block: csr_matrix, device: torch.device) -> torch.Tensor:
         ).to(device)
 
 
+class _TfidfRows(SparseRows):
+    """The TF-IDF of `source`, made block by block as it is read."""
+
+    def __init__(
+        self, source: SparseRows, feature_idf: np.ndarray, pivot: float
+    ) -> None:
+        self.source = source
+        self.feature_idf = feature_idf
+        self.pivot = pivot
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.source.shape
+
+    def _block(self, rows: slice | torch.Tensor | np.ndarray) -> csr_matrix:
+        block = csr_matrix(self.source._block(rows), dtype=np.float32)
+        return tfidf(block, self.feature_idf, self.pivot)
+
+
 class LSA:
     r"""Latent semantic analysis of a cell-by-feature count matrix.
 
-    The counts are turned into the TF-IDF of Signac's `RunTFIDF(method = 1)` or of
-    gensim's `TfidfModel(smartirs="lfu")` (`tfidf`), and the components are the top
-    `n_pc` right singular vectors of the TF-IDF matrix `W`, the optimum of
-    `||W - W V V.T||` over orthonormal `V`. The scores of a cell are `w V`,
-    standardized for "signac" as `RunSVD(scale.embeddings = TRUE)` does.
+    The counts are turned into the TF-IDF of gensim's `TfidfModel(smartirs="lfu")`
+    (`tfidf`), and the components are the top `n_pc` right singular vectors of the
+    TF-IDF matrix `W`, the optimum of `||W - W V V.T||` over orthonormal `V`. The scores
+    of a cell are `w V`.
 
     Parameters
     ----------
     n_pc : int
         Number of components. Defaults to 20.
-    flavor : str
-        "gensim" or "signac", the TF-IDF. Defaults to "signac".
     solver : str
         "arpack" for `scipy.sparse.linalg.svds` on the TF-IDF matrix in memory, on
         the CPU, which gives the exact optimum. "randomized" for the randomized SVD of
@@ -169,18 +161,15 @@ class LSA:
     idf_ : np.ndarray
         The idf of every feature, which transform uses for new cells.
     pivot_ : float or None
-        For "gensim", the pivot of the normalization.
+        The pivot of the normalization.
     depth_correlations_, n_dropped_components_
         With drop_depth, the Spearman rho of every component with the depth, and the
         number of components dropped.
-    score_mean_, score_sd_
-        For "signac", the mean and the standard deviation of every score.
     """
 
     def __init__(
         self,
         n_pc: int = 20,
-        flavor: Literal["gensim", "signac"] = "gensim",
         solver: Literal["auto", "arpack", "randomized"] = "auto",
         n_iter: int = 4,
         oversample: int = 10,
@@ -190,9 +179,6 @@ class LSA:
         device: str | torch.device | None = None,
         random_state: int | None = DEFAULT_RANDOM_STATE,
     ) -> None:
-        if flavor not in FLAVORS:
-            msg = f"flavor={flavor!r} is not valid. Use 'gensim' or 'signac'."
-            raise ValueError(msg)
         if solver not in SOLVERS:
             choices = ", ".join(repr(name) for name in SOLVERS)
             msg = f"solver={solver!r} is not valid. Use one of {choices}."
@@ -204,7 +190,6 @@ class LSA:
             )
             raise ValueError(msg)
         self.n_pc = n_pc
-        self.flavor = flavor
         self.solver = solver
         self.n_iter = n_iter
         self.oversample = oversample
@@ -221,15 +206,15 @@ class LSA:
         self.pivot_: float | None = None
         self.depth_correlations_: np.ndarray | None = None
         self.n_dropped_components_: int | None = None
-        self.score_mean_: torch.Tensor | None = None
-        self.score_sd_: torch.Tensor | None = None
 
     def fit(self, X: torch.Tensor | np.ndarray | ad.AnnData | spmatrix) -> LSA:
         """Fits the components to `X`, cells in rows and features in columns."""
         self.fit_transform(X)
         return self
 
-    def fit_transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
+    def fit_transform(
+        self, X: torch.Tensor | np.ndarray | ad.AnnData | spmatrix
+    ) -> torch.Tensor:
         """Fits the components to `X` and returns the scores of its cells, on the CPU.
 
         The scores come from the solver, so they cost no pass after the fit.
@@ -258,11 +243,12 @@ class LSA:
         tqdm.write(f"SOLVER: {solver}")
 
         self._fit_idf(source)
+        weighted = self._weighted(source)
         if solver == "arpack":
-            components, singular, scores = self._arpack(source)
+            components, singular, scores = self._arpack(weighted)
         else:
             _announce_device(device)
-            components, singular, scores = self._randomized(source, device)
+            components, singular, scores = self._randomized(weighted, device)
 
         signs = largest_entry_signs(components)
         components, scores = components * signs, scores * signs
@@ -279,113 +265,82 @@ class LSA:
             )
         self.components_ = components.contiguous()
         self.singular_values_ = singular
-
-        self.score_mean_ = self.score_sd_ = None
-        if self.flavor == "signac":
-            self.score_mean_ = scores.mean(dim=0)
-            self.score_sd_ = scores.std(dim=0).clip(min=1e-12)
-            scores = (scores - self.score_mean_) / self.score_sd_
         return scores
 
-    def transform(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> torch.Tensor:
+    def transform(
+        self, X: torch.Tensor | np.ndarray | ad.AnnData | spmatrix
+    ) -> torch.Tensor:
         """The scores of the cells of `X`, with the idf of the fit."""
         if self.components_ is None:
             msg = "LSA is not fitted. Call fit() before transform()."
             raise RuntimeError(msg)
+        assert self.idf_ is not None
+        assert self.pivot_ is not None
         device = _resolve_device(self.device)
-        source = self._source(X)
+        weighted = _TfidfRows(self._source(X), self.idf_, self.pivot_)
         components = self.components_.to(device)
         scores = [
             (_torch_csr(block, device) @ components).cpu()
-            for _, block in self._tfidf_blocks(source, None)
+            for _, block in self._raw_blocks(weighted)
         ]
-        scores_all = torch.cat(scores)
-        if self.score_mean_ is not None and self.score_sd_ is not None:
-            scores_all = (scores_all - self.score_mean_) / self.score_sd_
-        return scores_all
+        return torch.cat(scores)
 
-    def _source(self, X: torch.Tensor | np.ndarray | ad.AnnData) -> SparseRows:
+    def _source(
+        self, X: torch.Tensor | np.ndarray | ad.AnnData | spmatrix
+    ) -> SparseRows:
         """`X` as CSR rows: read from the file when backed, else held in memory."""
         if isinstance(X, ad.AnnData) and X.isbacked:
             return BackedRows(X.X, binarize=self.binarize)
-        rows = (
-            SparseRows(csr_matrix(X, dtype=np.float32))
-            if issparse(X)
-            else _to_sparse(X)
-        )
+        rows = _to_sparse(X)
         return SparseRows(binary(rows.matrix)) if self.binarize else rows
 
-    def _chunk(self) -> int:
-        return self.chunk_size or DEFAULT_CHUNK_ROWS
-
     def _raw_blocks(self, source: SparseRows) -> Iterator[tuple[slice, csr_matrix]]:
-        """The rows of `source` by blocks, as they are stored, as float32 CSR."""
-        n, chunk = source.shape[0], self._chunk()
+        """The rows of `source` by blocks of `chunk_size`, as float32 CSR."""
+        n, chunk = source.shape[0], self.chunk_size or DEFAULT_CHUNK_ROWS
         for start in range(0, n, chunk):
             rows = slice(start, min(start + chunk, n))
-            block = source._block(rows)
-            yield rows, csr_matrix(block if issparse(block) else np.asarray(block))
-
-    def _tfidf(self, block: csr_matrix) -> csr_matrix:
-        """`tfidf` of `block` with the idf of the fit."""
-        assert self.idf_ is not None
-        return tfidf(block, self.flavor, self.idf_, self.pivot_)
-
-    def _tfidf_blocks(
-        self, source: SparseRows, tfidf_matrix: csr_matrix | None
-    ) -> Iterator[tuple[slice, csr_matrix]]:
-        """The TF-IDF by blocks of rows: slices of `tfidf_matrix`, or made as read."""
-        if tfidf_matrix is not None:
-            n, chunk = tfidf_matrix.shape[0], self._chunk()
-            for start in range(0, n, chunk):
-                rows = slice(start, min(start + chunk, n))
-                yield rows, tfidf_matrix[rows]
-            return
-        for rows, block in self._raw_blocks(source):
-            yield rows, self._tfidf(block)
+            yield rows, csr_matrix(source._block(rows), dtype=np.float32)
 
     def _fit_idf(self, source: SparseRows) -> None:
         """Fits the idf in one pass over the counts."""
         n, p = source.shape
-        totals = np.zeros(p)
         holders = np.zeros(p)
         for _, block in self._raw_blocks(source):
             if bool((block.data < 0).any()):
                 msg = "LSA takes counts, but the input has negative values."
                 raise ValueError(msg)
-            totals += np.asarray(block.sum(axis=0), dtype=np.float64).ravel()
             holders += np.asarray((block > 0).sum(axis=0), dtype=np.float64).ravel()
-        self.idf_, self.pivot_ = idf(self.flavor, totals, holders, n)
+        self.idf_, self.pivot_ = idf(holders, n)
 
-    def _tfidf_in_memory(self, source: SparseRows) -> csr_matrix | None:
-        """The whole TF-IDF matrix for a matrix in memory, else None."""
+    def _weighted(self, source: SparseRows) -> SparseRows:
+        """The TF-IDF of `source`: whole for a matrix in memory, else made as read."""
+        assert self.idf_ is not None
+        assert self.pivot_ is not None
         if isinstance(source, BackedRows):
-            return None
-        return self._tfidf(source.matrix)
+            return _TfidfRows(source, self.idf_, self.pivot_)
+        return SparseRows(tfidf(source.matrix, self.idf_, self.pivot_))
 
     def _arpack(
-        self, source: SparseRows
+        self, weighted: SparseRows
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        tfidf_matrix = self._tfidf_in_memory(source)
-        assert tfidf_matrix is not None
-        u, s, vt = svds(tfidf_matrix, k=self.n_pc, rng=self.random_state)
+        u, s, vt = svds(weighted.matrix, k=self.n_pc, rng=self.random_state)
         order = np.argsort(s)[::-1]
-        components = torch.from_numpy(np.ascontiguousarray(vt[order].T))
-        singular = torch.from_numpy(np.ascontiguousarray(s[order]))
-        scores = torch.from_numpy(np.ascontiguousarray(u[:, order] * s[order]))
-        return components.float(), singular.float(), scores.float()
+        return (
+            torch.tensor(vt[order].T, dtype=torch.float32),
+            torch.tensor(s[order], dtype=torch.float32),
+            torch.tensor(u[:, order] * s[order], dtype=torch.float32),
+        )
 
     def _randomized(
-        self, source: SparseRows, device: torch.device
+        self, weighted: SparseRows, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The randomized SVD of Halko et al., with a QR step after every product.
 
         The scores are `W V`, one pass more than `Q U S` costs, so that transform gives
         the cells of the fit the scores that the fit gives them.
         """
-        n, p = source.shape
+        n, p = weighted.shape
         width = min(self.n_pc + self.oversample, n, p)
-        tfidf_matrix = self._tfidf_in_memory(source)
         generator = torch.Generator()
         if self.random_state is not None:
             generator.manual_seed(self.random_state)
@@ -397,14 +352,14 @@ class LSA:
 
             def times(right: torch.Tensor) -> torch.Tensor:
                 product = torch.empty(n, right.shape[1], device=device)
-                for rows, block in self._tfidf_blocks(source, tfidf_matrix):
+                for rows, block in self._raw_blocks(weighted):
                     product[rows] = _torch_csr(block, device) @ right
                 passes.update(1)
                 return product
 
             def transposed_times(left: torch.Tensor) -> torch.Tensor:
                 product = torch.zeros(p, left.shape[1], device=device)
-                for rows, block in self._tfidf_blocks(source, tfidf_matrix):
+                for rows, block in self._raw_blocks(weighted):
                     product += _torch_csr(block.T.tocsr(), device) @ left[rows]
                 passes.update(1)
                 return product

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import scipy.stats
 import torch
-from glmpca.LSA import LSA, TFIDF_SCALE, idf, tfidf
+from glmpca.LSA import LSA, idf, tfidf
 from scipy import sparse
 
 if TYPE_CHECKING:
@@ -20,7 +20,6 @@ N_PC = 4
 DEFINED = 3
 """The components that the three groups of `grouped_counts` define; the next one is
 noise, and two solvers need not agree on it."""
-FLAVORS = ["signac", "gensim"]
 SOLVERS = ["arpack", "randomized"]
 
 
@@ -39,7 +38,8 @@ def grouped_counts(depth_spread: float = 0.3) -> sparse.csr_matrix:
 
 def tfidf_of_fit(model: LSA, X: sparse.csr_matrix) -> np.ndarray:
     assert model.idf_ is not None
-    return tfidf(X, model.flavor, model.idf_, model.pivot_).toarray().astype(np.float64)
+    assert model.pivot_ is not None
+    return tfidf(X, model.idf_, model.pivot_).toarray().astype(np.float64)
 
 
 def exact_singular_values(model: LSA, X: sparse.csr_matrix) -> np.ndarray:
@@ -79,63 +79,42 @@ GENSIM_WEIGHTS = np.array([
 """gensim 4.4.0, `TfidfModel(corpus, normalize=True, smartirs="lfu")`, on LSI_COUNTS."""
 
 
-def tfidf_of_counts(flavor: str, counts: np.ndarray) -> np.ndarray:
-    feature_idf, pivot = idf(
-        flavor, counts.sum(axis=0), (counts > 0).sum(axis=0), counts.shape[0]
-    )
-    return tfidf(sparse.csr_matrix(counts), flavor, feature_idf, pivot).toarray()
+def tfidf_of_counts(counts: np.ndarray) -> np.ndarray:
+    feature_idf, pivot = idf((counts > 0).sum(axis=0), counts.shape[0])
+    return tfidf(sparse.csr_matrix(counts), feature_idf, pivot).toarray()
 
 
 def test_the_gensim_tfidf_is_the_tfidf_of_gensim() -> None:
-    np.testing.assert_allclose(
-        tfidf_of_counts("gensim", LSI_COUNTS), GENSIM_WEIGHTS, atol=1e-6
-    )
+    np.testing.assert_allclose(tfidf_of_counts(LSI_COUNTS), GENSIM_WEIGHTS, atol=1e-6)
 
 
-def test_the_signac_tfidf_is_the_tfidf_of_signac_runtfidf() -> None:
-    depth = LSI_COUNTS.sum(axis=1, keepdims=True)
-    feature_idf = LSI_COUNTS.shape[0] / np.maximum(LSI_COUNTS.sum(axis=0), 1.0)
-    expected = np.log1p(LSI_COUNTS / depth * feature_idf * TFIDF_SCALE)
-
-    np.testing.assert_allclose(
-        tfidf_of_counts("signac", LSI_COUNTS), expected, rtol=1e-6
-    )
-
-
-@pytest.mark.parametrize("flavor", FLAVORS)
-def test_the_tfidf_keeps_the_entries_of_the_counts(flavor: str) -> None:
+def test_the_tfidf_keeps_the_entries_of_the_counts() -> None:
     counts = sparse.csr_matrix(LSI_COUNTS)
-    feature_idf, pivot = idf(
-        flavor, LSI_COUNTS.sum(axis=0), (LSI_COUNTS > 0).sum(axis=0), 6
-    )
+    feature_idf, pivot = idf((LSI_COUNTS > 0).sum(axis=0), 6)
 
-    result = tfidf(counts, flavor, feature_idf, pivot)
+    result = tfidf(counts, feature_idf, pivot)
 
     assert sparse.isspmatrix_csr(result)
     np.testing.assert_array_equal(result.indices, counts.indices)
     np.testing.assert_array_equal(result.indptr, counts.indptr)
 
 
-@pytest.mark.parametrize("flavor", FLAVORS)
-def test_the_fit_keeps_the_idf_of_the_counts(flavor: str) -> None:
+def test_the_fit_keeps_the_idf_of_the_counts() -> None:
     X = grouped_counts()
-    model = LSA(N_PC, flavor=flavor, device="cpu")
+    model = LSA(N_PC, device="cpu")
 
     model.fit(X)
 
     dense = X.toarray()
-    feature_idf, pivot = idf(
-        flavor, dense.sum(axis=0), (dense > 0).sum(axis=0), dense.shape[0]
-    )
+    feature_idf, pivot = idf((dense > 0).sum(axis=0), dense.shape[0])
     assert model.idf_ is not None
     np.testing.assert_allclose(model.idf_, feature_idf)
-    assert model.pivot_ == (None if flavor == "signac" else pytest.approx(pivot))
+    assert model.pivot_ == pytest.approx(pivot)
 
 
-@pytest.mark.parametrize("flavor", FLAVORS)
-def test_arpack_gives_the_exact_singular_values(flavor: str) -> None:
+def test_arpack_gives_the_exact_singular_values() -> None:
     X = grouped_counts()
-    model = LSA(N_PC, flavor=flavor, solver="arpack", device="cpu")
+    model = LSA(N_PC, solver="arpack", device="cpu")
 
     model.fit(X)
 
@@ -148,21 +127,19 @@ def test_arpack_gives_the_exact_singular_values(flavor: str) -> None:
     assert captured(model, X) == pytest.approx(1.0, abs=1e-5)
 
 
-@pytest.mark.parametrize("flavor", FLAVORS)
-def test_the_randomized_solver_reaches_the_exact_subspace(flavor: str) -> None:
+def test_the_randomized_solver_reaches_the_exact_subspace() -> None:
     X = grouped_counts()
-    model = LSA(N_PC, flavor=flavor, solver="randomized", device="cpu")
+    model = LSA(N_PC, solver="randomized", device="cpu")
 
     model.fit(X)
 
     assert captured(model, X) > 0.999
 
 
-@pytest.mark.parametrize("flavor", FLAVORS)
 @pytest.mark.parametrize("solver", SOLVERS)
-def test_transform_gives_the_scores_of_the_fit(flavor: str, solver: str) -> None:
+def test_transform_gives_the_scores_of_the_fit(solver: str) -> None:
     X = grouped_counts()
-    model = LSA(N_PC, flavor=flavor, solver=solver, device="cpu")
+    model = LSA(N_PC, solver=solver, device="cpu")
 
     fitted = model.fit_transform(X)
 
@@ -170,27 +147,15 @@ def test_transform_gives_the_scores_of_the_fit(flavor: str, solver: str) -> None
 
 
 @pytest.mark.parametrize("solver", SOLVERS)
-def test_signac_scores_are_standardized_and_gensim_scores_are_w_v(
-    solver: str,
-) -> None:
+def test_the_scores_are_w_v(solver: str) -> None:
     X = grouped_counts()
-    signac = LSA(N_PC, flavor="signac", solver=solver, device="cpu")
-    gensim = LSA(N_PC, flavor="gensim", solver=solver, device="cpu")
+    model = LSA(N_PC, solver=solver, device="cpu")
 
-    signac_scores = signac.fit_transform(X)
-    gensim_scores = gensim.fit_transform(X)
+    scores = model.fit_transform(X)
 
-    torch.testing.assert_close(
-        signac_scores.mean(dim=0), torch.zeros(N_PC), atol=1e-5, rtol=0
-    )
-    torch.testing.assert_close(
-        signac_scores.std(dim=0), torch.ones(N_PC), atol=1e-5, rtol=0
-    )
-    assert gensim.components_ is not None
-    matrix = torch.from_numpy(tfidf_of_fit(gensim, X)).float()
-    torch.testing.assert_close(
-        gensim_scores, matrix @ gensim.components_, atol=1e-4, rtol=1e-4
-    )
+    assert model.components_ is not None
+    matrix = torch.from_numpy(tfidf_of_fit(model, X)).float()
+    torch.testing.assert_close(scores, matrix @ model.components_, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize("solver", SOLVERS)
@@ -274,7 +239,7 @@ def test_arpack_cannot_take_a_backed_anndata(tmp_path: Path) -> None:
 
 def test_drop_depth_drops_the_component_that_follows_the_depth() -> None:
     X = grouped_counts(depth_spread=1.5)
-    model = LSA(N_PC, flavor="gensim", drop_depth=True, device="cpu")
+    model = LSA(N_PC, drop_depth=True, device="cpu")
 
     scores = model.fit_transform(X)
 
@@ -319,7 +284,6 @@ def test_binarize_fits_the_binary_matrix() -> None:
 @pytest.mark.parametrize(
     ("options", "message"),
     [
-        ({"flavor": "tfidf"}, "flavor='tfidf' is not valid"),
         ({"solver": "lobpcg"}, "solver='lobpcg' is not valid"),
         ({"n_iter": -1}, "are not valid"),
     ],

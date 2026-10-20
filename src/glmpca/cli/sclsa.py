@@ -50,11 +50,6 @@ _PLOT = "Plot options"
 _OTHER = "Other options"
 
 
-class Flavor(str, Enum):
-    signac = "signac"
-    gensim = "gensim"
-
-
 class Solver(str, Enum):
     auto = "auto"
     arpack = "arpack"
@@ -119,22 +114,6 @@ def main(
             ),
         ),
     ] = 20,
-    flavor: Annotated[
-        Flavor,
-        typer.Option(
-            "--flavor",
-            metavar="FLAVOR",
-            rich_help_panel=_LSA,
-            help=(
-                "The weighting of the counts.\n\n"
-                "[bold yellow]signac[/bold yellow]: "
-                "``log1p(count / depth · cells / feature total · 10,000)``"
-                "and standardized scores.\n\n"
-                "[bold yellow]gensim[/bold yellow]: gensim's "
-                '``TfidfModel(smartirs="lfu")``.'
-            ),
-        ),
-    ] = Flavor.signac,
     solver: Annotated[
         Solver,
         typer.Option(
@@ -331,7 +310,6 @@ def main(
             out_file=out_file,
             out_file_umap=out_file_umap,
             n_prin_comps=n_prin_comps,
-            flavor=flavor,
             solver=solver,
             n_iter=n_iter,
             drop_depth=drop_depth,
@@ -361,7 +339,6 @@ def main(
 
     model = LSA(
         n_pc=n_prin_comps,
-        flavor=flavor.value,
         solver=solver.value,
         n_iter=n_iter,
         drop_depth=drop_depth,
@@ -380,7 +357,6 @@ def main(
     adata.uns["LSA"] = {
         "params": {
             "n_pc": n_prin_comps,
-            "flavor": flavor.value,
             "solver": solver.value,
             "solver_used": model.solver_,
             "n_iter": n_iter,

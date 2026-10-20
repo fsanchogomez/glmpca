@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import anndata as ad
 import numpy as np
 import pandas as pd
-import pytest
 from glmpca.cli.sclsa import app
 from scipy import sparse
 from typer.testing import CliRunner
@@ -47,20 +46,17 @@ def run(input_path: Path, out_path: Path, *options: str) -> Result:
     )
 
 
-@pytest.mark.parametrize("flavor", ["signac", "gensim"])
-def test_sclsa_writes_the_results_to_the_output_file(
-    tmp_path: Path, flavor: str
-) -> None:
+def test_sclsa_writes_the_results_to_the_output_file(tmp_path: Path) -> None:
     out_path = tmp_path / "out.h5ad"
 
-    result = run(write_input(tmp_path), out_path, "--flavor", flavor)
+    result = run(write_input(tmp_path), out_path)
 
     assert result.exit_code == 0, result.output
     adata = ad.read_h5ad(out_path)
     assert adata.obsm["X_lsa"].shape == (N_CELLS, N_PC)
     assert adata.varm["LSA_loadings"].shape == (N_FEATURES, N_PC)
     params = adata.uns["LSA"]["params"]
-    assert params["flavor"] == flavor
+    assert "flavor" not in params
     assert params["solver"] == "auto"
     assert params["solver_used"] == "arpack"
     assert len(adata.uns["LSA"]["singular_values"]) == N_PC
