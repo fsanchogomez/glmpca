@@ -145,7 +145,7 @@ def main(
                 "over the matrix."
             ),
         ),
-    ] = 4,
+    ] = 8,
     drop_depth: Annotated[
         bool,
         typer.Option(

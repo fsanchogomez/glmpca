@@ -131,9 +131,9 @@ class LSA:
         on `device`, from memory or from a backed AnnData. "auto" takes "arpack" for a
         matrix in memory on the CPU, else "randomized". Defaults to "auto".
     n_iter : int
-        Power iterations of the randomized solver. Defaults to 4.
-    oversample : int
-        Columns of the randomized solver beyond n_pc. Defaults to 10.
+        Power iterations of the randomized solver. Defaults to 8.
+    oversample : int or None
+        Columns of the randomized solver beyond n_pc. None takes n_pc. Defaults to None.
     drop_depth : bool
         Whether to drop every component whose scores follow the depth of the cells,
         the total of their counts as given, |Spearman rho| above
@@ -171,8 +171,8 @@ class LSA:
         self,
         n_pc: int = 20,
         solver: Literal["auto", "arpack", "randomized"] = "auto",
-        n_iter: int = 4,
-        oversample: int = 10,
+        n_iter: int = 8,
+        oversample: int | None = None,
         drop_depth: bool = False,
         binarize: bool = False,
         chunk_size: int | None = None,
@@ -183,6 +183,8 @@ class LSA:
             choices = ", ".join(repr(name) for name in SOLVERS)
             msg = f"solver={solver!r} is not valid. Use one of {choices}."
             raise ValueError(msg)
+        if oversample is None:
+            oversample = n_pc
         if n_pc < 1 or n_iter < 0 or oversample < 0:
             msg = (
                 f"n_pc={n_pc}, n_iter={n_iter} and oversample={oversample} are not "
