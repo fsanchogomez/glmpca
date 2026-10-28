@@ -449,7 +449,7 @@ def main(
                 "a higher number for samples with more expected heterogeneity."
             ),
         ),
-    ] = 20,
+    ] = 50,
     glmpca_family: Annotated[
         FamilyChoice,
         typer.Option(
